@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: music-bot
+    env: node
+    plan: free
+    buildCommand: "apt-get update && apt-get install -y ffmpeg && npm install"
+    startCommand: "npm start"
