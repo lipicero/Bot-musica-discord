@@ -1889,3 +1889,30 @@ client.on("interactionCreate", async (interaction) => {
 
 // Iniciar el bot
 client.login(process.env.DISCORD_TOKEN);
+
+// Si corremos en Render Web Service, expongamos un health-check HTTP en PORT
+function startHealthServer() {
+  const port = Number(process.env.PORT || 0);
+  if (!port) return; // no estamos en un Web Service
+  const http = require('http');
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('ok');
+  });
+  server.listen(port, () => console.log(`[http] health server escuchando en :${port}`));
+}
+startHealthServer();
+
+// Apagado limpio en plataformas que envían señales (Render)
+function gracefulShutdown(signal) {
+  console.log(`[shutdown] señal recibida: ${signal}`);
+  try {
+    for (const [gid] of queues) {
+      try { getVoiceConnection(gid)?.destroy(); } catch {}
+    }
+  } catch {}
+  try { client.destroy(); } catch {}
+  process.exit(0);
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));

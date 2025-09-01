@@ -1,7 +1,27 @@
 services:
-  - type: worker
+  - type: web
     name: music-bot
-    env: node
+    env: docker
     plan: free
-    buildCommand: "npm install"
-    startCommand: "npm start"
+    autoDeploy: true
+    healthCheckPath: /
+    # Si querés persistir volumes.json entre deploys, descomentá el disco persistente
+    # disks:
+    #   - name: data
+    #     mountPath: /app
+    #     sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DISCORD_TOKEN
+        sync: false
+      # Opcional: cookies de YouTube para acceso a contenidos restringidos/edad
+      - key: YT_COOKIE
+        sync: false
+      # Debug opcional
+      - key: DEBUG_AUDIO
+        value: "0"
+      - key: FAST_START
+        value: "1"
+      - key: FAST_START_MS
+        value: "2000"
