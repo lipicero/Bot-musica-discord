@@ -1,0 +1,28 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# Environment & secrets
+.env
+.env.*
+
+# Logs
+logs/*
+!logs/.gitkeep
+*.log
+bot.pid
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Runtime/state
+volumes.json
+
+# Misc
+*.tmp
+*.swp
