@@ -199,6 +199,20 @@ function getQueue(guildId) {
       console.error("[player:error]", err);
       const qq = queues.get(guildId);
       if (!qq || !qq.songs.length) return;
+      // Si es un 403 de miniget/ytdl, intentar re-crear el recurso con play-dl directamente
+      const is403 = /\b403\b/.test(String(err?.message || ""));
+      if (is403) {
+        try {
+          const current = qq.songs[0];
+          if (current?.url) {
+            const resource = await createResourceFromUrl(current.url, qq.volume ?? 1.0, { preferPlayDl: true });
+            qq.player.play(resource);
+            return;
+          }
+        } catch (e403) {
+          if (DEBUG_AUDIO) console.warn("[player:error:403-fallback-failed]", e403?.message || e403);
+        }
+      }
       // Reintentar la pista actual hasta 2 veces, luego saltar
       qq.currentRetry = (qq.currentRetry || 0) + 1;
       if (qq.currentRetry <= 2) {
@@ -372,7 +386,8 @@ async function ensureConnection(guild, voiceChannel) {
   }
 }
 
-async function createResourceFromUrl(url, volume = 1.0) {
+async function createResourceFromUrl(url, volume = 1.0, options = {}) {
+  const { preferPlayDl = false } = options || {};
   // Canonicalizar URL de YouTube para mayor compatibilidad
   url = canonicalizeYouTubeUrl(url);
   if (!url || typeof url !== "string" || !/^https?:\/\//i.test(url)) {
@@ -380,20 +395,61 @@ async function createResourceFromUrl(url, volume = 1.0) {
   }
   const ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
   const ytCookiesArr = ytCookie ? parseCookieHeaderToArray(ytCookie) : null;
-  // Para YouTube: priorizar ytdl-core y evitar warnings de play-dl
+  const userAgent = process.env.YTDL_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+  const acceptLang = process.env.YTDL_ACCEPT_LANGUAGE || 'es-ES,es;q=0.9,en;q=0.8';
+  const baseReqOpts = {
+    headers: {
+      'user-agent': userAgent,
+      'accept-language': acceptLang,
+      ...(ytCookie ? { cookie: ytCookie } : {}),
+    },
+  };
+  // Para YouTube
   if (isYouTubeUrl(url)) {
+    const forcePlayDl = String(process.env.YT_FORCE_PLAYDL || "0") === "1";
+    // Si se solicita o está forzado, intentamos primero con play-dl para evitar 403 de firmas/cookies
+    if (preferPlayDl || forcePlayDl) {
+      try {
+        const info = await playdl.video_info(url);
+        const s = await playdl.stream_from_info(info, {
+          discordPlayerCompatibility: true,
+        });
+        const inputType =
+          typeof s.type === "number" ? s.type : StreamType.WebmOpus;
+        const resource = createAudioResource(s.stream, {
+          inputType,
+          inlineVolume: true,
+        });
+        if (resource.volume)
+          resource.volume.setVolumeLogarithmic(
+            Math.max(0, Math.min(2, volume))
+          );
+        if (DEBUG_AUDIO) console.log("[createResource] using play-dl (prefer/force)");
+        return resource;
+      } catch (ePlayPrefer) {
+        if (DEBUG_AUDIO && ePlayPrefer?.message !== "Invalid URL")
+          console.warn(
+            "[createResource:playdl:prefer]",
+            ePlayPrefer?.message || ePlayPrefer,
+            "url:",
+            url
+          );
+        if (forcePlayDl) {
+          // Si está forzado y falló, no intentamos ytdl para evitar 403 en bucles
+          throw ePlayPrefer;
+        }
+      }
+    }
+    // En caso contrario, priorizar ytdl-core
     try {
       const id = extractYouTubeId(url) || url;
-      const info = await ytdl.getInfo(
-        id,
-        ytCookiesArr ? { cookies: ytCookiesArr } : undefined
-      );
+  const info = await ytdl.getInfo(id, { requestOptions: baseReqOpts });
       const fmt = selectWebmOpusFormat(info.formats);
       if (fmt) {
         const stream = ytdl.downloadFromInfo(info, {
           format: fmt,
           highWaterMark: 1 << 25,
-          ...(ytCookiesArr ? { cookies: ytCookiesArr } : {}),
+          requestOptions: baseReqOpts,
         });
         const resource = createAudioResource(stream, {
           inputType: StreamType.WebmOpus,
@@ -410,7 +466,7 @@ async function createResourceFromUrl(url, volume = 1.0) {
         quality: "highestaudio",
         filter: "audioonly",
         highWaterMark: 1 << 25,
-        ...(ytCookiesArr ? { cookies: ytCookiesArr } : {}),
+        requestOptions: baseReqOpts,
       });
       const resource = createAudioResource(fallbackStream, {
         inputType: StreamType.Arbitrary,
@@ -427,7 +483,20 @@ async function createResourceFromUrl(url, volume = 1.0) {
           "url:",
           url
         );
-      // Fallback a play-dl si ytdl falla
+      // Segundo intento: getBasicInfo y formato directo
+      try {
+  const basic = await ytdl.getBasicInfo(id, { requestOptions: baseReqOpts });
+        const fmt2 = selectWebmOpusFormat(basic.formats) || ytdl.chooseFormat(basic.formats, { quality: 'highestaudio', filter: 'audioonly' });
+        if (fmt2) {
+          const stream2 = ytdl(id, { format: fmt2, highWaterMark: 1 << 25, requestOptions: baseReqOpts });
+          const res2 = createAudioResource(stream2, { inputType: /webm/i.test(fmt2.mimeType || fmt2.container) ? StreamType.WebmOpus : StreamType.Arbitrary, inlineVolume: true });
+          if (res2.volume) res2.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, volume)));
+          return res2;
+        }
+      } catch (eBasic) {
+        if (DEBUG_AUDIO) console.warn('[createResource:ytdl:basic-fallback]', eBasic?.message || eBasic, 'url:', url);
+      }
+  // Fallback a play-dl si ytdl falla
       try {
         const info = await playdl.video_info(url);
         const s = await playdl.stream_from_info(info, {
@@ -763,15 +832,52 @@ function selectWebmOpusFormat(formats, preference = "highest") {
     : candidates[candidates.length - 1];
 }
 
+// Construye opciones (cookies y headers) para llamadas de ytdl/miniget
+function buildYtdlRequestOptions(videoIdOrUrl) {
+  const ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
+  const userAgent =
+    process.env.YTDL_USER_AGENT ||
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+  const acceptLang =
+    process.env.YTDL_ACCEPT_LANGUAGE || "es-ES,es;q=0.9,en;q=0.8";
+  let referer;
+  try {
+    if (videoIdOrUrl) {
+      if (/^https?:\/\//i.test(String(videoIdOrUrl))) {
+        const url = canonicalizeYouTubeUrl(String(videoIdOrUrl));
+        if (isYouTubeUrl(url)) referer = url;
+      } else if (/^[a-zA-Z0-9_-]{6,}$/.test(String(videoIdOrUrl))) {
+        referer = `https://www.youtube.com/watch?v=${videoIdOrUrl}`;
+      }
+    }
+  } catch {}
+  const headers = {
+    "user-agent": userAgent,
+    "accept-language": acceptLang,
+  };
+  if (ytCookie) headers.cookie = ytCookie;
+  if (referer) headers.referer = referer;
+  return {
+    requestOptions: { headers },
+  };
+}
+
 // Crear recurso directamente desde info de ytdl (evita pedir info de nuevo)
 function createResourceFromYtdlInfo(info, volume = 1.0) {
   try {
     const fmt = selectWebmOpusFormat(info.formats, "highest");
     if (fmt) {
-      const stream = ytdl.downloadFromInfo(info, {
+      const vidRef =
+        info?.videoDetails?.video_url ||
+        (info?.videoDetails?.videoId
+          ? `https://www.youtube.com/watch?v=${info.videoDetails.videoId}`
+          : undefined);
+      const ytdlOpts = {
         format: fmt,
         highWaterMark: 1 << 25,
-      });
+        ...buildYtdlRequestOptions(vidRef),
+      };
+      const stream = ytdl.downloadFromInfo(info, ytdlOpts);
       const resource = createAudioResource(stream, {
         inputType: StreamType.WebmOpus,
         inlineVolume: true,
@@ -780,10 +886,16 @@ function createResourceFromYtdlInfo(info, volume = 1.0) {
         resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, volume)));
       return resource;
     }
+    const vidRef =
+      info?.videoDetails?.video_url ||
+      (info?.videoDetails?.videoId
+        ? `https://www.youtube.com/watch?v=${info.videoDetails.videoId}`
+        : undefined);
     const fallbackStream = ytdl.downloadFromInfo(info, {
       quality: "highestaudio",
       filter: "audioonly",
       highWaterMark: 1 << 25,
+      ...buildYtdlRequestOptions(vidRef),
     });
     const resource = createAudioResource(fallbackStream, {
       inputType: StreamType.Arbitrary,
@@ -801,10 +913,16 @@ function createFastStartResourceFromYtdlInfo(info, volume = 1.0) {
   try {
     const fmt = selectWebmOpusFormat(info.formats, "lowest");
     if (!fmt) return null;
+    const vidRef =
+      info?.videoDetails?.video_url ||
+      (info?.videoDetails?.videoId
+        ? `https://www.youtube.com/watch?v=${info.videoDetails.videoId}`
+        : undefined);
     const stream = ytdl.downloadFromInfo(info, {
       format: fmt,
       highWaterMark: 1 << 22,
       dlChunkSize: 1 << 20,
+      ...buildYtdlRequestOptions(vidRef),
     });
     const resource = createAudioResource(stream, {
       inputType: StreamType.WebmOpus,
@@ -894,6 +1012,14 @@ async function playNext(guildId) {
   } catch (e) {
     console.error("[playNext:error]", e?.message || e, "url:", current?.url);
     // Saltar esta pista y continuar con la siguiente
+    // Intento único: si el error fue 403, probar play-dl directo antes de saltar
+    if (/\b403\b/.test(String(e?.message || ""))) {
+      try {
+        const res = await createResourceFromUrl(current.url, q.volume ?? 1.0, { preferPlayDl: true });
+        q.player.play(res);
+        return;
+      } catch {}
+    }
     q.songs.shift();
     if (q.songs.length > 0) {
       playNext(guildId).catch((err) =>
@@ -1191,15 +1317,11 @@ client.on("messageCreate", async (message) => {
       q.textChannelId = message.channel.id;
       // Paralelizar conexión con fetch de info/metadata
       const connectP = ensureConnection(message.guild, voiceChannel);
-      const ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
-      const ytCookiesArr = ytCookie ? parseCookieHeaderToArray(ytCookie) : null;
+  const ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
       let songData = null;
       if (isYouTubeUrl(finalUrl)) {
         const id = extractYouTubeId(finalUrl) || finalUrl;
-        const info = await ytdl.getInfo(
-          id,
-          ytCookiesArr ? { cookies: ytCookiesArr } : undefined
-        );
+  const info = await ytdl.getInfo(id);
         const title = info?.videoDetails?.title || finalUrl;
         const dur = Number(info?.videoDetails?.lengthSeconds || 0) || 0;
         const thumb =
@@ -1640,16 +1762,12 @@ client.on("interactionCreate", async (interaction) => {
       q.textChannelId = interaction.channelId;
       // Paralelizar conexión con fetch de info/metadata
       const connectP = ensureConnection(guild, voiceChannel).catch((e) => e);
-      const ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
-      const ytCookiesArr = ytCookie ? parseCookieHeaderToArray(ytCookie) : null;
+  const ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
       let songData = null;
       if (isYouTubeUrl(finalUrl)) {
         try {
           const id = extractYouTubeId(finalUrl) || finalUrl;
-          const info = await ytdl.getInfo(
-            id,
-            ytCookiesArr ? { cookies: ytCookiesArr } : undefined
-          );
+          const info = await ytdl.getInfo(id);
           const title = info?.videoDetails?.title || finalUrl;
           const dur = Number(info?.videoDetails?.lengthSeconds || 0) || 0;
           const thumb =
