@@ -205,12 +205,20 @@ function getQueue(guildId) {
         try {
           const current = qq.songs[0];
           if (current?.url) {
-            const resource = await createResourceFromUrl(current.url, qq.volume ?? 1.0, { preferPlayDl: true });
+            const resource = await createResourceFromUrl(
+              current.url,
+              qq.volume ?? 1.0,
+              { preferPlayDl: true }
+            );
             qq.player.play(resource);
             return;
           }
         } catch (e403) {
-          if (DEBUG_AUDIO) console.warn("[player:error:403-fallback-failed]", e403?.message || e403);
+          if (DEBUG_AUDIO)
+            console.warn(
+              "[player:error:403-fallback-failed]",
+              e403?.message || e403
+            );
         }
       }
       // Reintentar la pista actual hasta 2 veces, luego saltar
@@ -395,12 +403,15 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
   }
   const ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
   const ytCookiesArr = ytCookie ? parseCookieHeaderToArray(ytCookie) : null;
-  const userAgent = process.env.YTDL_USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-  const acceptLang = process.env.YTDL_ACCEPT_LANGUAGE || 'es-ES,es;q=0.9,en;q=0.8';
+  const userAgent =
+    process.env.YTDL_USER_AGENT ||
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+  const acceptLang =
+    process.env.YTDL_ACCEPT_LANGUAGE || "es-ES,es;q=0.9,en;q=0.8";
   const baseReqOpts = {
     headers: {
-      'user-agent': userAgent,
-      'accept-language': acceptLang,
+      "user-agent": userAgent,
+      "accept-language": acceptLang,
       ...(ytCookie ? { cookie: ytCookie } : {}),
     },
   };
@@ -424,26 +435,27 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
           resource.volume.setVolumeLogarithmic(
             Math.max(0, Math.min(2, volume))
           );
-        if (DEBUG_AUDIO) console.log("[createResource] using play-dl (prefer/force)");
+        if (DEBUG_AUDIO)
+          console.log("[createResource] using play-dl (prefer/force)");
         return resource;
       } catch (ePlayPrefer) {
-        if (DEBUG_AUDIO && ePlayPrefer?.message !== "Invalid URL")
-          console.warn(
-            "[createResource:playdl:prefer]",
-            ePlayPrefer?.message || ePlayPrefer,
-            "url:",
-            url
-          );
-        if (forcePlayDl) {
-          // Si está forzado y falló, no intentamos ytdl para evitar 403 en bucles
+        const msg = String(ePlayPrefer?.message || ePlayPrefer || "");
+        if (DEBUG_AUDIO)
+          console.warn("[createResource:playdl:prefer]", msg, "url:", url);
+        // Si el error es 'Invalid URL' o desafío de login/consent, PERMITIR fallback a ytdl aunque esté forzado
+        const allowFallback =
+          /Invalid URL/i.test(msg) || /Sign in to confirm/i.test(msg);
+        if (!allowFallback && forcePlayDl) {
+          // Error distinto: respetar el forzado
           throw ePlayPrefer;
         }
+        // Si allowFallback o no está forzado, continuamos al branch ytdl
       }
     }
     // En caso contrario, priorizar ytdl-core
     try {
       const id = extractYouTubeId(url) || url;
-  const info = await ytdl.getInfo(id, { requestOptions: baseReqOpts });
+      const info = await ytdl.getInfo(id, { requestOptions: baseReqOpts });
       const fmt = selectWebmOpusFormat(info.formats);
       if (fmt) {
         const stream = ytdl.downloadFromInfo(info, {
@@ -485,18 +497,41 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
         );
       // Segundo intento: getBasicInfo y formato directo
       try {
-  const basic = await ytdl.getBasicInfo(id, { requestOptions: baseReqOpts });
-        const fmt2 = selectWebmOpusFormat(basic.formats) || ytdl.chooseFormat(basic.formats, { quality: 'highestaudio', filter: 'audioonly' });
+        const basic = await ytdl.getBasicInfo(id, {
+          requestOptions: baseReqOpts,
+        });
+        const fmt2 =
+          selectWebmOpusFormat(basic.formats) ||
+          ytdl.chooseFormat(basic.formats, {
+            quality: "highestaudio",
+            filter: "audioonly",
+          });
         if (fmt2) {
-          const stream2 = ytdl(id, { format: fmt2, highWaterMark: 1 << 25, requestOptions: baseReqOpts });
-          const res2 = createAudioResource(stream2, { inputType: /webm/i.test(fmt2.mimeType || fmt2.container) ? StreamType.WebmOpus : StreamType.Arbitrary, inlineVolume: true });
-          if (res2.volume) res2.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, volume)));
+          const stream2 = ytdl(id, {
+            format: fmt2,
+            highWaterMark: 1 << 25,
+            requestOptions: baseReqOpts,
+          });
+          const res2 = createAudioResource(stream2, {
+            inputType: /webm/i.test(fmt2.mimeType || fmt2.container)
+              ? StreamType.WebmOpus
+              : StreamType.Arbitrary,
+            inlineVolume: true,
+          });
+          if (res2.volume)
+            res2.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, volume)));
           return res2;
         }
       } catch (eBasic) {
-        if (DEBUG_AUDIO) console.warn('[createResource:ytdl:basic-fallback]', eBasic?.message || eBasic, 'url:', url);
+        if (DEBUG_AUDIO)
+          console.warn(
+            "[createResource:ytdl:basic-fallback]",
+            eBasic?.message || eBasic,
+            "url:",
+            url
+          );
       }
-  // Fallback a play-dl si ytdl falla
+      // Fallback a play-dl si ytdl falla
       try {
         const info = await playdl.video_info(url);
         const s = await playdl.stream_from_info(info, {
@@ -718,8 +753,8 @@ function buildProgressBar(totalSec, elapsedSec, size = 20) {
   const filled = Math.max(0, Math.min(size, Math.round(ratio * size)));
   // Posición del knob dentro del track
   const pos = Math.max(0, Math.min(size - 1, Math.round(ratio * (size - 1))));
-  const left = '█'.repeat(pos);
-  const right = '─'.repeat(Math.max(0, size - pos - 1));
+  const left = "█".repeat(pos);
+  const right = "─".repeat(Math.max(0, size - pos - 1));
   const bar = `┃${left}🔘${right}┃`;
   return `${formatDuration(elapsedSec)} ${bar} ${formatDuration(totalSec)}`;
 }
@@ -958,20 +993,17 @@ async function playNext(guildId) {
     const longEnough = (current.durationSec || 0) >= 60;
 
     if (current.ytdlInfo && fastStartEnabled && longEnough) {
-      resource = createFastStartResourceFromYtdlInfo(
-        current.ytdlInfo,
-        q.volume ?? 1.0
-      );
-      if (!resource)
-        resource = createResourceFromYtdlInfo(
+      resource =
+        createFastStartResourceFromYtdlInfo(
           current.ytdlInfo,
           q.volume ?? 1.0
-        );
+        ) || createResourceFromYtdlInfo(current.ytdlInfo, q.volume ?? 1.0);
     } else if (current.ytdlInfo) {
       resource = createResourceFromYtdlInfo(current.ytdlInfo, q.volume ?? 1.0);
     }
-    if (!resource)
+    if (!resource) {
       resource = await createResourceFromUrl(current.url, q.volume ?? 1.0);
+    }
 
     q.player.play(resource);
 
@@ -981,45 +1013,68 @@ async function playNext(guildId) {
       q.currentTrackToken = token;
       q.upgradeTimer = setTimeout(async () => {
         try {
-          // asegurar que seguimos en la misma pista
           if (!queues.has(guildId)) return;
           const qq = queues.get(guildId);
           if (!qq || qq.currentTrackToken !== token) return;
-          // no actualizar si ya no está reproduciendo
           if (qq.player?.state?.status !== AudioPlayerStatus.Playing) return;
           const bestRes = createResourceFromYtdlInfo(
             current.ytdlInfo,
             qq.volume ?? 1.0
           );
           if (!bestRes) return;
-          // intercambio rápido
           qq.player.play(bestRes);
           if (DEBUG_AUDIO) console.log("[fast-start] upgraded to high quality");
         } catch {}
       }, fastDelayMs);
     }
-    // Actualizar/crear el mensaje de Now Playing
+
     try {
       await renderNowPlaying(guildId);
     } catch (e) {
       if (DEBUG_AUDIO)
         console.warn("[renderNowPlaying:error]", e?.message || e);
     }
-    // iniciar ticker para refrescar el progreso
     try {
       startNowPlayingTicker(guildId);
     } catch {}
   } catch (e) {
     console.error("[playNext:error]", e?.message || e, "url:", current?.url);
-    // Saltar esta pista y continuar con la siguiente
-    // Intento único: si el error fue 403, probar play-dl directo antes de saltar
-    if (/\b403\b/.test(String(e?.message || ""))) {
+    // Fallback: forzar play-dl para esta URL
+    try {
+      const fallbackRes = await createResourceFromUrl(
+        current.url,
+        q.volume ?? 1.0,
+        { preferPlayDl: true }
+      );
+      q.player.play(fallbackRes);
       try {
-        const res = await createResourceFromUrl(current.url, q.volume ?? 1.0, { preferPlayDl: true });
-        q.player.play(res);
-        return;
+        await renderNowPlaying(guildId);
       } catch {}
+      try {
+        startNowPlayingTicker(guildId);
+      } catch {}
+      return;
+    } catch (e2) {
+      if (DEBUG_AUDIO)
+        console.warn("[playNext:fallback-playdl:failed]", e2?.message || e2);
     }
+    // Notificar y saltar esta pista
+    try {
+      if (q.textChannelId) {
+        const ch = await client.channels
+          .fetch(q.textChannelId)
+          .catch(() => null);
+        if (ch?.isTextBased?.()) {
+          await ch
+            .send(
+              `⚠️ No se pudo reproducir: ${
+                current?.title || current?.url || "pista"
+              } — se salta.`
+            )
+            .catch(() => {});
+        }
+      }
+    } catch {}
     q.songs.shift();
     if (q.songs.length > 0) {
       playNext(guildId).catch((err) =>
@@ -1317,11 +1372,11 @@ client.on("messageCreate", async (message) => {
       q.textChannelId = message.channel.id;
       // Paralelizar conexión con fetch de info/metadata
       const connectP = ensureConnection(message.guild, voiceChannel);
-  const ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
+      const ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
       let songData = null;
       if (isYouTubeUrl(finalUrl)) {
         const id = extractYouTubeId(finalUrl) || finalUrl;
-  const info = await ytdl.getInfo(id);
+        const info = await ytdl.getInfo(id);
         const title = info?.videoDetails?.title || finalUrl;
         const dur = Number(info?.videoDetails?.lengthSeconds || 0) || 0;
         const thumb =
@@ -1762,7 +1817,7 @@ client.on("interactionCreate", async (interaction) => {
       q.textChannelId = interaction.channelId;
       // Paralelizar conexión con fetch de info/metadata
       const connectP = ensureConnection(guild, voiceChannel).catch((e) => e);
-  const ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
+      const ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
       let songData = null;
       if (isYouTubeUrl(finalUrl)) {
         try {
@@ -2012,12 +2067,14 @@ client.login(process.env.DISCORD_TOKEN);
 function startHealthServer() {
   const port = Number(process.env.PORT || 0);
   if (!port) return; // no estamos en un Web Service
-  const http = require('http');
+  const http = require("http");
   const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('ok');
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("ok");
   });
-  server.listen(port, () => console.log(`[http] health server escuchando en :${port}`));
+  server.listen(port, () =>
+    console.log(`[http] health server escuchando en :${port}`)
+  );
 }
 startHealthServer();
 
@@ -2026,11 +2083,15 @@ function gracefulShutdown(signal) {
   console.log(`[shutdown] señal recibida: ${signal}`);
   try {
     for (const [gid] of queues) {
-      try { getVoiceConnection(gid)?.destroy(); } catch {}
+      try {
+        getVoiceConnection(gid)?.destroy();
+      } catch {}
     }
   } catch {}
-  try { client.destroy(); } catch {}
+  try {
+    client.destroy();
+  } catch {}
   process.exit(0);
 }
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
