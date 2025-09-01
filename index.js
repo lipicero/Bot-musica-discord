@@ -647,11 +647,12 @@ function buildProgressBar(totalSec, elapsedSec, size = 20) {
   elapsedSec = Math.max(0, Math.min(totalSec, Number(elapsedSec) || 0));
   const ratio = elapsedSec / totalSec;
   const filled = Math.max(0, Math.min(size, Math.round(ratio * size)));
-  const bar =
-    "▰".repeat(Math.max(0, filled - 1)) +
-    (filled > 0 ? "🔘" : "") +
-    "▱".repeat(Math.max(0, size - filled));
-  return bar;
+  // Posición del knob dentro del track
+  const pos = Math.max(0, Math.min(size - 1, Math.round(ratio * (size - 1))));
+  const left = '█'.repeat(pos);
+  const right = '─'.repeat(Math.max(0, size - pos - 1));
+  const bar = `┃${left}🔘${right}┃`;
+  return `${formatDuration(elapsedSec)} ${bar} ${formatDuration(totalSec)}`;
 }
 
 // Render de cola (queue) para reuso en respuestas
