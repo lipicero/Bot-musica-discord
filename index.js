@@ -47,11 +47,66 @@ try {
 } catch {}
 const { spawn, spawnSync } = require("child_process");
 
+// Helpers de cookies YouTube
+function parseNetscapeCookieFileToHeader(content) {
+  try {
+    const lines = String(content).split(/\r?\n/);
+    const parts = [];
+    for (const line of lines) {
+      const s = line.trim();
+      if (!s || s.startsWith("#")) continue;
+      const cols = s.split(/\t+/);
+      if (cols.length < 7) continue;
+      const name = cols[5];
+      const value = cols[6];
+      if (!name) continue;
+      parts.push(`${name}=${value}`);
+    }
+    const uniq = Array.from(new Map(parts.map((p) => {
+      const idx = p.indexOf("=");
+      const k = idx === -1 ? p : p.slice(0, idx);
+      return [k, p];
+    })).values());
+    return uniq.join("; ");
+  } catch {
+    return "";
+  }
+}
+
+function getYouTubeCookieHeaderFromEnv() {
+  try {
+    // Prioridad: YT_COOKIE (header) > YT_COOKIE_B64 (netscape o header) > YT_COOKIE_FILE > YOUTUBE_COOKIE
+    if (process.env.YT_COOKIE) return String(process.env.YT_COOKIE);
+    let raw = null;
+    if (process.env.YT_COOKIE_B64) {
+      try {
+        raw = Buffer.from(String(process.env.YT_COOKIE_B64).trim(), "base64").toString("utf8");
+      } catch {}
+      if (raw) {
+        const looksNetscape = /\t/.test(raw) || /Netscape HTTP Cookie File/i.test(raw);
+        return looksNetscape ? parseNetscapeCookieFileToHeader(raw) : raw;
+      }
+    }
+    if (process.env.YT_COOKIE_FILE) {
+      try {
+        const p = String(process.env.YT_COOKIE_FILE).trim();
+        if (p && fs.existsSync(p)) {
+          const txt = fs.readFileSync(p, "utf8");
+          const looksNetscape = /\t/.test(txt) || /Netscape HTTP Cookie File/i.test(txt);
+          return looksNetscape ? parseNetscapeCookieFileToHeader(txt) : txt;
+        }
+      } catch {}
+    }
+    if (process.env.YOUTUBE_COOKIE) return String(process.env.YOUTUBE_COOKIE);
+  } catch {}
+  return "";
+}
+
 // Config opcional de YouTube para play-dl (evita bloqueos/edad/consent)
 try {
-  const ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
-  if (ytCookie) {
-    playdl.setToken({ youtube: { cookie: ytCookie } });
+  const ytCookieHdr = getYouTubeCookieHeaderFromEnv();
+  if (ytCookieHdr) {
+    playdl.setToken({ youtube: { cookie: ytCookieHdr } });
     console.log("[play-dl] cookie de YouTube configurada");
   }
 } catch (e) {
@@ -464,7 +519,7 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
   if (!url || typeof url !== "string" || !/^https?:\/\//i.test(url)) {
     throw new Error("INVALID_STREAM_URL");
   }
-  const ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
+  const ytCookie = getYouTubeCookieHeaderFromEnv();
   const ytCookiesArr = ytCookie ? parseCookieHeaderToArray(ytCookie) : null;
   const userAgent =
     process.env.YTDL_USER_AGENT ||
