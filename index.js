@@ -44,7 +44,7 @@ let ytdlp = null;
 try {
   ytdlp = require("yt-dlp-exec");
 } catch {}
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 
 // Config opcional de YouTube para play-dl (evita bloqueos/edad/consent)
 try {
