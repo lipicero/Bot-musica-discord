@@ -925,32 +925,48 @@ async function getDirectUrlFromYtDlp(targetUrl, headers = {}) {
 
 async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   if (DEBUG_AUDIO) console.log(`[yt-dlp] invocando yt-dlp para ${url}`);
-  // 1) Obtener URL directa del audio
-  const directUrl = await getDirectUrlFromYtDlp(url, headers);
-  // 2) Pasar por ffmpeg para forzar webm/opus estable leyendo directo desde la URL
+  const binPath = getYtDlpBinaryPath();
+  if (!binPath && !(ytdlp && ytdlp.raw)) throw new Error("YTDLP_NOT_AVAILABLE");
+
   const ffmpegPath = process.env.FFMPEG_PATH || require("ffmpeg-static");
   if (!ffmpegPath) throw new Error("FFMPEG_REQUIRED");
-  const hdrs = [];
-  if (headers?.userAgent) hdrs.push(`User-Agent: ${headers.userAgent}`);
-  if (headers?.acceptLang) hdrs.push(`Accept-Language: ${headers.acceptLang}`);
-  // No pasar cookies al fetch de media directa (googlevideo): no es necesario y puede romper.
-  const headerString = hdrs.length ? hdrs.join("\r\n") + "\r\n" : null;
+
+  // Preparar encabezados y cookie para yt-dlp (no para ffmpeg)
+  const args = ["--no-playlist", "-f", "bestaudio/best", "-o", "-"];
+  if (headers?.userAgent) {
+    args.push("--user-agent", headers.userAgent);
+  }
+  if (headers?.acceptLang) {
+    args.push("--add-header", `Accept-Language: ${headers.acceptLang}`);
+  }
+  const cookieFile = ensureYtDlpCookiesFileFromEnv();
+  if (cookieFile) {
+    args.push("--cookies", cookieFile);
+  }
+  args.push(url);
+
+  // Lanzar yt-dlp (binario o wrapper)
+  const yProc = binPath
+    ? spawn(binPath, args, { stdio: ["ignore", "pipe", "pipe"] })
+    : ytdlp.raw(args[args.length - 1], {
+        o: "-",
+        f: "bestaudio/best",
+        noPlaylist: true,
+        ...(headers?.userAgent ? { userAgent: headers.userAgent } : {}),
+        ...(headers?.acceptLang
+          ? { addHeader: [`Accept-Language: ${headers.acceptLang}`] }
+          : {}),
+        ...(cookieFile ? { cookies: cookieFile } : {}),
+      });
+
+  // ffmpeg para transcodificar a ogg/opus por pipe
   const ffArgs = [
     "-hide_banner",
     "-loglevel",
     "warning",
     "-nostdin",
-    "-reconnect",
-    "1",
-    "-reconnect_streamed",
-    "1",
-    "-reconnect_delay_max",
-    "5",
-  ];
-  if (headerString) ffArgs.push("-headers", headerString);
-  ffArgs.push(
     "-i",
-    directUrl,
+    "pipe:0",
     "-vn",
     "-sn",
     "-dn",
@@ -968,19 +984,26 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
     "60",
     "-f",
     "ogg",
-    "pipe:1"
-  );
-  const ff = spawn(ffmpegPath, ffArgs, { stdio: ["ignore", "pipe", "pipe"] });
-  ff.stderr?.on("data", (d) => {
-    const s = d.toString();
-    if (DEBUG_AUDIO) console.warn(`[ffmpeg] ${s.trim()}`);
-  });
+    "pipe:1",
+  ];
+  const ff = spawn(ffmpegPath, ffArgs, { stdio: ["pipe", "pipe", "pipe"] });
+
+  // Encadenar salida de yt-dlp a ffmpeg
+  yProc.stdout?.pipe(ff.stdin);
+  if (DEBUG_AUDIO) {
+    yProc.stderr?.on("data", (d) => console.warn(`[yt-dlp] ${String(d).trim()}`));
+    ff.stderr?.on("data", (d) => console.warn(`[ffmpeg] ${String(d).trim()}`));
+  }
+
+  // Crear recurso
   const out = ff.stdout;
   out.on("close", () => {
-    if (!ff.killed)
-      try {
-        ff.kill("SIGKILL");
-      } catch {}
+    try {
+      ff.kill("SIGKILL");
+    } catch {}
+    try {
+      yProc.kill?.("SIGKILL");
+    } catch {}
   });
   const resource = createAudioResource(out, {
     inputType: StreamType.OggOpus,
