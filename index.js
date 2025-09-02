@@ -936,6 +936,7 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   // Opcionales para mitigar captcha en YouTube
   const extractorArgsEnv = (process.env.YT_YTDLP_EXTRACTOR_ARGS || "").trim();
   const ytClient = (process.env.YT_YTDLP_CLIENT || "").trim().toLowerCase(); // p.ej.: android | tvhtml5 | web | ios | mweb
+  const strictClient = String(process.env.YT_YTDLP_STRICT_CLIENT || "0") === "1";
   const forceIpv4 = String(process.env.YT_FORCE_IPV4 || "0") === "1";
 
   if (headers?.userAgent) {
@@ -944,13 +945,6 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   if (headers?.acceptLang) {
     args.push("--add-header", `Accept-Language: ${headers.acceptLang}`);
   }
-  if (extractorArgsEnv) {
-    args.push("--extractor-args", extractorArgsEnv);
-    if (DEBUG_AUDIO) console.log(`[yt-dlp] extractor-args (env): ${extractorArgsEnv}`);
-  } else if (ytClient) {
-    args.push("--extractor-args", `youtube:player_client=${ytClient}`);
-    if (DEBUG_AUDIO) console.log(`[yt-dlp] usando player_client=${ytClient}`);
-  }
   if (forceIpv4) {
     args.push("--force-ipv4");
     if (DEBUG_AUDIO) console.log(`[yt-dlp] forzando IPv4`);
@@ -958,6 +952,28 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   const cookieFile = ensureYtDlpCookiesFileFromEnv();
   if (cookieFile) {
     args.push("--cookies", cookieFile);
+  }
+  // Elegir extractor-args (player_client) según cookies y configuración
+  let effectiveClient = ytClient;
+  if (!extractorArgsEnv) {
+    if (!effectiveClient) {
+      effectiveClient = cookieFile ? "web" : "android";
+    }
+    if (cookieFile && effectiveClient === "android" && !strictClient) {
+      effectiveClient = "web";
+      if (DEBUG_AUDIO)
+        console.log(
+          `[yt-dlp] cambiando player_client=android -> web (cookies presentes)`
+        );
+    }
+    if (effectiveClient) {
+      args.push("--extractor-args", `youtube:player_client=${effectiveClient}`);
+      if (DEBUG_AUDIO)
+        console.log(`[yt-dlp] usando player_client=${effectiveClient}`);
+    }
+  } else {
+    args.push("--extractor-args", extractorArgsEnv);
+    if (DEBUG_AUDIO) console.log(`[yt-dlp] extractor-args (env): ${extractorArgsEnv}`);
   }
   args.push(url);
 
@@ -973,11 +989,14 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
           ? { addHeader: [`Accept-Language: ${headers.acceptLang}`] }
           : {}),
         ...(cookieFile ? { cookies: cookieFile } : {}),
-        ...(extractorArgsEnv
-          ? { extractorArgs: extractorArgsEnv }
-          : ytClient
-          ? { extractorArgs: `youtube:player_client=${ytClient}` }
-          : {}),
+        ...(() => {
+          if (extractorArgsEnv) return { extractorArgs: extractorArgsEnv };
+          const clientForWrapper = (() => {
+            if (!effectiveClient) return null;
+            return `youtube:player_client=${effectiveClient}`;
+          })();
+          return clientForWrapper ? { extractorArgs: clientForWrapper } : {};
+        })(),
         ...(forceIpv4 ? { forceIpv4: true } : {}),
       });
 
