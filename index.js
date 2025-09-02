@@ -1010,10 +1010,30 @@ function parseCookieHeaderToArray(header) {
 // Devuelve la ruta al archivo o null si no hay cookie.
 function ensureYtDlpCookiesFileFromEnv() {
   try {
-    const raw = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
+    // Prioridad: YT_COOKIE_B64 > YT_COOKIE_FILE > YT_COOKIE/YOUTUBE_COOKIE
+    let raw = null;
+    if (process.env.YT_COOKIE_B64) {
+      try {
+        raw = Buffer.from(String(process.env.YT_COOKIE_B64).trim(), "base64").toString("utf8");
+        if (DEBUG_AUDIO) console.log("[yt-dlp] usando YT_COOKIE_B64 (decodificada)");
+      } catch (e) {
+        if (DEBUG_AUDIO) console.warn("[yt-dlp] YT_COOKIE_B64 inválida:", e?.message || e);
+      }
+    }
+    if (!raw && process.env.YT_COOKIE_FILE) {
+      const p = String(process.env.YT_COOKIE_FILE).trim();
+      try {
+        if (p && fs.existsSync(p)) {
+          raw = fs.readFileSync(p, "utf8");
+          if (DEBUG_AUDIO) console.log(`[yt-dlp] usando YT_COOKIE_FILE: ${p}`);
+        }
+      } catch (e) {
+        if (DEBUG_AUDIO) console.warn("[yt-dlp] No se pudo leer YT_COOKIE_FILE:", e?.message || e);
+      }
+    }
+    if (!raw) raw = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
     if (!raw) return null;
     const tmpPath = path.join(os.tmpdir(), `yt_cookies_${process.pid}.txt`);
-    if (fs.existsSync(tmpPath)) return tmpPath;
 
     let content = String(raw);
     // Si parece ya ser Netscape (tiene tabs o cabecera), lo usamos tal cual
@@ -1049,7 +1069,8 @@ function ensureYtDlpCookiesFileFromEnv() {
       }
       content = lines.join("\n") + "\n";
     }
-    fs.writeFileSync(tmpPath, content, { encoding: "utf8" });
+  // Reescribir siempre para evitar cookies obsoletas si cambió el env
+  fs.writeFileSync(tmpPath, content, { encoding: "utf8" });
     if (DEBUG_AUDIO) console.log(`[yt-dlp] archivo de cookies creado: ${tmpPath}`);
     return tmpPath;
   } catch (e) {
