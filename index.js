@@ -932,7 +932,19 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   if (!ffmpegPath) throw new Error("FFMPEG_REQUIRED");
 
   // Preparar encabezados y cookie para yt-dlp (no para ffmpeg)
-  const args = ["--no-playlist", "-f", "bestaudio/best", "-o", "-"];
+  const args = [
+    "--no-playlist",
+    "-f",
+    // Preferir Opus si está disponible para menos CPU y mayor estabilidad
+    "bestaudio[acodec=opus]/bestaudio/best",
+    "-o",
+    "-",
+    // Reintentos y robustez de fragmentos
+    "--retries",
+    "infinite",
+    "--fragment-retries",
+    "10",
+  ];
   // Opcionales para mitigar captcha en YouTube
   const extractorArgsEnv = (process.env.YT_YTDLP_EXTRACTOR_ARGS || "").trim();
   const ytClient = (process.env.YT_YTDLP_CLIENT || "").trim().toLowerCase(); // p.ej.: android | tvhtml5 | web | ios | mweb
@@ -1000,11 +1012,19 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
         ...(forceIpv4 ? { forceIpv4: true } : {}),
       });
 
-  // ffmpeg para transcodificar a ogg/opus por pipe
+  // ffmpeg para transcodificar a ogg/opus por pipe (parametrizable)
+  const targetBitrate = String(process.env.FFMPEG_OPUS_BITRATE || "128k");
+  const frameOption = (() => {
+    const v = Number(process.env.FFMPEG_OPUS_FRAME_MS || 20);
+    const allowed = [2.5, 5, 10, 20, 40, 60];
+    const chosen = allowed.includes(v) ? v : 20;
+    return ["-frame_duration", String(chosen)];
+  })();
+  const complexity = Math.max(0, Math.min(10, Number(process.env.FFMPEG_OPUS_COMPLEXITY || 5)));
   const ffArgs = [
     "-hide_banner",
     "-loglevel",
-    "warning",
+    DEBUG_AUDIO ? "info" : "warning",
     "-nostdin",
     "-i",
     "pipe:0",
@@ -1018,11 +1038,14 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
     "-c:a",
     "libopus",
     "-b:a",
-    "160k",
+    targetBitrate,
+    "-vbr",
+    "on",
     "-application",
     "audio",
-    "-frame_duration",
-    "60",
+    ...frameOption,
+    "-compression_level",
+    String(complexity),
     "-f",
     "ogg",
     "pipe:1",
@@ -1755,7 +1778,7 @@ function buildControlsComponents(q) {
     new ButtonBuilder()
       .setCustomId("music_skip")
   .setEmoji("⏭️")
-      .setLabel("Saltar")
+      .setLabel("Siguiente")
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(!hasSong),
     new ButtonBuilder()
@@ -1786,7 +1809,7 @@ function buildControlsComponents(q) {
     new ButtonBuilder()
       .setCustomId("music_shuffle")
       .setEmoji("🔀")
-      .setLabel("Barajar")
+      .setLabel("Aleatorio")
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(!canShuffle),
     new ButtonBuilder()
