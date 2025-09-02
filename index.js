@@ -714,12 +714,8 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
             typeof s.type === "number" ? s.type : StreamType.WebmOpus;
           const resource = createAudioResource(s.stream, {
             inputType,
-            inlineVolume: true,
+            inlineVolume: false,
           });
-          if (resource.volume)
-            resource.volume.setVolumeLogarithmic(
-              Math.max(0, Math.min(2, volume))
-            );
           return resource;
         } catch (eForceNoBin) {
           if (DEBUG_AUDIO)
@@ -743,12 +739,8 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
           typeof s.type === "number" ? s.type : StreamType.WebmOpus;
         const resource = createAudioResource(s.stream, {
           inputType,
-          inlineVolume: true,
+          inlineVolume: false,
         });
-        if (resource.volume)
-          resource.volume.setVolumeLogarithmic(
-            Math.max(0, Math.min(2, volume))
-          );
         if (DEBUG_AUDIO)
           console.log("[createResource] using play-dl (prefer/force)");
         return resource;
@@ -780,12 +772,8 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
         });
         const resource = createAudioResource(stream, {
           inputType: StreamType.WebmOpus,
-          inlineVolume: true,
+          inlineVolume: false,
         });
-        if (resource.volume)
-          resource.volume.setVolumeLogarithmic(
-            Math.max(0, Math.min(2, volume))
-          );
         return resource;
       }
       // Si no hay WebM/Opus, usar audioonly y dejar que ffmpeg demux/transcode (requiere ffmpeg-static)
@@ -796,13 +784,8 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
         highWaterMark: 1 << 25,
         ...buildYtdlRequestOptions(info?.videoDetails?.video_url || id),
       });
-      const resource = createAudioResource(fallbackStream, {
-        inputType: StreamType.Arbitrary,
-        inlineVolume: true,
-      });
-      if (resource.volume)
-        resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, volume)));
-      return resource;
+  // Transcodificar a Ogg/Opus para mejor compatibilidad móvil
+  return createOpusResourceFromStream(fallbackStream, volume);
     } catch (eYtdl) {
       if (DEBUG_AUDIO)
         console.warn(
@@ -846,15 +829,16 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
             highWaterMark: 1 << 25,
             ...buildYtdlRequestOptions(id),
           });
-          const res2 = createAudioResource(stream2, {
-            inputType: /webm/i.test(fmt2.mimeType || fmt2.container)
-              ? StreamType.WebmOpus
-              : StreamType.Arbitrary,
-            inlineVolume: true,
-          });
-          if (res2.volume)
-            res2.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, volume)));
-          return res2;
+          if (/webm/i.test(fmt2.mimeType || fmt2.container)) {
+            const res2 = createAudioResource(stream2, {
+              inputType: StreamType.WebmOpus,
+              inlineVolume: false,
+            });
+            return res2;
+          } else {
+            // Si no es webm/opus, transcodificar a Ogg/Opus
+            return createOpusResourceFromStream(stream2, volume);
+          }
         }
       } catch (eBasic) {
         if (DEBUG_AUDIO)
@@ -876,12 +860,8 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
           typeof s.type === "number" ? s.type : StreamType.WebmOpus;
         const resource = createAudioResource(s.stream, {
           inputType,
-          inlineVolume: true,
+          inlineVolume: false,
         });
-        if (resource.volume)
-          resource.volume.setVolumeLogarithmic(
-            Math.max(0, Math.min(2, volume))
-          );
         return resource;
       } catch (ePlay) {
         if (DEBUG_AUDIO && ePlay?.message !== "Invalid URL")
@@ -900,12 +880,8 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
             typeof s2.type === "number" ? s2.type : StreamType.WebmOpus;
           const resource2 = createAudioResource(s2.stream, {
             inputType: inputType2,
-            inlineVolume: true,
+            inlineVolume: false,
           });
-          if (resource2.volume)
-            resource2.volume.setVolumeLogarithmic(
-              Math.max(0, Math.min(2, volume))
-            );
           return resource2;
         } catch (ePlayB) {
           if (DEBUG_AUDIO && ePlayB?.message !== "Invalid URL")
@@ -949,10 +925,8 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
         typeof s.type === "number" ? s.type : StreamType.WebmOpus;
       const resource = createAudioResource(s.stream, {
         inputType,
-        inlineVolume: true,
+        inlineVolume: false,
       });
-      if (resource.volume)
-        resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, volume)));
       return resource;
     } catch (ePlay) {
       if (DEBUG_AUDIO)
@@ -972,12 +946,8 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
           typeof s2.type === "number" ? s2.type : StreamType.WebmOpus;
         const resource2 = createAudioResource(s2.stream, {
           inputType: inputType2,
-          inlineVolume: true,
+          inlineVolume: false,
         });
-        if (resource2.volume)
-          resource2.volume.setVolumeLogarithmic(
-            Math.max(0, Math.min(2, volume))
-          );
         return resource2;
       } catch (ePlayB) {
         if (DEBUG_AUDIO)
@@ -1185,6 +1155,13 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
     "-vn",
     "-sn",
     "-dn",
+    // Volumen por filtro si se especifica (evita inlineVolume y re-encode downstream)
+    ...(() => {
+      const v = Math.max(0, Math.min(2, Number(volume) || 1));
+      if (v === 1) return [];
+      // volumen lineal
+      return ["-filter:a", `volume=${v.toFixed(2)}`];
+    })(),
     "-ac",
     "2",
     "-ar",
@@ -1285,7 +1262,7 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   out.on("error", ignoreErr("ffmpeg:out"));
   const resource = createAudioResource(out, {
     inputType: StreamType.OggOpus,
-    inlineVolume: true,
+  inlineVolume: false,
   });
   // Asegurar limpieza si el recurso deja de usarse aguas arriba
   try {
@@ -1718,6 +1695,52 @@ function buildYtdlRequestOptions(videoIdOrUrl) {
   return opts;
 }
 
+// Transcodifica un stream arbitrario a Ogg/Opus con los mismos parámetros
+function createOpusResourceFromStream(inputStream, volume = 1.0) {
+  const ffmpegPath = process.env.FFMPEG_PATH || (() => { try { return require("ffmpeg-static"); } catch { return null; } })();
+  if (!ffmpegPath) throw new Error("FFMPEG_REQUIRED");
+  const targetBitrate = String(process.env.FFMPEG_OPUS_BITRATE || "128k");
+  const frameOption = (() => {
+    const v = Number(process.env.FFMPEG_OPUS_FRAME_MS || 20);
+    const allowed = [2.5, 5, 10, 20, 40, 60];
+    const chosen = allowed.includes(v) ? v : 20;
+    return ["-frame_duration", String(chosen)];
+  })();
+  const complexity = Math.max(0, Math.min(10, Number(process.env.FFMPEG_OPUS_COMPLEXITY || 5)));
+  const ffArgs = [
+    "-hide_banner",
+    "-loglevel",
+    DEBUG_AUDIO ? "info" : "warning",
+    "-nostdin",
+    "-i",
+    "pipe:0",
+    "-vn",
+    "-sn",
+    "-dn",
+    ...(() => {
+      const v = Math.max(0, Math.min(2, Number(volume) || 1));
+      if (v === 1) return [];
+      return ["-filter:a", `volume=${v.toFixed(2)}`];
+    })(),
+    "-ac", "2",
+    "-ar", "48000",
+    "-c:a", "libopus",
+    "-b:a", targetBitrate,
+    "-vbr", "on",
+    "-application", "audio",
+    ...frameOption,
+    "-compression_level", String(complexity),
+    "-f", "ogg",
+    "pipe:1",
+  ];
+  const ff = spawn(ffmpegPath, ffArgs, { stdio: ["pipe", "pipe", "pipe"] });
+  inputStream.pipe(ff.stdin);
+  if (DEBUG_AUDIO) ff.stderr.on("data", (d) => console.warn(`[ffmpeg] ${String(d).trim()}`));
+  const out = ff.stdout;
+  const resource = createAudioResource(out, { inputType: StreamType.OggOpus, inlineVolume: false });
+  return resource;
+}
+
 // Crear recurso directamente desde info de ytdl (evita pedir info de nuevo)
 function createResourceFromYtdlInfo(info, volume = 1.0) {
   try {
@@ -1753,13 +1776,8 @@ function createResourceFromYtdlInfo(info, volume = 1.0) {
       highWaterMark: 1 << 25,
       ...buildYtdlRequestOptions(vidRef),
     });
-    const resource = createAudioResource(fallbackStream, {
-      inputType: StreamType.Arbitrary,
-      inlineVolume: true,
-    });
-    if (resource.volume)
-      resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, volume)));
-    return resource;
+    // Transcodificar a Ogg/Opus y aplicar volumen en ffmpeg
+    return createOpusResourceFromStream(fallbackStream, volume);
   } catch (e) {
     return null;
   }
@@ -1937,7 +1955,7 @@ function startNowPlayingTicker(guildId) {
     // Solo refrescar cuando realmente está reproduciendo
     if (qq.player?.state?.status !== AudioPlayerStatus.Playing) return;
     renderNowPlaying(guildId).catch(() => {});
-  }, 3_000);
+  }, 1_000);
 }
 
 function stopNowPlayingTicker(guildId) {
