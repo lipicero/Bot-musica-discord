@@ -1105,9 +1105,16 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   // Elegir extractor-args (player_client) según cookies y configuración
   let effectiveClient = ytClient;
   if (!extractorArgsEnv) {
-    // Por defecto usar android (evita SABR en web y habilita bestaudio rápido). Si el usuario setea YT_YTDLP_CLIENT, respetarlo.
+    // Selección dinámica: si hay cookies -> web; si no -> android.
     if (!effectiveClient) {
-      effectiveClient = "android";
+      effectiveClient = cookieFile ? "web" : "android";
+    }
+    if (cookieFile && effectiveClient === "android" && !strictClient) {
+      effectiveClient = "web";
+      if (DEBUG_AUDIO)
+        console.log(
+          `[yt-dlp] cambiando player_client=android -> web (cookies presentes)`
+        );
     }
     if (effectiveClient) {
       args.push("--extractor-args", `youtube:player_client=${effectiveClient}`);
@@ -1123,7 +1130,7 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   // Lanzar yt-dlp (binario o wrapper)
   const yProc = binPath
     ? spawn(binPath, args, { stdio: ["ignore", "pipe", "pipe"] })
-  : ytdlp.raw(args[args.length - 1], {
+    : ytdlp.raw(args[args.length - 1], {
         o: "-",
     f: "bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio",
         noPlaylist: true,
@@ -1142,6 +1149,40 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
         })(),
         ...(forceIpv4 ? { forceIpv4: true } : {}),
       });
+  // Si falla por cliente android con cookies, reintentar con web una vez
+  let restarted = false;
+  const trySwitchToWeb = () => {
+    if (restarted || !cookieFile || effectiveClient === "web") return;
+    restarted = true;
+    try {
+      if (binPath) {
+        const idx = args.indexOf("--extractor-args");
+        if (idx >= 0) {
+          args[idx + 1] = "youtube:player_client=web";
+        } else {
+          args.push("--extractor-args", "youtube:player_client=web");
+        }
+        if (DEBUG_AUDIO) console.log("[yt-dlp] retry con player_client=web");
+        return spawn(binPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+      } else if (ytdlp && ytdlp.raw) {
+        const opts = {
+          o: "-",
+          f: "bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio",
+          noPlaylist: true,
+          ...(headers?.userAgent ? { userAgent: headers.userAgent } : {}),
+          ...(headers?.acceptLang
+            ? { addHeader: [`Accept-Language: ${headers.acceptLang}`] }
+            : {}),
+          ...(cookieFile ? { cookies: cookieFile } : {}),
+          extractorArgs: "youtube:player_client=web",
+          ...(forceIpv4 ? { forceIpv4: true } : {}),
+        };
+        if (DEBUG_AUDIO) console.log("[yt-dlp] retry (wrapper) con web");
+        return ytdlp.raw(url, opts);
+      }
+    } catch {}
+    return null;
+  };
 
   // ffmpeg para transcodificar a ogg/opus por pipe (parametrizable)
   const targetBitrate = String(process.env.FFMPEG_OPUS_BITRATE || "128k");
@@ -1191,7 +1232,23 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   const ff = spawn(ffmpegPath, ffArgs, { stdio: ["pipe", "pipe", "pipe"] });
 
   // Encadenar salida de yt-dlp a ffmpeg
-  yProc.stdout?.pipe(ff.stdin);
+  let yOut = yProc.stdout;
+  yProc.stderr?.on("data", (d) => {
+    const s = String(d || "");
+    if (/does not support cookies/i.test(s) || /Only images are available/i.test(s) || /Requested format is not available/i.test(s)) {
+      const alt = trySwitchToWeb();
+      if (alt) {
+        // re-encadenar con el nuevo proceso
+        yProc.stdout?.removeAllListeners?.();
+        yProc.stderr?.removeAllListeners?.();
+        yOut = alt.stdout;
+        alt.stderr?.on("data", (d2) => DEBUG_AUDIO && console.warn(`[yt-dlp] ${String(d2).trim()}`));
+        yOut?.pipe(ff.stdin);
+        return;
+      }
+    }
+  });
+  yOut?.pipe(ff.stdin);
   if (DEBUG_AUDIO) {
     yProc.stderr?.on("data", (d) => console.warn(`[yt-dlp] ${String(d).trim()}`));
     ff.stderr?.on("data", (d) => console.warn(`[ffmpeg] ${String(d).trim()}`));
