@@ -16,6 +16,7 @@ const MAX_PLAYLIST_ITEMS = Math.max(
   1,
   Math.min(100, Number(process.env.MAX_PLAYLIST_ITEMS || 25))
 );
+const PREFETCH_AHEAD = Math.max(0, Math.min(5, Number(process.env.PREFETCH_AHEAD || 2)));
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -46,6 +47,14 @@ try {
   ytdlp = require("yt-dlp-exec");
 } catch {}
 const { spawn, spawnSync } = require("child_process");
+let miniget = null;
+try {
+  miniget = require("miniget");
+} catch {}
+const WARMUP_AHEAD = Math.max(0, Math.min(3, Number(process.env.WARMUP_AHEAD || 1)));
+const WARMUP_ON_ADD = String(process.env.WARMUP_ON_ADD || "1") === "1";
+const WARMUP_BYTES = Math.max(16384, Math.min(1024 * 1024, Number(process.env.WARMUP_BYTES || 65536)));
+const WARMUP_TIMEOUT_MS = Math.max(500, Math.min(5000, Number(process.env.WARMUP_TIMEOUT_MS || 3000)));
 
 // Helpers de cookies YouTube
 function parseNetscapeCookieFileToHeader(content) {
@@ -414,10 +423,144 @@ function getQueue(guildId) {
       uiInterval: null,
       currentRetry: 0,
   currentSong: null,
+      prefetching: false,
     };
     queues.set(guildId, q);
   }
   return q;
+}
+
+async function schedulePrefetch(guildId) {
+  const q = queues.get(guildId);
+  if (!q || q.prefetching) return;
+  if (PREFETCH_AHEAD <= 0) return;
+  const forceYtDlp = String(process.env.YT_FORCE_YTDLP || "0") === "1";
+  if (forceYtDlp) return; // ytdlInfo prefetch no se usa cuando se fuerza yt-dlp
+  q.prefetching = true;
+  try {
+    // Prefetch para los próximos N temas a partir del índice 0 o 1 según si ya se está reproduciendo
+    const startIdx = 0; // incluimos actual si aún no tiene info (beneficia fast-start)
+    const endIdx = Math.min(q.songs.length, startIdx + 1 + PREFETCH_AHEAD);
+    for (let i = startIdx; i < endIdx; i++) {
+      const item = q.songs[i];
+      if (!item) continue;
+      if (item.ytdlInfo) continue;
+      if (!isYouTubeUrl(item.url)) continue;
+      try {
+        const id = extractYouTubeId(item.url) || item.url;
+        const info = await ytdl.getInfo(id, buildYtdlRequestOptions(id));
+        item.ytdlInfo = info;
+        // Actualizar metadata si faltaba
+        if (!item.title) item.title = info?.videoDetails?.title || item.url;
+        const dur = Number(info?.videoDetails?.lengthSeconds || 0) || 0;
+        if (!item.durationSec && dur) item.durationSec = Math.floor(dur);
+        if (!item.thumbnailUrl) {
+          item.thumbnailUrl = (info?.videoDetails?.thumbnails || [])[0]?.url || deriveYouTubeThumb(item.url);
+        }
+      } catch {}
+      // pequeño respiro para no saturar
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    // Warm-up ligero de audio para próximos temas
+    if (WARMUP_AHEAD > 0 && miniget) {
+      const playing = q.player?.state?.status === AudioPlayerStatus.Playing;
+      const startW = playing ? 1 : 0;
+      const endW = Math.min(q.songs.length, startW + WARMUP_AHEAD + 1);
+      for (let i = startW; i < endW; i++) {
+        const item = q.songs[i];
+        if (!item || item._warmed) continue;
+        const info = item.ytdlInfo;
+        if (!info) continue;
+        try {
+          let fmt = selectWebmOpusFormat(info.formats, "highest");
+          if (!fmt) {
+            fmt = ytdl.chooseFormat(info.formats, { quality: "highestaudio", filter: "audioonly" });
+          }
+          const direct = fmt?.url;
+          if (!direct) continue;
+          const headers = buildYtdlRequestOptions(info?.videoDetails?.video_url || item.url)?.requestOptions?.headers || {};
+          await warmupUrl(direct, headers, WARMUP_BYTES, WARMUP_TIMEOUT_MS);
+          item._warmed = true;
+        } catch {}
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    }
+  } finally {
+    q.prefetching = false;
+  }
+}
+
+async function warmupUrl(url, headers, bytes, timeoutMs) {
+  if (!miniget || !url) return;
+  return await new Promise((resolve) => {
+    let done = false;
+    let req;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      try { clearTimeout(timer); } catch {}
+      try { req?.destroy(); } catch {}
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    const h = Object.assign({}, headers, { Range: `bytes=0-${bytes - 1}` });
+    try {
+      req = miniget(url, { headers: h });
+    } catch {
+      return finish();
+    }
+    let read = 0;
+    req.on("data", (chunk) => {
+      read += chunk.length;
+      if (read >= bytes) finish();
+    });
+    req.on("error", finish);
+    req.on("end", finish);
+  });
+}
+
+async function warmupItems(items) {
+  if (!Array.isArray(items) || items.length === 0) return;
+  const forceYtDlp = String(process.env.YT_FORCE_YTDLP || "0") === "1";
+  for (const item of items) {
+    if (!item || item._warmed) continue;
+    try {
+      let directUrl = null;
+      let headers = null;
+      if (isYouTubeUrl(item.url)) {
+        if (!forceYtDlp && item.ytdlInfo) {
+          let fmt = selectWebmOpusFormat(item.ytdlInfo.formats, "highest");
+          if (!fmt) fmt = ytdl.chooseFormat(item.ytdlInfo.formats, { quality: "highestaudio", filter: "audioonly" });
+          directUrl = fmt?.url || null;
+          headers = buildYtdlRequestOptions(item.url)?.requestOptions?.headers || {};
+        } else {
+          // Usar yt-dlp -g para URL directa cuando está forzado
+          try {
+            const u = await getDirectUrlFromYtDlp(item.url, {
+              userAgent:
+                process.env.YTDL_USER_AGENT ||
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+              acceptLang: process.env.YTDL_ACCEPT_LANGUAGE || "es-ES,es;q=0.9,en;q=0.8",
+            });
+            directUrl = u;
+            headers = {};
+          } catch {}
+        }
+      }
+      if (directUrl) {
+        await warmupUrl(directUrl, headers, WARMUP_BYTES, WARMUP_TIMEOUT_MS);
+        item._warmed = true;
+      }
+    } catch {}
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
+function maybeWarmupOnAdd(guildId, newItems) {
+  if (!WARMUP_ON_ADD) return;
+  if (!newItems || newItems.length === 0) return;
+  // Warm-up en background, sin bloquear
+  warmupItems(newItems).catch(() => {});
 }
 
 async function ensureConnection(guild, voiceChannel) {
@@ -2032,6 +2175,7 @@ client.on("messageCreate", async (message) => {
         const items = (pl.videos || []).slice(0, MAX_PLAYLIST_ITEMS);
         if (items.length === 0)
           return message.reply("❌ No pude leer la playlist.");
+        const added = [];
         for (const vid of items) {
           const url =
             vid.url ||
@@ -2041,14 +2185,18 @@ client.on("messageCreate", async (message) => {
           const title = vid.title || vid.name || url;
           const dur =
             Number(vid.durationInSec || vid.durationInMs / 1000 || 0) || 0;
-          q.songs.push({
+          const song = {
             url: canonicalizeYouTubeUrl(url),
             title,
             durationSec: dur ? Math.floor(dur) : 0,
             thumbnailUrl: deriveYouTubeThumb(url),
             requestedById: message.author.id,
-          });
+          };
+          q.songs.push(song);
+          added.push(song);
         }
+        maybeWarmupOnAdd(message.guild.id, added);
+  schedulePrefetch(message.guild.id).catch(() => {});
         if (
           q.songs.length > 0 &&
           q.player.state.status !== AudioPlayerStatus.Playing
@@ -2129,7 +2277,9 @@ client.on("messageCreate", async (message) => {
         };
       }
       await connectP;
-      q.songs.push(songData);
+  q.songs.push(songData);
+  maybeWarmupOnAdd(message.guild.id, [songData]);
+  schedulePrefetch(message.guild.id).catch(() => {});
       let header;
   if (q.player.state.status !== AudioPlayerStatus.Playing && q.songs.length === 1) {
         await playNext(message.guild.id);
@@ -2496,6 +2646,7 @@ client.on("interactionCreate", async (interaction) => {
             return safeRespond(interaction, "❌ No pude leer la playlist.", {
               edit: true,
             });
+          const added = [];
           for (const vid of items) {
             const url =
               vid.url ||
@@ -2505,14 +2656,18 @@ client.on("interactionCreate", async (interaction) => {
             const title = vid.title || vid.name || url;
             const dur =
               Number(vid.durationInSec || vid.durationInMs / 1000 || 0) || 0;
-            q.songs.push({
+            const song = {
               url: canonicalizeYouTubeUrl(url),
               title,
               durationSec: dur ? Math.floor(dur) : 0,
               thumbnailUrl: deriveYouTubeThumb(url),
               requestedById: member?.user?.id,
-            });
+            };
+            q.songs.push(song);
+            added.push(song);
           }
+          maybeWarmupOnAdd(guild.id, added);
+          schedulePrefetch(guild.id).catch(() => {});
           if (
             q.songs.length > 0 &&
             q.player.state.status !== AudioPlayerStatus.Playing
@@ -2627,7 +2782,9 @@ client.on("interactionCreate", async (interaction) => {
           { edit: true }
         );
       }
-      q.songs.push(songData);
+  q.songs.push(songData);
+  maybeWarmupOnAdd(guild.id, [songData]);
+  schedulePrefetch(guild.id).catch(() => {});
       let header;
   if (q.player.state.status !== AudioPlayerStatus.Playing && q.songs.length === 1) {
         await playNext(guild.id);
