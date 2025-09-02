@@ -40,6 +40,11 @@ const {
 } = require("@discordjs/voice");
 const playdl = require("play-dl");
 const ytdl = require("@distube/ytdl-core");
+let ytdlp = null;
+try {
+  ytdlp = require("yt-dlp-exec");
+} catch {}
+const { spawn } = require("child_process");
 
 // Config opcional de YouTube para play-dl (evita bloqueos/edad/consent)
 try {
@@ -62,7 +67,7 @@ const client = new Client({
   ],
 });
 
-// Cuando el bot está listo (v14: alias; en v15 sólo 'clientReady')
+// Evento recomendado en v14: 'clientReady' (evita warning de deprecación)
 client.once("clientReady", async (c) => {
   console.log(`✅ Bot conectado como ${c.user.tag}`);
   // Registro rápido por cada servidor donde está el bot
@@ -195,6 +200,18 @@ function getQueue(guildId) {
     const player = createAudioPlayer({
       behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
     });
+    if (DEBUG_AUDIO) {
+      player.on("stateChange", (oldState, newState) => {
+        try {
+          const os = oldState?.status;
+          const ns = newState?.status;
+          const ms = q?.player?.state?.resource?.playbackDuration || 0;
+          console.log(
+            `[player] state ${os} -> ${ns} (${Math.floor(ms / 1000)}s)`
+          );
+        } catch {}
+      });
+    }
     player.on("error", async (err) => {
       console.error("[player:error]", err);
       const qq = queues.get(guildId);
@@ -205,11 +222,52 @@ function getQueue(guildId) {
         try {
           const current = qq.songs[0];
           if (current?.url) {
+            const forceYtDlp = String(process.env.YT_FORCE_YTDLP);
+            if (forceYtDlp && ytdlp) {
+              const res2 = await createResourceFromYtDlp(
+                current.url,
+                qq.volume ?? 1.0,
+                {
+                  userAgent:
+                    process.env.YTDL_USER_AGENT ||
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                  acceptLang:
+                    process.env.YTDL_ACCEPT_LANGUAGE ||
+                    "es-ES,es;q=0.9,en;q=0.8",
+                  cookie: process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE,
+                }
+              );
+              qq.player.play(res2);
+              return;
+            }
+            // Primero intentar con play-dl
             const resource = await createResourceFromUrl(
               current.url,
               qq.volume ?? 1.0,
               { preferPlayDl: true }
-            );
+            ).catch(() => null);
+            if (resource) {
+              qq.player.play(resource);
+              return;
+            }
+            // Luego probar con yt-dlp si está disponible
+            if (ytdlp) {
+              const res3 = await createResourceFromYtDlp(
+                current.url,
+                qq.volume ?? 1.0,
+                {
+                  userAgent:
+                    process.env.YTDL_USER_AGENT ||
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                  acceptLang:
+                    process.env.YTDL_ACCEPT_LANGUAGE ||
+                    "es-ES,es;q=0.9,en;q=0.8",
+                  cookie: process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE,
+                }
+              );
+              qq.player.play(res3);
+              return;
+            }
             qq.player.play(resource);
             return;
           }
@@ -313,6 +371,8 @@ async function ensureConnection(guild, voiceChannel) {
   }
 
   const attemptJoin = async () => {
+    if (DEBUG_AUDIO)
+      console.log(`[voice] intentando unirse a ${voiceChannel?.id}`);
     const conn = joinVoiceChannel({
       channelId: voiceChannel.id,
       guildId: guild.id,
@@ -362,6 +422,8 @@ async function ensureConnection(guild, voiceChannel) {
     });
     conn.subscribe(q.player);
     await entersState(conn, VoiceConnectionStatus.Ready, 45_000);
+    if (DEBUG_AUDIO)
+      console.log(`[voice] conectado y listo en guild ${guild.id}`);
     return conn;
   };
 
@@ -417,10 +479,57 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
   };
   // Para YouTube
   if (isYouTubeUrl(url)) {
+    // Resolver ID una sola vez para reutilizar en fallbacks
+    const id = extractYouTubeId(url) || url;
     const forcePlayDl = String(process.env.YT_FORCE_PLAYDL || "0") === "1";
+    const forceYtDlp = String(process.env.YT_FORCE_YTDLP || "0") === "1";
+    // Si se fuerza yt-dlp, usarlo directo
+    if (forceYtDlp) {
+      const hasBin = !!getYtDlpBinaryPath() || !!ytdlp;
+      if (hasBin) {
+        if (DEBUG_AUDIO)
+          console.log(`[createResource] usando yt-dlp (forzado)`);
+        return await createResourceFromYtDlp(url, volume, {
+          userAgent,
+          acceptLang,
+          cookie: ytCookie,
+        });
+      } else {
+        if (DEBUG_AUDIO)
+          console.warn(
+            `[createResource] YT_FORCE_YTDLP=1 pero no hay yt-dlp instalado; usando play-dl`
+          );
+        // Intentar play-dl de inmediato y evitar ytdl-core cuando se fuerza yt-dlp
+        try {
+          const info = await playdl.video_info(url);
+          const s = await playdl.stream_from_info(info, {
+            discordPlayerCompatibility: true,
+          });
+          const inputType =
+            typeof s.type === "number" ? s.type : StreamType.WebmOpus;
+          const resource = createAudioResource(s.stream, {
+            inputType,
+            inlineVolume: true,
+          });
+          if (resource.volume)
+            resource.volume.setVolumeLogarithmic(
+              Math.max(0, Math.min(2, volume))
+            );
+          return resource;
+        } catch (eForceNoBin) {
+          if (DEBUG_AUDIO)
+            console.warn(
+              `[createResource] play-dl falló sin yt-dlp:`,
+              eForceNoBin?.message || eForceNoBin
+            );
+        }
+      }
+    }
     // Si se solicita o está forzado, intentamos primero con play-dl para evitar 403 de firmas/cookies
-    if (preferPlayDl || forcePlayDl) {
+    if (!forceYtDlp && (preferPlayDl || forcePlayDl)) {
       try {
+        if (DEBUG_AUDIO)
+          console.log(`[createResource] usando play-dl (prefer/force)`);
         const info = await playdl.video_info(url);
         const s = await playdl.stream_from_info(info, {
           discordPlayerCompatibility: true,
@@ -452,16 +561,17 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
         // Si allowFallback o no está forzado, continuamos al branch ytdl
       }
     }
-    // En caso contrario, priorizar ytdl-core
+    // En caso contrario, priorizar ytdl-core (a menos que se fuerce yt-dlp)
     try {
-      const id = extractYouTubeId(url) || url;
-      const info = await ytdl.getInfo(id, { requestOptions: baseReqOpts });
+      if (DEBUG_AUDIO) console.log(`[createResource] usando ytdl-core getInfo`);
+      const info = await ytdl.getInfo(id, buildYtdlRequestOptions(id));
       const fmt = selectWebmOpusFormat(info.formats);
       if (fmt) {
+        if (DEBUG_AUDIO) console.log(`[createResource] ytdl formato webm/opus`);
         const stream = ytdl.downloadFromInfo(info, {
           format: fmt,
           highWaterMark: 1 << 25,
-          requestOptions: baseReqOpts,
+          ...buildYtdlRequestOptions(info?.videoDetails?.video_url || id),
         });
         const resource = createAudioResource(stream, {
           inputType: StreamType.WebmOpus,
@@ -474,11 +584,12 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
         return resource;
       }
       // Si no hay WebM/Opus, usar audioonly y dejar que ffmpeg demux/transcode (requiere ffmpeg-static)
+      if (DEBUG_AUDIO) console.log(`[createResource] ytdl fallback audioonly`);
       const fallbackStream = ytdl.downloadFromInfo(info, {
         quality: "highestaudio",
         filter: "audioonly",
         highWaterMark: 1 << 25,
-        requestOptions: baseReqOpts,
+        ...buildYtdlRequestOptions(info?.videoDetails?.video_url || id),
       });
       const resource = createAudioResource(fallbackStream, {
         inputType: StreamType.Arbitrary,
@@ -495,11 +606,27 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
           "url:",
           url
         );
+      // Intentar yt-dlp si está disponible o forzado
+      try {
+        if (ytdlp) {
+          const r = await createResourceFromYtDlp(url, volume, {
+            userAgent,
+            acceptLang,
+            cookie: ytCookie,
+          });
+          return r;
+        }
+      } catch (eYtdlpA) {
+        if (DEBUG_AUDIO)
+          console.warn(
+            "[createResource:ytdlp:fallback-A]",
+            eYtdlpA?.message || eYtdlpA
+          );
+      }
       // Segundo intento: getBasicInfo y formato directo
       try {
-        const basic = await ytdl.getBasicInfo(id, {
-          requestOptions: baseReqOpts,
-        });
+        if (DEBUG_AUDIO) console.log(`[createResource] ytdl getBasicInfo`);
+        const basic = await ytdl.getBasicInfo(id, buildYtdlRequestOptions(id));
         const fmt2 =
           selectWebmOpusFormat(basic.formats) ||
           ytdl.chooseFormat(basic.formats, {
@@ -507,10 +634,12 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
             filter: "audioonly",
           });
         if (fmt2) {
+          if (DEBUG_AUDIO)
+            console.log(`[createResource] ytdl chooseFormat directo`);
           const stream2 = ytdl(id, {
             format: fmt2,
             highWaterMark: 1 << 25,
-            requestOptions: baseReqOpts,
+            ...buildYtdlRequestOptions(id),
           });
           const res2 = createAudioResource(stream2, {
             inputType: /webm/i.test(fmt2.mimeType || fmt2.container)
@@ -533,6 +662,7 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
       }
       // Fallback a play-dl si ytdl falla
       try {
+        if (DEBUG_AUDIO) console.log(`[createResource] fallback play-dl A`);
         const info = await playdl.video_info(url);
         const s = await playdl.stream_from_info(info, {
           discordPlayerCompatibility: true,
@@ -557,6 +687,7 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
             url
           );
         try {
+          if (DEBUG_AUDIO) console.log(`[createResource] fallback play-dl B`);
           const s2 = await playdl.stream(url, {
             discordPlayerCompatibility: true,
           });
@@ -579,12 +710,32 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
               "url:",
               url
             );
+          // Último intento con yt-dlp
+          try {
+            if (ytdlp) {
+              if (DEBUG_AUDIO)
+                console.log(`[createResource] fallback yt-dlp B`);
+              const r2 = await createResourceFromYtDlp(url, volume, {
+                userAgent,
+                acceptLang,
+                cookie: ytCookie,
+              });
+              return r2;
+            }
+          } catch (eYtdlpB) {
+            if (DEBUG_AUDIO)
+              console.warn(
+                "[createResource:ytdlp:fallback-B]",
+                eYtdlpB?.message || eYtdlpB
+              );
+          }
         }
       }
     }
   } else {
     // No YouTube: usar play-dl primero (Soundcloud, etc.)
     try {
+      if (DEBUG_AUDIO) console.log(`[createResource] no-YouTube con play-dl`);
       const info = await playdl.video_info(url);
       const s = await playdl.stream_from_info(info, {
         discordPlayerCompatibility: true,
@@ -607,6 +758,8 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
           url
         );
       try {
+        if (DEBUG_AUDIO)
+          console.log(`[createResource] no-YouTube fallback play-dl B`);
         const s2 = await playdl.stream(url, {
           discordPlayerCompatibility: true,
         });
@@ -637,6 +790,190 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
   const err = new Error("UNPLAYABLE_URL");
   err.url = url;
   throw err;
+}
+
+async function getDirectUrlFromYtDlp(targetUrl, headers = {}) {
+  const binPath = getYtDlpBinaryPath();
+  const addHeader = [];
+  if (headers?.userAgent) addHeader.push(`User-Agent: ${headers.userAgent}`);
+  if (headers?.acceptLang)
+    addHeader.push(`Accept-Language: ${headers.acceptLang}`);
+  if (headers?.cookie) addHeader.push(`Cookie: ${headers.cookie}`);
+  return await new Promise((resolve, reject) => {
+    if (binPath) {
+      const args = ["-g", "-f", "bestaudio/best", "--no-playlist"];
+      for (const h of addHeader) args.push("--add-header", h);
+      args.push(targetUrl);
+      const proc = spawn(binPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+      let out = "";
+      let err = "";
+      proc.stdout.on("data", (d) => {
+        out += d.toString();
+      });
+      proc.stderr.on("data", (d) => {
+        err += d.toString();
+      });
+      proc.on("close", (code) => {
+        if (code === 0) {
+          const lines = out
+            .split(/\r?\n/)
+            .map((s) => s.trim())
+            .filter(Boolean);
+          if (lines.length) return resolve(lines[0]);
+          return reject(new Error("YTDLP_NO_URL"));
+        }
+        if (DEBUG_AUDIO && err) console.warn(`[yt-dlp] ${err.trim()}`);
+        reject(new Error(`YTDLP_EXIT_${code}`));
+      });
+      proc.on("error", reject);
+    } else if (ytdlp && ytdlp.raw) {
+      const proc = ytdlp.raw(targetUrl, {
+        g: true,
+        format: "bestaudio/best",
+        noPlaylist: true,
+        addHeader,
+      });
+      let out = "";
+      let err = "";
+      proc.stdout.on("data", (d) => {
+        out += d.toString();
+      });
+      proc.stderr.on("data", (d) => {
+        err += d.toString();
+      });
+      proc.on("close", (code) => {
+        if (code === 0) {
+          const lines = out
+            .split(/\r?\n/)
+            .map((s) => s.trim())
+            .filter(Boolean);
+          if (lines.length) return resolve(lines[0]);
+          return reject(new Error("YTDLP_NO_URL"));
+        }
+        if (DEBUG_AUDIO && err) console.warn(`[yt-dlp] ${err.trim()}`);
+        reject(new Error(`YTDLP_EXIT_${code}`));
+      });
+      proc.on("error", reject);
+    } else {
+      reject(new Error("YTDLP_NOT_AVAILABLE"));
+    }
+  });
+}
+
+async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
+  if (DEBUG_AUDIO) console.log(`[yt-dlp] invocando yt-dlp para ${url}`);
+  // 1) Obtener URL directa del audio
+  const directUrl = await getDirectUrlFromYtDlp(url, headers);
+  // 2) Pasar por ffmpeg para forzar webm/opus estable leyendo directo desde la URL
+  const ffmpegPath = process.env.FFMPEG_PATH || require("ffmpeg-static");
+  if (!ffmpegPath) throw new Error("FFMPEG_REQUIRED");
+  const hdrs = [];
+  if (headers?.userAgent) hdrs.push(`User-Agent: ${headers.userAgent}`);
+  if (headers?.acceptLang) hdrs.push(`Accept-Language: ${headers.acceptLang}`);
+  if (headers?.cookie) hdrs.push(`Cookie: ${headers.cookie}`);
+  const headerString = hdrs.length ? hdrs.join("\r\n") + "\r\n" : null;
+  const ffArgs = [
+    "-hide_banner",
+    "-loglevel",
+    "warning",
+    "-nostdin",
+    "-reconnect",
+    "1",
+    "-reconnect_streamed",
+    "1",
+    "-reconnect_delay_max",
+    "5",
+  ];
+  if (headerString) ffArgs.push("-headers", headerString);
+  ffArgs.push(
+    "-i",
+    directUrl,
+    "-vn",
+    "-sn",
+    "-dn",
+    "-ac",
+    "2",
+    "-ar",
+    "48000",
+    "-c:a",
+    "libopus",
+    "-b:a",
+    "160k",
+    "-application",
+    "audio",
+    "-frame_duration",
+    "60",
+    "-f",
+    "ogg",
+    "pipe:1"
+  );
+  const ff = spawn(ffmpegPath, ffArgs, { stdio: ["ignore", "pipe", "pipe"] });
+  ff.stderr?.on("data", (d) => {
+    const s = d.toString();
+    if (DEBUG_AUDIO) console.warn(`[ffmpeg] ${s.trim()}`);
+  });
+  const out = ff.stdout;
+  out.on("close", () => {
+    if (!ff.killed)
+      try {
+        ff.kill("SIGKILL");
+      } catch {}
+  });
+  const resource = createAudioResource(out, {
+    inputType: StreamType.OggOpus,
+    inlineVolume: true,
+  });
+  if (resource.volume)
+    resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, volume)));
+  return resource;
+}
+
+function getYtDlpBinaryPath() {
+  // 1) Variable de entorno explícita
+  if (process.env.YT_DLP_PATH && fs.existsSync(process.env.YT_DLP_PATH)) {
+    return process.env.YT_DLP_PATH;
+  }
+  // 2) Buscar en PATH con where/which
+  try {
+    if (process.platform === "win32") {
+      const r = spawnSync("where", ["yt-dlp.exe"], { encoding: "utf8" });
+      if (r.status === 0) {
+        const line = String(r.stdout || "")
+          .split(/\r?\n/)
+          .find(Boolean);
+        if (line && fs.existsSync(line.trim())) return line.trim();
+      }
+      const r2 = spawnSync("where", ["yt-dlp"], { encoding: "utf8" });
+      if (r2.status === 0) {
+        const line = String(r2.stdout || "")
+          .split(/\r?\n/)
+          .find(Boolean);
+        if (line && fs.existsSync(line.trim())) return line.trim();
+      }
+    } else {
+      const r = spawnSync("which", ["yt-dlp"], { encoding: "utf8" });
+      if (r.status === 0) {
+        const line = String(r.stdout || "")
+          .split(/\r?\n/)
+          .find(Boolean);
+        if (line && fs.existsSync(line.trim())) return line.trim();
+      }
+    }
+  } catch {}
+  // 3) Rutas comunes en Windows
+  if (process.platform === "win32") {
+    const guesses = [
+      "C:/Windows/yt-dlp.exe",
+      "C:/Program Files/yt-dlp/yt-dlp.exe",
+      "C:/Program Files (x86)/yt-dlp/yt-dlp.exe",
+    ];
+    for (const p of guesses) {
+      try {
+        if (fs.existsSync(p)) return p;
+      } catch {}
+    }
+  }
+  return null;
 }
 
 // Convierte "a=b; c=d" en [{name:'a',value:'b'}, {name:'c',value:'d'}]
@@ -890,11 +1227,18 @@ function buildYtdlRequestOptions(videoIdOrUrl) {
     "user-agent": userAgent,
     "accept-language": acceptLang,
   };
-  if (ytCookie) headers.cookie = ytCookie;
+  // Si no podemos construir el formato nuevo, dejamos el viejo en headers
+  const cookiesArray = ytCookie ? parseCookieHeaderToArray(ytCookie) : null;
+  if (!cookiesArray || cookiesArray.length === 0) {
+    if (ytCookie) headers.cookie = ytCookie;
+  }
   if (referer) headers.referer = referer;
-  return {
-    requestOptions: { headers },
-  };
+  // Construir opciones en nuevo formato si hay cookies
+  const opts = { requestOptions: { headers } };
+  if (cookiesArray && cookiesArray.length) {
+    opts.requestOptions.cookies = cookiesArray;
+  }
+  return opts;
 }
 
 // Crear recurso directamente desde info de ytdl (evita pedir info de nuevo)
@@ -991,14 +1335,15 @@ async function playNext(guildId) {
       Math.min(8000, Number(process.env.FAST_START_MS || 2000))
     );
     const longEnough = (current.durationSec || 0) >= 60;
+    const forceYtDlp = String(process.env.YT_FORCE_YTDLP);
 
-    if (current.ytdlInfo && fastStartEnabled && longEnough) {
+    if (!forceYtDlp && current.ytdlInfo && fastStartEnabled && longEnough) {
       resource =
         createFastStartResourceFromYtdlInfo(
           current.ytdlInfo,
           q.volume ?? 1.0
         ) || createResourceFromYtdlInfo(current.ytdlInfo, q.volume ?? 1.0);
-    } else if (current.ytdlInfo) {
+    } else if (!forceYtDlp && current.ytdlInfo) {
       resource = createResourceFromYtdlInfo(current.ytdlInfo, q.volume ?? 1.0);
     }
     if (!resource) {
@@ -1028,15 +1373,18 @@ async function playNext(guildId) {
       }, fastDelayMs);
     }
 
-    try {
-      await renderNowPlaying(guildId);
-    } catch (e) {
-      if (DEBUG_AUDIO)
-        console.warn("[renderNowPlaying:error]", e?.message || e);
+    // Evitar duplicados: sólo actualizar si ya existe un panel asignado
+    if (q.nowPlayingMessageId) {
+      try {
+        await renderNowPlaying(guildId);
+      } catch (e) {
+        if (DEBUG_AUDIO)
+          console.warn("[renderNowPlaying:error]", e?.message || e);
+      }
+      try {
+        startNowPlayingTicker(guildId);
+      } catch {}
     }
-    try {
-      startNowPlayingTicker(guildId);
-    } catch {}
   } catch (e) {
     console.error("[playNext:error]", e?.message || e, "url:", current?.url);
     // Fallback: forzar play-dl para esta URL
@@ -1047,12 +1395,14 @@ async function playNext(guildId) {
         { preferPlayDl: true }
       );
       q.player.play(fallbackRes);
-      try {
-        await renderNowPlaying(guildId);
-      } catch {}
-      try {
-        startNowPlayingTicker(guildId);
-      } catch {}
+      if (q.nowPlayingMessageId) {
+        try {
+          await renderNowPlaying(guildId);
+        } catch {}
+        try {
+          startNowPlayingTicker(guildId);
+        } catch {}
+      }
       return;
     } catch (e2) {
       if (DEBUG_AUDIO)
@@ -1069,7 +1419,7 @@ async function playNext(guildId) {
             .send(
               `⚠️ No se pudo reproducir: ${
                 current?.title || current?.url || "pista"
-              } — se salta.`
+              } — siguiente canción...`
             )
             .catch(() => {});
         }
@@ -1250,7 +1600,7 @@ async function renderNowPlaying(guildId) {
       const msg = await channel.messages.fetch(q.nowPlayingMessageId);
       await msg.edit(
         canEmbed
-          ? { embeds: [embed], components }
+          ? { content: "", embeds: [embed], components }
           : { content: contentFallback, components }
       );
       return msg;
@@ -1375,21 +1725,32 @@ client.on("messageCreate", async (message) => {
       const ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
       let songData = null;
       if (isYouTubeUrl(finalUrl)) {
-        const id = extractYouTubeId(finalUrl) || finalUrl;
-        const info = await ytdl.getInfo(id);
-        const title = info?.videoDetails?.title || finalUrl;
-        const dur = Number(info?.videoDetails?.lengthSeconds || 0) || 0;
-        const thumb =
-          (info?.videoDetails?.thumbnails || [])[0]?.url ||
-          deriveYouTubeThumb(finalUrl);
-        songData = {
-          url: finalUrl,
-          title,
-          durationSec: dur ? Math.floor(dur) : 0,
-          thumbnailUrl: thumb,
-          requestedById: message.author.id,
-          ytdlInfo: info,
-        };
+        if (String(process.env.YT_FORCE_YTDLP)) {
+          const meta = await fetchMetadata(finalUrl);
+          songData = {
+            url: finalUrl,
+            title: meta.title,
+            durationSec: meta.durationSec || 0,
+            thumbnailUrl: meta.thumbnailUrl,
+            requestedById: message.author.id,
+          };
+        } else {
+          const id = extractYouTubeId(finalUrl) || finalUrl;
+          const info = await ytdl.getInfo(id);
+          const title = info?.videoDetails?.title || finalUrl;
+          const dur = Number(info?.videoDetails?.lengthSeconds || 0) || 0;
+          const thumb =
+            (info?.videoDetails?.thumbnails || [])[0]?.url ||
+            deriveYouTubeThumb(finalUrl);
+          songData = {
+            url: finalUrl,
+            title,
+            durationSec: dur ? Math.floor(dur) : 0,
+            thumbnailUrl: thumb,
+            requestedById: message.author.id,
+            ytdlInfo: info,
+          };
+        }
       } else {
         const meta = await fetchMetadata(finalUrl);
         songData = {
@@ -1820,23 +2181,7 @@ client.on("interactionCreate", async (interaction) => {
       const ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
       let songData = null;
       if (isYouTubeUrl(finalUrl)) {
-        try {
-          const id = extractYouTubeId(finalUrl) || finalUrl;
-          const info = await ytdl.getInfo(id);
-          const title = info?.videoDetails?.title || finalUrl;
-          const dur = Number(info?.videoDetails?.lengthSeconds || 0) || 0;
-          const thumb =
-            (info?.videoDetails?.thumbnails || [])[0]?.url ||
-            deriveYouTubeThumb(finalUrl);
-          songData = {
-            url: finalUrl,
-            title,
-            durationSec: dur ? Math.floor(dur) : 0,
-            thumbnailUrl: thumb,
-            requestedById: member?.user?.id,
-            ytdlInfo: info,
-          };
-        } catch {
+        if (String(process.env.YT_FORCE_YTDLP)) {
           const meta = await fetchMetadata(finalUrl);
           songData = {
             url: finalUrl,
@@ -1845,6 +2190,33 @@ client.on("interactionCreate", async (interaction) => {
             thumbnailUrl: meta.thumbnailUrl,
             requestedById: member?.user?.id,
           };
+        } else {
+          try {
+            const id = extractYouTubeId(finalUrl) || finalUrl;
+            const info = await ytdl.getInfo(id);
+            const title = info?.videoDetails?.title || finalUrl;
+            const dur = Number(info?.videoDetails?.lengthSeconds || 0) || 0;
+            const thumb =
+              (info?.videoDetails?.thumbnails || [])[0]?.url ||
+              deriveYouTubeThumb(finalUrl);
+            songData = {
+              url: finalUrl,
+              title,
+              durationSec: dur ? Math.floor(dur) : 0,
+              thumbnailUrl: thumb,
+              requestedById: member?.user?.id,
+              ytdlInfo: info,
+            };
+          } catch {
+            const meta = await fetchMetadata(finalUrl);
+            songData = {
+              url: finalUrl,
+              title: meta.title,
+              durationSec: meta.durationSec || 0,
+              thumbnailUrl: meta.thumbnailUrl,
+              requestedById: member?.user?.id,
+            };
+          }
         }
       } else {
         const meta = await fetchMetadata(finalUrl);
