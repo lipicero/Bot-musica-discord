@@ -933,11 +933,27 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
 
   // Preparar encabezados y cookie para yt-dlp (no para ffmpeg)
   const args = ["--no-playlist", "-f", "bestaudio/best", "-o", "-"];
+  // Opcionales para mitigar captcha en YouTube
+  const extractorArgsEnv = (process.env.YT_YTDLP_EXTRACTOR_ARGS || "").trim();
+  const ytClient = (process.env.YT_YTDLP_CLIENT || "").trim().toLowerCase(); // p.ej.: android | tvhtml5 | web | ios | mweb
+  const forceIpv4 = String(process.env.YT_FORCE_IPV4 || "0") === "1";
+
   if (headers?.userAgent) {
     args.push("--user-agent", headers.userAgent);
   }
   if (headers?.acceptLang) {
     args.push("--add-header", `Accept-Language: ${headers.acceptLang}`);
+  }
+  if (extractorArgsEnv) {
+    args.push("--extractor-args", extractorArgsEnv);
+    if (DEBUG_AUDIO) console.log(`[yt-dlp] extractor-args (env): ${extractorArgsEnv}`);
+  } else if (ytClient) {
+    args.push("--extractor-args", `youtube:player_client=${ytClient}`);
+    if (DEBUG_AUDIO) console.log(`[yt-dlp] usando player_client=${ytClient}`);
+  }
+  if (forceIpv4) {
+    args.push("--force-ipv4");
+    if (DEBUG_AUDIO) console.log(`[yt-dlp] forzando IPv4`);
   }
   const cookieFile = ensureYtDlpCookiesFileFromEnv();
   if (cookieFile) {
@@ -957,6 +973,12 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
           ? { addHeader: [`Accept-Language: ${headers.acceptLang}`] }
           : {}),
         ...(cookieFile ? { cookies: cookieFile } : {}),
+        ...(extractorArgsEnv
+          ? { extractorArgs: extractorArgsEnv }
+          : ytClient
+          ? { extractorArgs: `youtube:player_client=${ytClient}` }
+          : {}),
+        ...(forceIpv4 ? { forceIpv4: true } : {}),
       });
 
   // ffmpeg para transcodificar a ogg/opus por pipe
