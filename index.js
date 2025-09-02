@@ -1036,20 +1036,45 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
     ff.stderr?.on("data", (d) => console.warn(`[ffmpeg] ${String(d).trim()}`));
   }
 
+  // Manejo de errores de streams para evitar EPIPE/ECONNRESET no capturados
+  const ignoreErr = (label) => (err) => {
+    if (!err) return;
+    const code = err?.code || "";
+    if (code === "EPIPE" || code === "ECONNRESET") {
+      if (DEBUG_AUDIO) console.warn(`[${label}] ${code} (ignorada)`);
+      return; // suprimir
+    }
+    console.warn(`[${label}]`, err?.message || err);
+  };
+  yProc.on?.("error", ignoreErr("yt-dlp:proc"));
+  yProc.stdout?.on("error", ignoreErr("yt-dlp:stdout"));
+  yProc.stdin?.on?.("error", ignoreErr("yt-dlp:stdin"));
+  ff.on("error", ignoreErr("ffmpeg:proc"));
+  ff.stdout.on("error", ignoreErr("ffmpeg:stdout"));
+  ff.stdin.on("error", ignoreErr("ffmpeg:stdin"));
+
   // Crear recurso
   const out = ff.stdout;
-  out.on("close", () => {
+  const cleanup = () => {
     try {
       ff.kill("SIGKILL");
     } catch {}
     try {
       yProc.kill?.("SIGKILL");
     } catch {}
-  });
+  };
+  out.on("close", cleanup);
+  out.on("end", cleanup);
+  out.on("error", ignoreErr("ffmpeg:out"));
   const resource = createAudioResource(out, {
     inputType: StreamType.OggOpus,
     inlineVolume: true,
   });
+  // Asegurar limpieza si el recurso deja de usarse aguas arriba
+  try {
+    resource.playStream?.once?.("close", cleanup);
+    resource.playStream?.on?.("error", ignoreErr("resource:playStream"));
+  } catch {}
   if (resource.volume)
     resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, volume)));
   return resource;
