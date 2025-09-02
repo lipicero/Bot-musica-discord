@@ -999,16 +999,12 @@ function parseCookieHeaderToArray(header) {
 
 async function resolvePlayableUrl(input) {
   let url = input.replace(/^<(.+)>$/, "$1").trim();
-  // Si es un link HTTP(s), tratemos de decidir rápido sin ir a red
   if (/^https?:\/\//i.test(url)) {
-    // Normalizar YouTube Music, youtu.be y shorts a watch?v=
     if (isYouTubeUrl(url)) {
       return canonicalizeYouTubeUrl(url);
     }
-    // Para URLs no-YouTube, devolvemos tal cual y dejamos que el pipeline falle si no es soportado
     return url;
   }
-  // No parece URL: búsqueda por texto en YouTube
   try {
     const results = await playdl.search(url, {
       limit: 1,
@@ -1031,7 +1027,6 @@ async function fetchTitle(url) {
 
 async function fetchMetadata(url) {
   const normalized = canonicalizeYouTubeUrl(url);
-  // Prefiere ytdl para YouTube, es más rápido/consistente y lo reutilizaremos
   if (isYouTubeUrl(normalized)) {
     try {
       const id = extractYouTubeId(normalized) || normalized;
@@ -1048,7 +1043,6 @@ async function fetchMetadata(url) {
       };
     } catch {}
   }
-  // Fallback con play-dl para otras plataformas
   try {
     const info = await playdl.video_info(normalized);
     const title = info?.video_details?.title || normalized;
@@ -1088,7 +1082,6 @@ function buildProgressBar(totalSec, elapsedSec, size = 20) {
   elapsedSec = Math.max(0, Math.min(totalSec, Number(elapsedSec) || 0));
   const ratio = elapsedSec / totalSec;
   const filled = Math.max(0, Math.min(size, Math.round(ratio * size)));
-  // Posición del knob dentro del track
   const pos = Math.max(0, Math.min(size - 1, Math.round(ratio * (size - 1))));
   const left = "█".repeat(pos);
   const right = "─".repeat(Math.max(0, size - pos - 1));
