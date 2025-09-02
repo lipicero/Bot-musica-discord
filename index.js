@@ -248,7 +248,7 @@ client.on("guildCreate", async (guild) => {
 // ======================
 // Cola por servidor
 // ======================
-const queues = new Map(); // guildId -> { songs: Array<{url,title,durationSec,thumbnailUrl,requestedById,retries?:number, ytdlInfo?:any, videoId?:string}>, player, connection, textChannelId, nowPlayingMessageId, loop:boolean, volume:number, uiInterval?: NodeJS.Timer, currentRetry?:number, upgradeTimer?:NodeJS.Timer, currentTrackToken?:string }
+const queues = new Map(); // guildId -> { songs: Array<{url,title,durationSec,thumbnailUrl,requestedById,retries?:number, ytdlInfo?:any, videoId?:string}>, player, connection, textChannelId, nowPlayingMessageId, loop:boolean, volume:number, uiInterval?: NodeJS.Timer, currentRetry?:number, upgradeTimer?:NodeJS.Timer, currentTrackToken?:string, currentSong?: any }
 
 function getQueue(guildId) {
   let q = queues.get(guildId);
@@ -345,7 +345,8 @@ function getQueue(guildId) {
         }
       } else {
         qq.currentRetry = 0;
-        qq.songs.shift();
+        if (qq.songs[0] === qq.currentSong) qq.songs.shift();
+        qq.currentSong = null;
         if (qq.songs.length > 0) {
           try {
             await playNext(guildId);
@@ -375,10 +376,14 @@ function getQueue(guildId) {
       }
       // Si está en loop, vuelve a reproducir el mismo tema sin avanzar
       if (qq.loop && qq.songs.length > 0) {
+        // simplemente reiniciar la misma pista sin modificar la cola
         playNext(guildId).catch((e) => console.error("[playNext:error]", e));
         return;
       }
-      qq.songs.shift();
+      if (qq.songs.length > 0 && qq.songs[0] === qq.currentSong) {
+        qq.songs.shift();
+      }
+      qq.currentSong = null;
       if (qq.songs.length > 0) {
         playNext(guildId).catch((e) => console.error("[playNext:error]", e));
       } else {
@@ -408,6 +413,7 @@ function getQueue(guildId) {
       volume: initialVol,
       uiInterval: null,
       currentRetry: 0,
+  currentSong: null,
     };
     queues.set(guildId, q);
   }
@@ -1678,7 +1684,8 @@ async function playNext(guildId) {
       resource = await createResourceFromUrl(current.url, q.volume ?? 1.0);
     }
 
-    q.player.play(resource);
+  q.currentSong = current;
+  q.player.play(resource);
 
     // Programar upgrade a mayor calidad si aplica
     if (current.ytdlInfo && fastStartEnabled && longEnough) {
@@ -1753,7 +1760,9 @@ async function playNext(guildId) {
         }
       }
     } catch {}
-    q.songs.shift();
+  // al fallar, eliminar sólo la pista actual
+  if (q.songs[0] === q.currentSong) q.songs.shift();
+  q.currentSong = null;
     if (q.songs.length > 0) {
       playNext(guildId).catch((err) =>
         console.error("[playNext:chain:error]", err)
@@ -2122,14 +2131,14 @@ client.on("messageCreate", async (message) => {
       await connectP;
       q.songs.push(songData);
       let header;
-      if (q.songs.length === 1) {
+  if (q.player.state.status !== AudioPlayerStatus.Playing && q.songs.length === 1) {
         await playNext(message.guild.id);
         header = `🎶 Reproduciendo: ${songData.title}${
           songData.durationSec
             ? ` [${formatDuration(songData.durationSec)}]`
             : ""
         }`;
-      } else {
+  } else {
         header = `➕ Añadido a la cola: ${songData.title}${
           songData.durationSec
             ? ` [${formatDuration(songData.durationSec)}]`
@@ -2620,14 +2629,14 @@ client.on("interactionCreate", async (interaction) => {
       }
       q.songs.push(songData);
       let header;
-      if (q.songs.length === 1) {
+  if (q.player.state.status !== AudioPlayerStatus.Playing && q.songs.length === 1) {
         await playNext(guild.id);
         header = `🎶 Reproduciendo: ${songData.title}${
           songData.durationSec
             ? ` [${formatDuration(songData.durationSec)}]`
             : ""
         }`;
-      } else {
+  } else {
         header = `➕ Añadido a la cola: ${songData.title}${
           songData.durationSec
             ? ` [${formatDuration(songData.durationSec)}]`
