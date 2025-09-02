@@ -8,7 +8,7 @@ WORKDIR /app
 
 # Paquetes mínimos y tini para señalización limpia
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tzdata tini curl \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata tini curl python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Instalar yt-dlp binario estático (Linux) y hacerlo ejecutable
