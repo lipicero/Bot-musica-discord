@@ -1733,27 +1733,40 @@ function stopNowPlayingTicker(guildId) {
 function buildControlsComponents(q) {
   const isPaused = q.player.state.status === AudioPlayerStatus.Paused;
   const s = q.songs?.[0];
+  const vol = Math.max(0, Math.min(2, q.volume ?? 1));
+  const volDownDisabled = vol <= 0.01;
+  const volUpDisabled = vol >= 1.99;
+  const canShuffle = (q.songs?.length || 0) > 2;
+  const hasSong = !!s;
   // Fila 1: transporte y loop
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId("music_replay")
-      .setEmoji("⏮️")
-      .setStyle(ButtonStyle.Secondary),
+  .setEmoji("🔄")
+      .setLabel("Reiniciar")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(!hasSong),
     new ButtonBuilder()
       .setCustomId(isPaused ? "music_resume" : "music_pause")
-      .setEmoji(isPaused ? "▶️" : "⏸️")
-      .setStyle(ButtonStyle.Primary),
+  .setEmoji(isPaused ? "▶️" : "⏸️")
+      .setLabel(isPaused ? "Reanudar" : "Pausar")
+      .setStyle(ButtonStyle.Primary)
+      .setDisabled(!hasSong),
     new ButtonBuilder()
       .setCustomId("music_skip")
-      .setEmoji("⏭️")
-      .setStyle(ButtonStyle.Secondary),
+  .setEmoji("⏭️")
+      .setLabel("Saltar")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(!hasSong),
     new ButtonBuilder()
       .setCustomId("music_stop")
-      .setEmoji("⏹️")
+  .setEmoji("🛑")
+      .setLabel("Detener")
       .setStyle(ButtonStyle.Danger),
     new ButtonBuilder()
       .setCustomId("music_loop")
       .setEmoji("🔁")
+      .setLabel("Bucle")
       .setStyle(q.loop ? ButtonStyle.Success : ButtonStyle.Secondary)
   );
   // Fila 2: volumen, shuffle, guardar y enlace
@@ -1761,30 +1774,47 @@ function buildControlsComponents(q) {
     new ButtonBuilder()
       .setCustomId("music_vol_down")
       .setEmoji("🔉")
-      .setStyle(ButtonStyle.Secondary),
+      .setLabel("Vol -")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(volDownDisabled),
     new ButtonBuilder()
       .setCustomId("music_vol_up")
       .setEmoji("🔊")
-      .setStyle(ButtonStyle.Secondary),
+      .setLabel("Vol +")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(volUpDisabled),
     new ButtonBuilder()
       .setCustomId("music_shuffle")
       .setEmoji("🔀")
-      .setStyle(ButtonStyle.Secondary),
+      .setLabel("Barajar")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(!canShuffle),
     new ButtonBuilder()
       .setCustomId("music_save")
-      .setEmoji("💾")
+      .setEmoji("⭐")
+      .setLabel("Guardar")
       .setStyle(ButtonStyle.Secondary)
+      .setDisabled(!hasSong)
+  );
+  // Fila 3: mostrar cola y link al tema actual (si existe)
+  const row3 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("music_queue")
+      .setEmoji("🧾")
+      .setLabel("Cola")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(!(q.songs?.length > 0))
   );
   if (s?.url) {
-    row2.addComponents(
+    row3.addComponents(
       new ButtonBuilder()
         .setStyle(ButtonStyle.Link)
         .setURL(s.url)
-        .setEmoji("🔗")
+        .setEmoji("🌐")
         .setLabel("Abrir")
     );
   }
-  return [row1, row2];
+  return [row1, row2, row3];
 }
 
 function buildNowPlayingEmbed(q, guild) {
@@ -2197,9 +2227,22 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
     const id = interaction.customId;
-    try {
-      await interaction.deferUpdate();
-    } catch {}
+    // Para botones que editan el panel actual, usamos deferUpdate(); para los que sólo responden efímero (cola), respondemos directo.
+    const deferForIds = new Set([
+      "music_pause",
+      "music_resume",
+      "music_skip",
+      "music_stop",
+      "music_loop",
+      "music_shuffle",
+      "music_replay",
+      "music_vol_down",
+      "music_vol_up",
+      "music_save",
+    ]);
+    if (deferForIds.has(id)) {
+      try { await interaction.deferUpdate(); } catch {}
+    }
     if (id === "music_pause") {
       q.player.pause();
       try {
@@ -2254,6 +2297,17 @@ client.on("interactionCreate", async (interaction) => {
         q.songs = [head, ...rest];
       }
       await renderNowPlaying(guild.id).catch(() => {});
+      return;
+    }
+    if (id === "music_queue") {
+      // Responder efímero con la cola formateada
+      const text = formatQueueMessage(q, 20);
+      try {
+        await interaction.reply({ content: `📋 Cola actual:\n${text}` , ephemeral: true });
+      } catch (e) {
+        // Si ya fue respondida, intentar editReply
+        try { await interaction.editReply({ content: `📋 Cola actual:\n${text}` }); } catch {}
+      }
       return;
     }
     if (id === "music_replay") {
