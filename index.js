@@ -18,6 +18,7 @@ const MAX_PLAYLIST_ITEMS = Math.max(
 );
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 const {
   Client,
   GatewayIntentBits,
@@ -798,10 +799,15 @@ async function getDirectUrlFromYtDlp(targetUrl, headers = {}) {
   if (headers?.userAgent) addHeader.push(`User-Agent: ${headers.userAgent}`);
   if (headers?.acceptLang)
     addHeader.push(`Accept-Language: ${headers.acceptLang}`);
-  if (headers?.cookie) addHeader.push(`Cookie: ${headers.cookie}`);
+  // No pasar cookies por header: yt-dlp depreca esto y además YouTube lo bloquea.
+  // Usaremos archivo de cookies Netscape vía --cookies si está disponible.
+  const cookieFile = ensureYtDlpCookiesFileFromEnv();
   return await new Promise((resolve, reject) => {
     if (binPath) {
       const args = ["-g", "-f", "bestaudio/best", "--no-playlist"];
+      if (cookieFile) {
+        args.push("--cookies", cookieFile);
+      }
       for (const h of addHeader) args.push("--add-header", h);
       args.push(targetUrl);
       const proc = spawn(binPath, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -826,12 +832,14 @@ async function getDirectUrlFromYtDlp(targetUrl, headers = {}) {
         reject(new Error(`YTDLP_EXIT_${code}`));
       });
       proc.on("error", reject);
-    } else if (ytdlp && ytdlp.raw) {
+  } else if (ytdlp && ytdlp.raw) {
       const proc = ytdlp.raw(targetUrl, {
         g: true,
         format: "bestaudio/best",
         noPlaylist: true,
-        addHeader,
+    addHeader,
+    // Si existe archivo de cookies, pasarlo también aquí
+    ...(cookieFile ? { cookies: cookieFile } : {}),
       });
       let out = "";
       let err = "";
@@ -870,7 +878,7 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   const hdrs = [];
   if (headers?.userAgent) hdrs.push(`User-Agent: ${headers.userAgent}`);
   if (headers?.acceptLang) hdrs.push(`Accept-Language: ${headers.acceptLang}`);
-  if (headers?.cookie) hdrs.push(`Cookie: ${headers.cookie}`);
+  // No pasar cookies al fetch de media directa (googlevideo): no es necesario y puede romper.
   const headerString = hdrs.length ? hdrs.join("\r\n") + "\r\n" : null;
   const ffArgs = [
     "-hide_banner",
@@ -994,6 +1002,59 @@ function parseCookieHeaderToArray(header) {
       .filter(Boolean);
   } catch {
     return [];
+  }
+}
+
+// Crea (si no existe) un archivo temporal de cookies en formato Netscape
+// a partir de la variable de entorno YT_COOKIE/YOUTUBE_COOKIE.
+// Devuelve la ruta al archivo o null si no hay cookie.
+function ensureYtDlpCookiesFileFromEnv() {
+  try {
+    const raw = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
+    if (!raw) return null;
+    const tmpPath = path.join(os.tmpdir(), `yt_cookies_${process.pid}.txt`);
+    if (fs.existsSync(tmpPath)) return tmpPath;
+
+    let content = String(raw);
+    // Si parece ya ser Netscape (tiene tabs o cabecera), lo usamos tal cual
+    const looksNetscape = content.includes("\t") || /Netscape HTTP Cookie File/i.test(content);
+    if (!looksNetscape) {
+      // Convertimos desde header "a=b; c=d" al formato Netscape para dominios de YouTube
+      const pairs = parseCookieHeaderToArray(content);
+      const expires = Math.floor(Date.now() / 1000) + 3600 * 24 * 365; // +1 año
+      const domains = [
+        ".youtube.com",
+        ".youtube-nocookie.com",
+        ".google.com",
+        ".googlevideo.com",
+      ];
+      const lines = [
+        "# Netscape HTTP Cookie File",
+        "# This file was generated automatically by the bot.",
+      ];
+      for (const { name, value } of pairs) {
+        for (const domain of domains) {
+          // Campos: domain, includeSubdomains, path, secure, expiration, name, value
+          lines.push([
+            domain,
+            "TRUE",
+            "/",
+            // Marcar como Secure por defecto para mayor compatibilidad
+            "TRUE",
+            String(expires),
+            name,
+            value,
+          ].join("\t"));
+        }
+      }
+      content = lines.join("\n") + "\n";
+    }
+    fs.writeFileSync(tmpPath, content, { encoding: "utf8" });
+    if (DEBUG_AUDIO) console.log(`[yt-dlp] archivo de cookies creado: ${tmpPath}`);
+    return tmpPath;
+  } catch (e) {
+    if (DEBUG_AUDIO) console.warn("[yt-dlp] No se pudo crear archivo de cookies:", e?.message || e);
+    return null;
   }
 }
 
