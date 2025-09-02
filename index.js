@@ -1135,7 +1135,7 @@ function ensureYtDlpCookiesFileFromEnv() {
     if (!raw) return null;
     const tmpPath = path.join(os.tmpdir(), `yt_cookies_${process.pid}.txt`);
 
-    let content = String(raw);
+  let content = String(raw);
     // Si parece ya ser Netscape (tiene tabs o cabecera), lo usamos tal cual
     const looksNetscape = content.includes("\t") || /Netscape HTTP Cookie File/i.test(content);
     if (!looksNetscape) {
@@ -1168,6 +1168,47 @@ function ensureYtDlpCookiesFileFromEnv() {
         }
       }
       content = lines.join("\n") + "\n";
+    }
+    // Validación básica (no imprime valores): ¿faltan cookies críticas?
+    if (DEBUG_AUDIO) {
+      try {
+        const needByDomain = {
+          ".google.com": [
+            "SID",
+            "HSID",
+            "SSID",
+            "SAPISID",
+            "__Secure-1PSID",
+            "__Secure-3PSID",
+          ],
+          ".youtube.com": [
+            "VISITOR_INFO1_LIVE",
+            "PREF",
+          ],
+        };
+        const have = new Map(); // domain -> Set(names)
+        for (const line of content.split(/\r?\n/)) {
+          if (!line || line.startsWith("#")) continue;
+          const parts = line.split("\t");
+          if (parts.length < 7) continue;
+          const domain = parts[0]?.trim();
+          const name = parts[5]?.trim();
+          if (!domain || !name) continue;
+          if (!have.has(domain)) have.set(domain, new Set());
+          have.get(domain).add(name);
+        }
+        const warns = [];
+        for (const [dom, names] of Object.entries(needByDomain)) {
+          const got = have.get(dom) || new Set();
+          const missing = names.filter((n) => !got.has(n));
+          if (missing.length) warns.push(`${dom}: ${missing.join(", ")}`);
+        }
+        if (warns.length) {
+          console.warn(
+            `[yt-dlp] Aviso: cookies Netscape parecen incompletas. Faltan claves críticas -> ${warns.join(" | ")}`
+          );
+        }
+      } catch {}
     }
   // Reescribir siempre para evitar cookies obsoletas si cambió el env
   fs.writeFileSync(tmpPath, content, { encoding: "utf8" });
