@@ -27,7 +27,14 @@ services:
         value: "2000"
       # Forzar backend yt-dlp en producción si querés
       - key: YT_FORCE_YTDLP
+      - key: PREBUFFER_MS
+        value: "300"
+      - key: PREBUFFER_MIN_BYTES
+        value: "32768"
         value: "1"
       # Ruta no necesaria en Linux si está en PATH; se deja por si se quisiera fijar explícita
       - key: YT_DLP_PATH
         value: "/usr/local/bin/yt-dlp"
+
+      - key: YT_YTDLP_CLIENT
+        value: "android"

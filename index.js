@@ -434,8 +434,7 @@ async function schedulePrefetch(guildId) {
   const q = queues.get(guildId);
   if (!q || q.prefetching) return;
   if (PREFETCH_AHEAD <= 0) return;
-  const forceYtDlp = String(process.env.YT_FORCE_YTDLP || "0") === "1";
-  if (forceYtDlp) return; // ytdlInfo prefetch no se usa cuando se fuerza yt-dlp
+  // Aunque se fuerce yt-dlp, el prefetch de ytdlInfo acelera fast-start y metadatos.
   q.prefetching = true;
   try {
     // Prefetch para los próximos N temas a partir del índice 0 o 1 según si ya se está reproduciendo
@@ -522,8 +521,12 @@ async function warmupUrl(url, headers, bytes, timeoutMs) {
 async function warmupItems(items) {
   if (!Array.isArray(items) || items.length === 0) return;
   const forceYtDlp = String(process.env.YT_FORCE_YTDLP || "0") === "1";
-  for (const item of items) {
-    if (!item || item._warmed) continue;
+  const queue = items.filter(Boolean).filter((i) => !i._warmed);
+  const concurrency = 2;
+  let idx = 0;
+  const runNext = async () => {
+    if (idx >= queue.length) return;
+    const item = queue[idx++];
     try {
       let directUrl = null;
       let headers = null;
@@ -552,8 +555,9 @@ async function warmupItems(items) {
         item._warmed = true;
       }
     } catch {}
-    await new Promise((r) => setTimeout(r, 100));
-  }
+  };
+  const runners = Array.from({ length: Math.min(concurrency, queue.length) }, () => runNext());
+  await Promise.all(runners);
 }
 
 function maybeWarmupOnAdd(guildId, newItems) {
@@ -770,11 +774,15 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
           highWaterMark: 1 << 25,
           ...buildYtdlRequestOptions(info?.videoDetails?.video_url || id),
         });
-        const resource = createAudioResource(stream, {
+        // Si el volumen != 1, transcodificar para aplicar volumen en ffmpeg
+        const vol = Number(volume) || 1;
+        if (Math.abs(vol - 1) > 1e-3) {
+          return createOpusResourceFromStream(stream, vol);
+        }
+        return createAudioResource(stream, {
           inputType: StreamType.WebmOpus,
           inlineVolume: false,
         });
-        return resource;
       }
       // Si no hay WebM/Opus, usar audioonly y dejar que ffmpeg demux/transcode (requiere ffmpeg-static)
       if (DEBUG_AUDIO) console.log(`[createResource] ytdl fallback audioonly`);
@@ -830,11 +838,15 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
             ...buildYtdlRequestOptions(id),
           });
           if (/webm/i.test(fmt2.mimeType || fmt2.container)) {
-            const res2 = createAudioResource(stream2, {
+            const vol = Number(volume) || 1;
+            if (Math.abs(vol - 1) > 1e-3) {
+              // transcodificar para aplicar volumen
+              return createOpusResourceFromStream(stream2, vol);
+            }
+            return createAudioResource(stream2, {
               inputType: StreamType.WebmOpus,
               inlineVolume: false,
             });
-            return res2;
           } else {
             // Si no es webm/opus, transcodificar a Ogg/Opus
             return createOpusResourceFromStream(stream2, volume);
@@ -1054,8 +1066,8 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   const args = [
     "--no-playlist",
     "-f",
-    // Preferir Opus si está disponible para menos CPU y mayor estabilidad
-    "bestaudio[acodec=opus]/bestaudio/best",
+    // Preferir sólo audio: Opus -> M4A -> cualquier bestaudio (evita caer a 'best' con video)
+    "bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio",
     "-o",
     "-",
     // Reintentos y robustez de fragmentos
@@ -1065,9 +1077,9 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
     "10",
   // Acelerar y estabilizar HLS/DASH cuando aplique
   "--concurrent-fragments",
-  "4",
+  "8",
   "--http-chunk-size",
-  "1M",
+  "512K",
   ];
   // Opcionales para mitigar captcha en YouTube
   const extractorArgsEnv = (process.env.YT_YTDLP_EXTRACTOR_ARGS || "").trim();
@@ -1092,15 +1104,9 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   // Elegir extractor-args (player_client) según cookies y configuración
   let effectiveClient = ytClient;
   if (!extractorArgsEnv) {
+    // Por defecto usar android (evita SABR en web y habilita bestaudio rápido). Si el usuario setea YT_YTDLP_CLIENT, respetarlo.
     if (!effectiveClient) {
-      effectiveClient = cookieFile ? "web" : "android";
-    }
-    if (cookieFile && effectiveClient === "android" && !strictClient) {
-      effectiveClient = "web";
-      if (DEBUG_AUDIO)
-        console.log(
-          `[yt-dlp] cambiando player_client=android -> web (cookies presentes)`
-        );
+      effectiveClient = "android";
     }
     if (effectiveClient) {
       args.push("--extractor-args", `youtube:player_client=${effectiveClient}`);
@@ -1116,9 +1122,9 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   // Lanzar yt-dlp (binario o wrapper)
   const yProc = binPath
     ? spawn(binPath, args, { stdio: ["ignore", "pipe", "pipe"] })
-    : ytdlp.raw(args[args.length - 1], {
+  : ytdlp.raw(args[args.length - 1], {
         o: "-",
-        f: "bestaudio/best",
+    f: "bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio",
         noPlaylist: true,
         ...(headers?.userAgent ? { userAgent: headers.userAgent } : {}),
         ...(headers?.acceptLang
@@ -1210,8 +1216,8 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   // Crear PassThrough con prebuffer para evitar underruns al inicio
   const { PassThrough } = require("stream");
   const kbps = Math.max(16, parseInt(targetBitrate, 10) || 128);
-  const preMs = Math.max(0, Math.min(3000, Number(process.env.PREBUFFER_MS || 700)));
-  const preMinBytes = Math.max(16384, Number(process.env.PREBUFFER_MIN_BYTES || 65536));
+  const preMs = Math.max(0, Math.min(3000, Number(process.env.PREBUFFER_MS || 300)));
+  const preMinBytes = Math.max(16384, Number(process.env.PREBUFFER_MIN_BYTES || 32768));
   const outHighWM = Math.max(64 * 1024, Number(process.env.OUTPUT_HIGH_WATERMARK || (1 << 20)));
   const pass = new PassThrough({ highWaterMark: outHighWM });
   const targetBytes = preMs > 0
@@ -1757,13 +1763,15 @@ function createResourceFromYtdlInfo(info, volume = 1.0) {
         ...buildYtdlRequestOptions(vidRef),
       };
       const stream = ytdl.downloadFromInfo(info, ytdlOpts);
-      const resource = createAudioResource(stream, {
+      const vol = Number(volume) || 1;
+      if (Math.abs(vol - 1) > 1e-3) {
+        // Transcodificar para aplicar volumen de forma consistente en móviles
+        return createOpusResourceFromStream(stream, vol);
+      }
+      return createAudioResource(stream, {
         inputType: StreamType.WebmOpus,
-        inlineVolume: true,
+        inlineVolume: false,
       });
-      if (resource.volume)
-        resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, volume)));
-      return resource;
     }
     const vidRef =
       info?.videoDetails?.video_url ||
@@ -1798,13 +1806,14 @@ function createFastStartResourceFromYtdlInfo(info, volume = 1.0) {
       dlChunkSize: 1 << 20,
       ...buildYtdlRequestOptions(vidRef),
     });
-    const resource = createAudioResource(stream, {
+    const vol = Number(volume) || 1;
+    if (Math.abs(vol - 1) > 1e-3) {
+      return createOpusResourceFromStream(stream, vol);
+    }
+    return createAudioResource(stream, {
       inputType: StreamType.WebmOpus,
-      inlineVolume: true,
+      inlineVolume: false,
     });
-    if (resource.volume)
-      resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, volume)));
-    return resource;
   } catch {
     return null;
   }
@@ -1826,19 +1835,19 @@ async function playNext(guildId) {
     let resource = null;
     const fastStartEnabled = String(process.env.FAST_START || "1") === "1";
     const fastDelayMs = Math.max(
-      500,
-      Math.min(8000, Number(process.env.FAST_START_MS || 2000))
+      300,
+      Math.min(5000, Number(process.env.FAST_START_MS || 1200))
     );
-    const longEnough = (current.durationSec || 0) >= 60;
-  const forceYtDlp = String(process.env.YT_FORCE_YTDLP || "0") === "1";
+    const longEnough = (current.durationSec || 0) >= 20;
+    const forceYtDlp = String(process.env.YT_FORCE_YTDLP || "0") === "1";
 
-  if (!forceYtDlp && current.ytdlInfo && fastStartEnabled && longEnough) {
+    if (current.ytdlInfo && fastStartEnabled && longEnough) {
       resource =
         createFastStartResourceFromYtdlInfo(
           current.ytdlInfo,
           q.volume ?? 1.0
         ) || createResourceFromYtdlInfo(current.ytdlInfo, q.volume ?? 1.0);
-  } else if (!forceYtDlp && current.ytdlInfo) {
+    } else if (current.ytdlInfo) {
       resource = createResourceFromYtdlInfo(current.ytdlInfo, q.volume ?? 1.0);
     }
     if (!resource) {
@@ -1858,10 +1867,20 @@ async function playNext(guildId) {
           const qq = queues.get(guildId);
           if (!qq || qq.currentTrackToken !== token) return;
           if (qq.player?.state?.status !== AudioPlayerStatus.Playing) return;
-          const bestRes = createResourceFromYtdlInfo(
-            current.ytdlInfo,
-            qq.volume ?? 1.0
-          );
+          // Si está forzado yt-dlp, hacer upgrade al pipeline de yt-dlp para máxima robustez
+          let bestRes = null;
+          const forceYtDlp2 = String(process.env.YT_FORCE_YTDLP || "0") === "1";
+          if (forceYtDlp2) {
+            try {
+              bestRes = await createResourceFromUrl(current.url, qq.volume ?? 1.0);
+            } catch {}
+          }
+          if (!bestRes) {
+            bestRes = createResourceFromYtdlInfo(
+              current.ytdlInfo,
+              qq.volume ?? 1.0
+            );
+          }
           if (!bestRes) return;
           qq.player.play(bestRes);
           if (DEBUG_AUDIO) console.log("[fast-start] upgraded to high quality");
