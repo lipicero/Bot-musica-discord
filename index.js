@@ -1061,6 +1061,7 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
 
   const ffmpegPath = process.env.FFMPEG_PATH || require("ffmpeg-static");
   if (!ffmpegPath) throw new Error("FFMPEG_REQUIRED");
+  const t0 = Date.now();
 
   // Preparar encabezados y cookie para yt-dlp (no para ffmpeg)
   const args = [
@@ -1233,6 +1234,7 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
       pass.write(ch);
     }
     acc.length = 0;
+  try { console.log(`[timing] prebuffer_ready ${Date.now() - t0}ms (${targetBytes} bytes)`); } catch {}
   };
   let preTimer = null;
   if (!started) {
@@ -1823,6 +1825,7 @@ async function playNext(guildId) {
   const q = queues.get(guildId);
   if (!q || q.songs.length === 0) return;
   const current = q.songs[0];
+  const tStart = Date.now();
   try {
     // cancelar cualquier upgrade pendiente de pista anterior
     if (q.upgradeTimer) {
@@ -1856,6 +1859,7 @@ async function playNext(guildId) {
 
   q.currentSong = current;
   q.player.play(resource);
+  try { console.log(`[timing] play_start queued ${current.title || current.url}`); } catch {}
 
     // Programar upgrade a mayor calidad si aplica
     if (current.ytdlInfo && fastStartEnabled && longEnough) {
@@ -1900,6 +1904,14 @@ async function playNext(guildId) {
         startNowPlayingTicker(guildId);
       } catch {}
     }
+    // Escuchar el cambio a Playing para medir
+    const onStateChange = (oldS, newS) => {
+      if (newS?.status === AudioPlayerStatus.Playing) {
+        try { console.log(`[timing] playing_after ${Date.now() - tStart}ms`); } catch {}
+        try { q.player.off("stateChange", onStateChange); } catch {}
+      }
+    };
+    try { q.player.on("stateChange", onStateChange); } catch {}
   } catch (e) {
     console.error("[playNext:error]", e?.message || e, "url:", current?.url);
     // Fallback: forzar play-dl para esta URL
