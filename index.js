@@ -1099,9 +1099,6 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
     if (DEBUG_AUDIO) console.log(`[yt-dlp] forzando IPv4`);
   }
   const cookieFile = ensureYtDlpCookiesFileFromEnv();
-  if (cookieFile) {
-    args.push("--cookies", cookieFile);
-  }
   // Elegir extractor-args (player_client) según cookies y configuración
   let effectiveClient = ytClient;
   if (!extractorArgsEnv) {
@@ -1122,6 +1119,10 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
         console.log(`[yt-dlp] usando player_client=${effectiveClient}`);
     }
   } else {
+  // Pasar cookies solo si no usamos android
+  if (cookieFile && effectiveClient !== "android") {
+    args.push("--cookies", cookieFile);
+  }
     args.push("--extractor-args", extractorArgsEnv);
     if (DEBUG_AUDIO) console.log(`[yt-dlp] extractor-args (env): ${extractorArgsEnv}`);
   }
@@ -1130,7 +1131,7 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   // Lanzar yt-dlp (binario o wrapper)
   const yProc = binPath
     ? spawn(binPath, args, { stdio: ["ignore", "pipe", "pipe"] })
-    : ytdlp.raw(args[args.length - 1], {
+  : ytdlp.raw(args[args.length - 1], {
         o: "-",
     f: "bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio",
         noPlaylist: true,
@@ -1138,7 +1139,7 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
         ...(headers?.acceptLang
           ? { addHeader: [`Accept-Language: ${headers.acceptLang}`] }
           : {}),
-        ...(cookieFile ? { cookies: cookieFile } : {}),
+    ...((cookieFile && effectiveClient !== "android") ? { cookies: cookieFile } : {}),
         ...(() => {
           if (extractorArgsEnv) return { extractorArgs: extractorArgsEnv };
           const clientForWrapper = (() => {
@@ -1162,6 +1163,11 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
         } else {
           args.push("--extractor-args", "youtube:player_client=web");
         }
+        // asegurar cookies para web
+        let cidx = args.indexOf("--cookies");
+        if (cidx < 0 && cookieFile) {
+          args.push("--cookies", cookieFile);
+        }
         if (DEBUG_AUDIO) console.log("[yt-dlp] retry con player_client=web");
         return spawn(binPath, args, { stdio: ["ignore", "pipe", "pipe"] });
       } else if (ytdlp && ytdlp.raw) {
@@ -1178,6 +1184,44 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
           ...(forceIpv4 ? { forceIpv4: true } : {}),
         };
         if (DEBUG_AUDIO) console.log("[yt-dlp] retry (wrapper) con web");
+        return ytdlp.raw(url, opts);
+      }
+    } catch {}
+    return null;
+  };
+  let switchedToIOS = false;
+  const trySwitchToIOS = () => {
+    if (switchedToIOS) return null;
+    switchedToIOS = true;
+    try {
+      if (binPath) {
+        const idx = args.indexOf("--extractor-args");
+        if (idx >= 0) {
+          args[idx + 1] = "youtube:player_client=ios";
+        } else {
+          args.push("--extractor-args", "youtube:player_client=ios");
+        }
+        // asegurar cookies para ios
+        let cidx = args.indexOf("--cookies");
+        if (cidx < 0 && cookieFile) {
+          args.push("--cookies", cookieFile);
+        }
+        if (DEBUG_AUDIO) console.log("[yt-dlp] retry con player_client=ios");
+        return spawn(binPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+      } else if (ytdlp && ytdlp.raw) {
+        const opts = {
+          o: "-",
+          f: "bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio",
+          noPlaylist: true,
+          ...(headers?.userAgent ? { userAgent: headers.userAgent } : {}),
+          ...(headers?.acceptLang
+            ? { addHeader: [`Accept-Language: ${headers.acceptLang}`] }
+            : {}),
+          ...(cookieFile ? { cookies: cookieFile } : {}),
+          extractorArgs: "youtube:player_client=ios",
+          ...(forceIpv4 ? { forceIpv4: true } : {}),
+        };
+        if (DEBUG_AUDIO) console.log("[yt-dlp] retry (wrapper) con ios");
         return ytdlp.raw(url, opts);
       }
     } catch {}
@@ -1239,10 +1283,24 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
       const alt = trySwitchToWeb();
       if (alt) {
         // re-encadenar con el nuevo proceso
+        try { yOut?.unpipe?.(ff.stdin); } catch {}
         yProc.stdout?.removeAllListeners?.();
         yProc.stderr?.removeAllListeners?.();
         yOut = alt.stdout;
-        alt.stderr?.on("data", (d2) => DEBUG_AUDIO && console.warn(`[yt-dlp] ${String(d2).trim()}`));
+        alt.stderr?.on("data", (d2) => {
+          const s2 = String(d2 || "");
+          if (/SABR streaming/i.test(s2) || /Requested format is not available/i.test(s2)) {
+            const alt2 = trySwitchToIOS();
+            if (alt2) {
+              try { yOut?.unpipe?.(ff.stdin); } catch {}
+              yOut = alt2.stdout;
+              alt2.stderr?.on("data", (d3) => DEBUG_AUDIO && console.warn(`[yt-dlp] ${String(d3).trim()}`));
+              yOut?.pipe(ff.stdin);
+              return;
+            }
+          }
+          if (DEBUG_AUDIO) console.warn(`[yt-dlp] ${s2.trim()}`);
+        });
         yOut?.pipe(ff.stdin);
         return;
       }
