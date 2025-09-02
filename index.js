@@ -223,7 +223,7 @@ function getQueue(guildId) {
         try {
           const current = qq.songs[0];
           if (current?.url) {
-            const forceYtDlp = String(process.env.YT_FORCE_YTDLP);
+            const forceYtDlp = String(process.env.YT_FORCE_YTDLP || "0") === "1";
             if (forceYtDlp && ytdlp) {
               const res2 = await createResourceFromYtDlp(
                 current.url,
@@ -252,7 +252,7 @@ function getQueue(guildId) {
               return;
             }
             // Luego probar con yt-dlp si está disponible
-            if (ytdlp) {
+            if (!forceYtDlp && ytdlp) {
               const res3 = await createResourceFromYtDlp(
                 current.url,
                 qq.volume ?? 1.0,
@@ -1410,15 +1410,15 @@ async function playNext(guildId) {
       Math.min(8000, Number(process.env.FAST_START_MS || 2000))
     );
     const longEnough = (current.durationSec || 0) >= 60;
-    const forceYtDlp = String(process.env.YT_FORCE_YTDLP);
+  const forceYtDlp = String(process.env.YT_FORCE_YTDLP || "0") === "1";
 
-    if (!forceYtDlp && current.ytdlInfo && fastStartEnabled && longEnough) {
+  if (!forceYtDlp && current.ytdlInfo && fastStartEnabled && longEnough) {
       resource =
         createFastStartResourceFromYtdlInfo(
           current.ytdlInfo,
           q.volume ?? 1.0
         ) || createResourceFromYtdlInfo(current.ytdlInfo, q.volume ?? 1.0);
-    } else if (!forceYtDlp && current.ytdlInfo) {
+  } else if (!forceYtDlp && current.ytdlInfo) {
       resource = createResourceFromYtdlInfo(current.ytdlInfo, q.volume ?? 1.0);
     }
     if (!resource) {
@@ -1800,7 +1800,7 @@ client.on("messageCreate", async (message) => {
       const ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
       let songData = null;
       if (isYouTubeUrl(finalUrl)) {
-        if (String(process.env.YT_FORCE_YTDLP)) {
+  if (String(process.env.YT_FORCE_YTDLP || "0") === "1") {
           const meta = await fetchMetadata(finalUrl);
           songData = {
             url: finalUrl,
@@ -2256,7 +2256,7 @@ client.on("interactionCreate", async (interaction) => {
       const ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
       let songData = null;
       if (isYouTubeUrl(finalUrl)) {
-        if (String(process.env.YT_FORCE_YTDLP)) {
+        if (String(process.env.YT_FORCE_YTDLP || "0") === "1") {
           const meta = await fetchMetadata(finalUrl);
           songData = {
             url: finalUrl,
