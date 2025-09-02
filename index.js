@@ -944,6 +944,11 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
     "infinite",
     "--fragment-retries",
     "10",
+  // Acelerar y estabilizar HLS/DASH cuando aplique
+  "--concurrent-fragments",
+  "4",
+  "--http-chunk-size",
+  "1M",
   ];
   // Opcionales para mitigar captcha en YouTube
   const extractorArgsEnv = (process.env.YT_YTDLP_EXTRACTOR_ARGS || "").trim();
@@ -1076,16 +1081,56 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   ff.stdout.on("error", ignoreErr("ffmpeg:stdout"));
   ff.stdin.on("error", ignoreErr("ffmpeg:stdin"));
 
-  // Crear recurso
-  const out = ff.stdout;
+  // Crear PassThrough con prebuffer para evitar underruns al inicio
+  const { PassThrough } = require("stream");
+  const kbps = Math.max(16, parseInt(targetBitrate, 10) || 128);
+  const preMs = Math.max(0, Math.min(3000, Number(process.env.PREBUFFER_MS || 700)));
+  const preMinBytes = Math.max(16384, Number(process.env.PREBUFFER_MIN_BYTES || 65536));
+  const outHighWM = Math.max(64 * 1024, Number(process.env.OUTPUT_HIGH_WATERMARK || (1 << 20)));
+  const pass = new PassThrough({ highWaterMark: outHighWM });
+  const targetBytes = preMs > 0
+    ? Math.max(preMinBytes, Math.floor(((kbps * 1000) / 8) * (preMs / 1000)))
+    : 0;
+  let started = targetBytes === 0;
+  const acc = [];
+  let accSize = 0;
+  const startPlayback = () => {
+    if (started) return;
+    started = true;
+    for (const ch of acc) {
+      pass.write(ch);
+    }
+    acc.length = 0;
+  };
+  let preTimer = null;
+  if (!started) {
+    const fallbackMs = Math.max(500, preMs * 2);
+    preTimer = setTimeout(startPlayback, fallbackMs);
+  }
+
+  ff.stdout.on("data", (chunk) => {
+    if (started) {
+      pass.write(chunk);
+    } else {
+      acc.push(chunk);
+      accSize += chunk.length;
+      if (accSize >= targetBytes) startPlayback();
+    }
+  });
+
+  const out = pass;
   const cleanup = () => {
+    try { if (preTimer) clearTimeout(preTimer); } catch {}
     try {
       ff.kill("SIGKILL");
     } catch {}
     try {
       yProc.kill?.("SIGKILL");
     } catch {}
+    try { pass.destroy(); } catch {}
   };
+  ff.stdout.on("end", () => { startPlayback(); pass.end(); });
+  ff.stdout.on("close", () => { startPlayback(); pass.end(); });
   out.on("close", cleanup);
   out.on("end", cleanup);
   out.on("error", ignoreErr("ffmpeg:out"));
