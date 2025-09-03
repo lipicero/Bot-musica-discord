@@ -26,5 +26,3 @@ volumes.json
 # Misc
 *.tmp
 *.swp
-cookies.b64.txt
-cookies.txt

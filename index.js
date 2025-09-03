@@ -16,7 +16,6 @@ const MAX_PLAYLIST_ITEMS = Math.max(
   1,
   Math.min(100, Number(process.env.MAX_PLAYLIST_ITEMS || 25))
 );
-const PREFETCH_AHEAD = Math.max(0, Math.min(5, Number(process.env.PREFETCH_AHEAD || 2)));
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -47,14 +46,6 @@ try {
   ytdlp = require("yt-dlp-exec");
 } catch {}
 const { spawn, spawnSync } = require("child_process");
-let miniget = null;
-try {
-  miniget = require("miniget");
-} catch {}
-const WARMUP_AHEAD = Math.max(0, Math.min(3, Number(process.env.WARMUP_AHEAD || 1)));
-const WARMUP_ON_ADD = String(process.env.WARMUP_ON_ADD || "1") === "1";
-const WARMUP_BYTES = Math.max(16384, Math.min(1024 * 1024, Number(process.env.WARMUP_BYTES || 65536)));
-const WARMUP_TIMEOUT_MS = Math.max(500, Math.min(5000, Number(process.env.WARMUP_TIMEOUT_MS || 3000)));
 
 // Helpers de cookies YouTube
 function parseNetscapeCookieFileToHeader(content) {
@@ -257,7 +248,7 @@ client.on("guildCreate", async (guild) => {
 // ======================
 // Cola por servidor
 // ======================
-const queues = new Map(); // guildId -> { songs: Array<{url,title,durationSec,thumbnailUrl,requestedById,retries?:number, ytdlInfo?:any, videoId?:string}>, player, connection, textChannelId, nowPlayingMessageId, loop:boolean, volume:number, uiInterval?: NodeJS.Timer, currentRetry?:number, upgradeTimer?:NodeJS.Timer, currentTrackToken?:string, currentSong?: any }
+const queues = new Map(); // guildId -> { songs: Array<{url,title,durationSec,thumbnailUrl,requestedById,retries?:number, ytdlInfo?:any, videoId?:string}>, player, connection, textChannelId, nowPlayingMessageId, loop:boolean, volume:number, uiInterval?: NodeJS.Timer, currentRetry?:number, upgradeTimer?:NodeJS.Timer, currentTrackToken?:string }
 
 function getQueue(guildId) {
   let q = queues.get(guildId);
@@ -354,8 +345,7 @@ function getQueue(guildId) {
         }
       } else {
         qq.currentRetry = 0;
-        if (qq.songs[0] === qq.currentSong) qq.songs.shift();
-        qq.currentSong = null;
+        qq.songs.shift();
         if (qq.songs.length > 0) {
           try {
             await playNext(guildId);
@@ -385,14 +375,10 @@ function getQueue(guildId) {
       }
       // Si está en loop, vuelve a reproducir el mismo tema sin avanzar
       if (qq.loop && qq.songs.length > 0) {
-        // simplemente reiniciar la misma pista sin modificar la cola
         playNext(guildId).catch((e) => console.error("[playNext:error]", e));
         return;
       }
-      if (qq.songs.length > 0 && qq.songs[0] === qq.currentSong) {
-        qq.songs.shift();
-      }
-      qq.currentSong = null;
+      qq.songs.shift();
       if (qq.songs.length > 0) {
         playNext(guildId).catch((e) => console.error("[playNext:error]", e));
       } else {
@@ -422,149 +408,10 @@ function getQueue(guildId) {
       volume: initialVol,
       uiInterval: null,
       currentRetry: 0,
-  currentSong: null,
-      prefetching: false,
     };
     queues.set(guildId, q);
   }
   return q;
-}
-
-async function schedulePrefetch(guildId) {
-  const q = queues.get(guildId);
-  if (!q || q.prefetching) return;
-  if (PREFETCH_AHEAD <= 0) return;
-  // Aunque se fuerce yt-dlp, el prefetch de ytdlInfo acelera fast-start y metadatos.
-  q.prefetching = true;
-  try {
-    // Prefetch para los próximos N temas a partir del índice 0 o 1 según si ya se está reproduciendo
-    const startIdx = 0; // incluimos actual si aún no tiene info (beneficia fast-start)
-    const endIdx = Math.min(q.songs.length, startIdx + 1 + PREFETCH_AHEAD);
-    for (let i = startIdx; i < endIdx; i++) {
-      const item = q.songs[i];
-      if (!item) continue;
-      if (item.ytdlInfo) continue;
-      if (!isYouTubeUrl(item.url)) continue;
-      try {
-        const id = extractYouTubeId(item.url) || item.url;
-        const info = await ytdl.getInfo(id, buildYtdlRequestOptions(id));
-        item.ytdlInfo = info;
-        // Actualizar metadata si faltaba
-        if (!item.title) item.title = info?.videoDetails?.title || item.url;
-        const dur = Number(info?.videoDetails?.lengthSeconds || 0) || 0;
-        if (!item.durationSec && dur) item.durationSec = Math.floor(dur);
-        if (!item.thumbnailUrl) {
-          item.thumbnailUrl = (info?.videoDetails?.thumbnails || [])[0]?.url || deriveYouTubeThumb(item.url);
-        }
-      } catch {}
-      // pequeño respiro para no saturar
-      await new Promise((r) => setTimeout(r, 150));
-    }
-    // Warm-up ligero de audio para próximos temas
-    if (WARMUP_AHEAD > 0 && miniget) {
-      const playing = q.player?.state?.status === AudioPlayerStatus.Playing;
-      const startW = playing ? 1 : 0;
-      const endW = Math.min(q.songs.length, startW + WARMUP_AHEAD + 1);
-      for (let i = startW; i < endW; i++) {
-        const item = q.songs[i];
-        if (!item || item._warmed) continue;
-        const info = item.ytdlInfo;
-        if (!info) continue;
-        try {
-          let fmt = selectWebmOpusFormat(info.formats, "highest");
-          if (!fmt) {
-            fmt = ytdl.chooseFormat(info.formats, { quality: "highestaudio", filter: "audioonly" });
-          }
-          const direct = fmt?.url;
-          if (!direct) continue;
-          const headers = buildYtdlRequestOptions(info?.videoDetails?.video_url || item.url)?.requestOptions?.headers || {};
-          await warmupUrl(direct, headers, WARMUP_BYTES, WARMUP_TIMEOUT_MS);
-          item._warmed = true;
-        } catch {}
-        await new Promise((r) => setTimeout(r, 100));
-      }
-    }
-  } finally {
-    q.prefetching = false;
-  }
-}
-
-async function warmupUrl(url, headers, bytes, timeoutMs) {
-  if (!miniget || !url) return;
-  return await new Promise((resolve) => {
-    let done = false;
-    let req;
-    const finish = () => {
-      if (done) return;
-      done = true;
-      try { clearTimeout(timer); } catch {}
-      try { req?.destroy(); } catch {}
-      resolve();
-    };
-    const timer = setTimeout(finish, timeoutMs);
-    const h = Object.assign({}, headers, { Range: `bytes=0-${bytes - 1}` });
-    try {
-      req = miniget(url, { headers: h });
-    } catch {
-      return finish();
-    }
-    let read = 0;
-    req.on("data", (chunk) => {
-      read += chunk.length;
-      if (read >= bytes) finish();
-    });
-    req.on("error", finish);
-    req.on("end", finish);
-  });
-}
-
-async function warmupItems(items) {
-  if (!Array.isArray(items) || items.length === 0) return;
-  const forceYtDlp = String(process.env.YT_FORCE_YTDLP || "0") === "1";
-  const queue = items.filter(Boolean).filter((i) => !i._warmed);
-  const concurrency = 2;
-  let idx = 0;
-  const runNext = async () => {
-    if (idx >= queue.length) return;
-    const item = queue[idx++];
-    try {
-      let directUrl = null;
-      let headers = null;
-      if (isYouTubeUrl(item.url)) {
-        if (!forceYtDlp && item.ytdlInfo) {
-          let fmt = selectWebmOpusFormat(item.ytdlInfo.formats, "highest");
-          if (!fmt) fmt = ytdl.chooseFormat(item.ytdlInfo.formats, { quality: "highestaudio", filter: "audioonly" });
-          directUrl = fmt?.url || null;
-          headers = buildYtdlRequestOptions(item.url)?.requestOptions?.headers || {};
-        } else {
-          // Usar yt-dlp -g para URL directa cuando está forzado
-          try {
-            const u = await getDirectUrlFromYtDlp(item.url, {
-              userAgent:
-                process.env.YTDL_USER_AGENT ||
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-              acceptLang: process.env.YTDL_ACCEPT_LANGUAGE || "es-ES,es;q=0.9,en;q=0.8",
-            });
-            directUrl = u;
-            headers = {};
-          } catch {}
-        }
-      }
-      if (directUrl) {
-        await warmupUrl(directUrl, headers, WARMUP_BYTES, WARMUP_TIMEOUT_MS);
-        item._warmed = true;
-      }
-    } catch {}
-  };
-  const runners = Array.from({ length: Math.min(concurrency, queue.length) }, () => runNext());
-  await Promise.all(runners);
-}
-
-function maybeWarmupOnAdd(guildId, newItems) {
-  if (!WARMUP_ON_ADD) return;
-  if (!newItems || newItems.length === 0) return;
-  // Warm-up en background, sin bloquear
-  warmupItems(newItems).catch(() => {});
 }
 
 async function ensureConnection(guild, voiceChannel) {
@@ -718,8 +565,12 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
             typeof s.type === "number" ? s.type : StreamType.WebmOpus;
           const resource = createAudioResource(s.stream, {
             inputType,
-            inlineVolume: false,
+            inlineVolume: true,
           });
+          if (resource.volume)
+            resource.volume.setVolumeLogarithmic(
+              Math.max(0, Math.min(2, volume))
+            );
           return resource;
         } catch (eForceNoBin) {
           if (DEBUG_AUDIO)
@@ -743,8 +594,12 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
           typeof s.type === "number" ? s.type : StreamType.WebmOpus;
         const resource = createAudioResource(s.stream, {
           inputType,
-          inlineVolume: false,
+          inlineVolume: true,
         });
+        if (resource.volume)
+          resource.volume.setVolumeLogarithmic(
+            Math.max(0, Math.min(2, volume))
+          );
         if (DEBUG_AUDIO)
           console.log("[createResource] using play-dl (prefer/force)");
         return resource;
@@ -774,15 +629,15 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
           highWaterMark: 1 << 25,
           ...buildYtdlRequestOptions(info?.videoDetails?.video_url || id),
         });
-        // Si el volumen != 1, transcodificar para aplicar volumen en ffmpeg
-        const vol = Number(volume) || 1;
-        if (Math.abs(vol - 1) > 1e-3) {
-          return createOpusResourceFromStream(stream, vol);
-        }
-        return createAudioResource(stream, {
+        const resource = createAudioResource(stream, {
           inputType: StreamType.WebmOpus,
-          inlineVolume: false,
+          inlineVolume: true,
         });
+        if (resource.volume)
+          resource.volume.setVolumeLogarithmic(
+            Math.max(0, Math.min(2, volume))
+          );
+        return resource;
       }
       // Si no hay WebM/Opus, usar audioonly y dejar que ffmpeg demux/transcode (requiere ffmpeg-static)
       if (DEBUG_AUDIO) console.log(`[createResource] ytdl fallback audioonly`);
@@ -792,8 +647,13 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
         highWaterMark: 1 << 25,
         ...buildYtdlRequestOptions(info?.videoDetails?.video_url || id),
       });
-  // Transcodificar a Ogg/Opus para mejor compatibilidad móvil
-  return createOpusResourceFromStream(fallbackStream, volume);
+      const resource = createAudioResource(fallbackStream, {
+        inputType: StreamType.Arbitrary,
+        inlineVolume: true,
+      });
+      if (resource.volume)
+        resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, volume)));
+      return resource;
     } catch (eYtdl) {
       if (DEBUG_AUDIO)
         console.warn(
@@ -837,20 +697,15 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
             highWaterMark: 1 << 25,
             ...buildYtdlRequestOptions(id),
           });
-          if (/webm/i.test(fmt2.mimeType || fmt2.container)) {
-            const vol = Number(volume) || 1;
-            if (Math.abs(vol - 1) > 1e-3) {
-              // transcodificar para aplicar volumen
-              return createOpusResourceFromStream(stream2, vol);
-            }
-            return createAudioResource(stream2, {
-              inputType: StreamType.WebmOpus,
-              inlineVolume: false,
-            });
-          } else {
-            // Si no es webm/opus, transcodificar a Ogg/Opus
-            return createOpusResourceFromStream(stream2, volume);
-          }
+          const res2 = createAudioResource(stream2, {
+            inputType: /webm/i.test(fmt2.mimeType || fmt2.container)
+              ? StreamType.WebmOpus
+              : StreamType.Arbitrary,
+            inlineVolume: true,
+          });
+          if (res2.volume)
+            res2.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, volume)));
+          return res2;
         }
       } catch (eBasic) {
         if (DEBUG_AUDIO)
@@ -872,8 +727,12 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
           typeof s.type === "number" ? s.type : StreamType.WebmOpus;
         const resource = createAudioResource(s.stream, {
           inputType,
-          inlineVolume: false,
+          inlineVolume: true,
         });
+        if (resource.volume)
+          resource.volume.setVolumeLogarithmic(
+            Math.max(0, Math.min(2, volume))
+          );
         return resource;
       } catch (ePlay) {
         if (DEBUG_AUDIO && ePlay?.message !== "Invalid URL")
@@ -892,8 +751,12 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
             typeof s2.type === "number" ? s2.type : StreamType.WebmOpus;
           const resource2 = createAudioResource(s2.stream, {
             inputType: inputType2,
-            inlineVolume: false,
+            inlineVolume: true,
           });
+          if (resource2.volume)
+            resource2.volume.setVolumeLogarithmic(
+              Math.max(0, Math.min(2, volume))
+            );
           return resource2;
         } catch (ePlayB) {
           if (DEBUG_AUDIO && ePlayB?.message !== "Invalid URL")
@@ -937,8 +800,10 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
         typeof s.type === "number" ? s.type : StreamType.WebmOpus;
       const resource = createAudioResource(s.stream, {
         inputType,
-        inlineVolume: false,
+        inlineVolume: true,
       });
+      if (resource.volume)
+        resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, volume)));
       return resource;
     } catch (ePlay) {
       if (DEBUG_AUDIO)
@@ -958,8 +823,12 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
           typeof s2.type === "number" ? s2.type : StreamType.WebmOpus;
         const resource2 = createAudioResource(s2.stream, {
           inputType: inputType2,
-          inlineVolume: false,
+          inlineVolume: true,
         });
+        if (resource2.volume)
+          resource2.volume.setVolumeLogarithmic(
+            Math.max(0, Math.min(2, volume))
+          );
         return resource2;
       } catch (ePlayB) {
         if (DEBUG_AUDIO)
@@ -1061,27 +930,9 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
 
   const ffmpegPath = process.env.FFMPEG_PATH || require("ffmpeg-static");
   if (!ffmpegPath) throw new Error("FFMPEG_REQUIRED");
-  const t0 = Date.now();
 
   // Preparar encabezados y cookie para yt-dlp (no para ffmpeg)
-  const args = [
-    "--no-playlist",
-    "-f",
-    // Preferir sólo audio: Opus -> M4A -> cualquier bestaudio (evita caer a 'best' con video)
-    "bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio",
-    "-o",
-    "-",
-    // Reintentos y robustez de fragmentos
-    "--retries",
-    "infinite",
-    "--fragment-retries",
-    "10",
-  // Acelerar y estabilizar HLS/DASH cuando aplique
-  "--concurrent-fragments",
-  "8",
-  "--http-chunk-size",
-  "512K",
-  ];
+  const args = ["--no-playlist", "-f", "bestaudio/best", "-o", "-"];
   // Opcionales para mitigar captcha en YouTube
   const extractorArgsEnv = (process.env.YT_YTDLP_EXTRACTOR_ARGS || "").trim();
   const ytClient = (process.env.YT_YTDLP_CLIENT || "").trim().toLowerCase(); // p.ej.: android | tvhtml5 | web | ios | mweb
@@ -1099,10 +950,12 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
     if (DEBUG_AUDIO) console.log(`[yt-dlp] forzando IPv4`);
   }
   const cookieFile = ensureYtDlpCookiesFileFromEnv();
+  if (cookieFile) {
+    args.push("--cookies", cookieFile);
+  }
   // Elegir extractor-args (player_client) según cookies y configuración
   let effectiveClient = ytClient;
   if (!extractorArgsEnv) {
-    // Selección dinámica: si hay cookies -> web; si no -> android.
     if (!effectiveClient) {
       effectiveClient = cookieFile ? "web" : "android";
     }
@@ -1119,10 +972,6 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
         console.log(`[yt-dlp] usando player_client=${effectiveClient}`);
     }
   } else {
-  // Pasar cookies solo si no usamos android
-  if (cookieFile && effectiveClient !== "android") {
-    args.push("--cookies", cookieFile);
-  }
     args.push("--extractor-args", extractorArgsEnv);
     if (DEBUG_AUDIO) console.log(`[yt-dlp] extractor-args (env): ${extractorArgsEnv}`);
   }
@@ -1131,15 +980,15 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   // Lanzar yt-dlp (binario o wrapper)
   const yProc = binPath
     ? spawn(binPath, args, { stdio: ["ignore", "pipe", "pipe"] })
-  : ytdlp.raw(args[args.length - 1], {
+    : ytdlp.raw(args[args.length - 1], {
         o: "-",
-    f: "bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio",
+        f: "bestaudio/best",
         noPlaylist: true,
         ...(headers?.userAgent ? { userAgent: headers.userAgent } : {}),
         ...(headers?.acceptLang
           ? { addHeader: [`Accept-Language: ${headers.acceptLang}`] }
           : {}),
-    ...((cookieFile && effectiveClient !== "android") ? { cookies: cookieFile } : {}),
+        ...(cookieFile ? { cookies: cookieFile } : {}),
         ...(() => {
           if (extractorArgsEnv) return { extractorArgs: extractorArgsEnv };
           const clientForWrapper = (() => {
@@ -1150,149 +999,18 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
         })(),
         ...(forceIpv4 ? { forceIpv4: true } : {}),
       });
-  // Si falla por cliente android con cookies, reintentar con web una vez
-  let restarted = false;
-  const trySwitchToWeb = () => {
-    if (restarted || !cookieFile || effectiveClient === "web") return;
-    restarted = true;
-    try {
-      if (binPath) {
-        const idx = args.indexOf("--extractor-args");
-        if (idx >= 0) {
-          args[idx + 1] = "youtube:player_client=web";
-        } else {
-          args.push("--extractor-args", "youtube:player_client=web");
-        }
-        // asegurar cookies para web
-        let cidx = args.indexOf("--cookies");
-        if (cidx < 0 && cookieFile) {
-          args.push("--cookies", cookieFile);
-        }
-        if (DEBUG_AUDIO) console.log("[yt-dlp] retry con player_client=web");
-        return spawn(binPath, args, { stdio: ["ignore", "pipe", "pipe"] });
-      } else if (ytdlp && ytdlp.raw) {
-        const opts = {
-          o: "-",
-          f: "bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio",
-          noPlaylist: true,
-          ...(headers?.userAgent ? { userAgent: headers.userAgent } : {}),
-          ...(headers?.acceptLang
-            ? { addHeader: [`Accept-Language: ${headers.acceptLang}`] }
-            : {}),
-          ...(cookieFile ? { cookies: cookieFile } : {}),
-          extractorArgs: "youtube:player_client=web",
-          ...(forceIpv4 ? { forceIpv4: true } : {}),
-        };
-        if (DEBUG_AUDIO) console.log("[yt-dlp] retry (wrapper) con web");
-        return ytdlp.raw(url, opts);
-      }
-    } catch {}
-    return null;
-  };
-  let switchedToIOS = false;
-  const trySwitchToIOS = () => {
-    if (switchedToIOS) return null;
-    switchedToIOS = true;
-    try {
-      if (binPath) {
-        const idx = args.indexOf("--extractor-args");
-        if (idx >= 0) {
-          args[idx + 1] = "youtube:player_client=ios";
-        } else {
-          args.push("--extractor-args", "youtube:player_client=ios");
-        }
-        // asegurar cookies para ios
-        let cidx = args.indexOf("--cookies");
-        if (cidx < 0 && cookieFile) {
-          args.push("--cookies", cookieFile);
-        }
-        if (DEBUG_AUDIO) console.log("[yt-dlp] retry con player_client=ios");
-        return spawn(binPath, args, { stdio: ["ignore", "pipe", "pipe"] });
-      } else if (ytdlp && ytdlp.raw) {
-        const opts = {
-          o: "-",
-          f: "bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio",
-          noPlaylist: true,
-          ...(headers?.userAgent ? { userAgent: headers.userAgent } : {}),
-          ...(headers?.acceptLang
-            ? { addHeader: [`Accept-Language: ${headers.acceptLang}`] }
-            : {}),
-          ...(cookieFile ? { cookies: cookieFile } : {}),
-          extractorArgs: "youtube:player_client=ios",
-          ...(forceIpv4 ? { forceIpv4: true } : {}),
-        };
-        if (DEBUG_AUDIO) console.log("[yt-dlp] retry (wrapper) con ios");
-        return ytdlp.raw(url, opts);
-      }
-    } catch {}
-    return null;
-  };
-  let switchedToAndroidNoCookies = false;
-  const trySwitchToAndroidNoCookies = () => {
-    if (switchedToAndroidNoCookies) return null;
-    switchedToAndroidNoCookies = true;
-    try {
-      if (binPath) {
-        // remover cookies si existen
-        let idxC = args.indexOf("--cookies");
-        if (idxC >= 0) {
-          args.splice(idxC, 2);
-        }
-        // setear cliente android
-        const idx = args.indexOf("--extractor-args");
-        if (idx >= 0) {
-          args[idx + 1] = "youtube:player_client=android";
-        } else {
-          args.push("--extractor-args", "youtube:player_client=android");
-        }
-        if (DEBUG_AUDIO) console.log("[yt-dlp] retry con player_client=android (sin cookies)");
-        return spawn(binPath, args, { stdio: ["ignore", "pipe", "pipe"] });
-      } else if (ytdlp && ytdlp.raw) {
-        const opts = {
-          o: "-",
-          f: "bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio",
-          noPlaylist: true,
-          ...(headers?.userAgent ? { userAgent: headers.userAgent } : {}),
-          ...(headers?.acceptLang
-            ? { addHeader: [`Accept-Language: ${headers.acceptLang}`] }
-            : {}),
-          // sin cookies
-          extractorArgs: "youtube:player_client=android",
-          ...(forceIpv4 ? { forceIpv4: true } : {}),
-        };
-        if (DEBUG_AUDIO) console.log("[yt-dlp] retry (wrapper) con android sin cookies");
-        return ytdlp.raw(url, opts);
-      }
-    } catch {}
-    return null;
-  };
 
-  // ffmpeg para transcodificar a ogg/opus por pipe (parametrizable)
-  const targetBitrate = String(process.env.FFMPEG_OPUS_BITRATE || "128k");
-  const frameOption = (() => {
-    const v = Number(process.env.FFMPEG_OPUS_FRAME_MS || 20);
-    const allowed = [2.5, 5, 10, 20, 40, 60];
-    const chosen = allowed.includes(v) ? v : 20;
-    return ["-frame_duration", String(chosen)];
-  })();
-  const complexity = Math.max(0, Math.min(10, Number(process.env.FFMPEG_OPUS_COMPLEXITY || 5)));
+  // ffmpeg para transcodificar a ogg/opus por pipe
   const ffArgs = [
     "-hide_banner",
     "-loglevel",
-    DEBUG_AUDIO ? "info" : "warning",
+    "warning",
     "-nostdin",
     "-i",
     "pipe:0",
     "-vn",
     "-sn",
     "-dn",
-    // Volumen por filtro si se especifica (evita inlineVolume y re-encode downstream)
-    ...(() => {
-      const v = Math.max(0, Math.min(2, Number(volume) || 1));
-      if (v === 1) return [];
-      // volumen lineal
-      return ["-filter:a", `volume=${v.toFixed(2)}`];
-    })(),
     "-ac",
     "2",
     "-ar",
@@ -1300,14 +1018,11 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
     "-c:a",
     "libopus",
     "-b:a",
-    targetBitrate,
-    "-vbr",
-    "on",
+    "160k",
     "-application",
     "audio",
-    ...frameOption,
-    "-compression_level",
-    String(complexity),
+    "-frame_duration",
+    "60",
     "-f",
     "ogg",
     "pipe:1",
@@ -1315,50 +1030,7 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   const ff = spawn(ffmpegPath, ffArgs, { stdio: ["pipe", "pipe", "pipe"] });
 
   // Encadenar salida de yt-dlp a ffmpeg
-  let yOut = yProc.stdout;
-  yProc.stderr?.on("data", (d) => {
-    const s = String(d || "");
-    if (/does not support cookies/i.test(s) || /Only images are available/i.test(s) || /Requested format is not available/i.test(s)) {
-      const alt = trySwitchToWeb();
-      if (alt) {
-        // re-encadenar con el nuevo proceso
-        try { yOut?.unpipe?.(ff.stdin); } catch {}
-        yProc.stdout?.removeAllListeners?.();
-        yProc.stderr?.removeAllListeners?.();
-        yOut = alt.stdout;
-        alt.stderr?.on("data", (d2) => {
-          const s2 = String(d2 || "");
-          if (/SABR streaming/i.test(s2) || /Requested format is not available/i.test(s2)) {
-            const alt2 = trySwitchToIOS();
-            if (alt2) {
-              try { yOut?.unpipe?.(ff.stdin); } catch {}
-              yOut = alt2.stdout;
-              alt2.stderr?.on("data", (d3) => DEBUG_AUDIO && console.warn(`[yt-dlp] ${String(d3).trim()}`));
-              yOut?.pipe(ff.stdin);
-              return;
-            }
-          }
-          if (DEBUG_AUDIO) console.warn(`[yt-dlp] ${s2.trim()}`);
-        });
-        yOut?.pipe(ff.stdin);
-        return;
-      }
-    }
-    // Reto de login/consent o bot challenge: intentar cliente android sin cookies
-    if (/Sign in to confirm/i.test(s) || /confirm you.?re not a bot/i.test(s) || /consent/i.test(s)) {
-      const alt = trySwitchToAndroidNoCookies();
-      if (alt) {
-        try { yOut?.unpipe?.(ff.stdin); } catch {}
-        yProc.stdout?.removeAllListeners?.();
-        yProc.stderr?.removeAllListeners?.();
-        yOut = alt.stdout;
-        alt.stderr?.on("data", (d4) => DEBUG_AUDIO && console.warn(`[yt-dlp] ${String(d4).trim()}`));
-        yOut?.pipe(ff.stdin);
-        return;
-      }
-    }
-  });
-  yOut?.pipe(ff.stdin);
+  yProc.stdout?.pipe(ff.stdin);
   if (DEBUG_AUDIO) {
     yProc.stderr?.on("data", (d) => console.warn(`[yt-dlp] ${String(d).trim()}`));
     ff.stderr?.on("data", (d) => console.warn(`[ffmpeg] ${String(d).trim()}`));
@@ -1381,63 +1053,22 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   ff.stdout.on("error", ignoreErr("ffmpeg:stdout"));
   ff.stdin.on("error", ignoreErr("ffmpeg:stdin"));
 
-  // Crear PassThrough con prebuffer para evitar underruns al inicio
-  const { PassThrough } = require("stream");
-  const kbps = Math.max(16, parseInt(targetBitrate, 10) || 128);
-  const preMs = Math.max(0, Math.min(3000, Number(process.env.PREBUFFER_MS || 300)));
-  const preMinBytes = Math.max(16384, Number(process.env.PREBUFFER_MIN_BYTES || 32768));
-  const outHighWM = Math.max(64 * 1024, Number(process.env.OUTPUT_HIGH_WATERMARK || (1 << 20)));
-  const pass = new PassThrough({ highWaterMark: outHighWM });
-  const targetBytes = preMs > 0
-    ? Math.max(preMinBytes, Math.floor(((kbps * 1000) / 8) * (preMs / 1000)))
-    : 0;
-  let started = targetBytes === 0;
-  const acc = [];
-  let accSize = 0;
-  const startPlayback = () => {
-    if (started) return;
-    started = true;
-    for (const ch of acc) {
-      pass.write(ch);
-    }
-    acc.length = 0;
-  try { console.log(`[timing] prebuffer_ready ${Date.now() - t0}ms (${targetBytes} bytes)`); } catch {}
-  };
-  let preTimer = null;
-  if (!started) {
-    const fallbackMs = Math.max(500, preMs * 2);
-    preTimer = setTimeout(startPlayback, fallbackMs);
-  }
-
-  ff.stdout.on("data", (chunk) => {
-    if (started) {
-      pass.write(chunk);
-    } else {
-      acc.push(chunk);
-      accSize += chunk.length;
-      if (accSize >= targetBytes) startPlayback();
-    }
-  });
-
-  const out = pass;
+  // Crear recurso
+  const out = ff.stdout;
   const cleanup = () => {
-    try { if (preTimer) clearTimeout(preTimer); } catch {}
     try {
       ff.kill("SIGKILL");
     } catch {}
     try {
       yProc.kill?.("SIGKILL");
     } catch {}
-    try { pass.destroy(); } catch {}
   };
-  ff.stdout.on("end", () => { startPlayback(); pass.end(); });
-  ff.stdout.on("close", () => { startPlayback(); pass.end(); });
   out.on("close", cleanup);
   out.on("end", cleanup);
   out.on("error", ignoreErr("ffmpeg:out"));
   const resource = createAudioResource(out, {
     inputType: StreamType.OggOpus,
-  inlineVolume: false,
+    inlineVolume: true,
   });
   // Asegurar limpieza si el recurso deja de usarse aguas arriba
   try {
@@ -1870,52 +1501,6 @@ function buildYtdlRequestOptions(videoIdOrUrl) {
   return opts;
 }
 
-// Transcodifica un stream arbitrario a Ogg/Opus con los mismos parámetros
-function createOpusResourceFromStream(inputStream, volume = 1.0) {
-  const ffmpegPath = process.env.FFMPEG_PATH || (() => { try { return require("ffmpeg-static"); } catch { return null; } })();
-  if (!ffmpegPath) throw new Error("FFMPEG_REQUIRED");
-  const targetBitrate = String(process.env.FFMPEG_OPUS_BITRATE || "128k");
-  const frameOption = (() => {
-    const v = Number(process.env.FFMPEG_OPUS_FRAME_MS || 20);
-    const allowed = [2.5, 5, 10, 20, 40, 60];
-    const chosen = allowed.includes(v) ? v : 20;
-    return ["-frame_duration", String(chosen)];
-  })();
-  const complexity = Math.max(0, Math.min(10, Number(process.env.FFMPEG_OPUS_COMPLEXITY || 5)));
-  const ffArgs = [
-    "-hide_banner",
-    "-loglevel",
-    DEBUG_AUDIO ? "info" : "warning",
-    "-nostdin",
-    "-i",
-    "pipe:0",
-    "-vn",
-    "-sn",
-    "-dn",
-    ...(() => {
-      const v = Math.max(0, Math.min(2, Number(volume) || 1));
-      if (v === 1) return [];
-      return ["-filter:a", `volume=${v.toFixed(2)}`];
-    })(),
-    "-ac", "2",
-    "-ar", "48000",
-    "-c:a", "libopus",
-    "-b:a", targetBitrate,
-    "-vbr", "on",
-    "-application", "audio",
-    ...frameOption,
-    "-compression_level", String(complexity),
-    "-f", "ogg",
-    "pipe:1",
-  ];
-  const ff = spawn(ffmpegPath, ffArgs, { stdio: ["pipe", "pipe", "pipe"] });
-  inputStream.pipe(ff.stdin);
-  if (DEBUG_AUDIO) ff.stderr.on("data", (d) => console.warn(`[ffmpeg] ${String(d).trim()}`));
-  const out = ff.stdout;
-  const resource = createAudioResource(out, { inputType: StreamType.OggOpus, inlineVolume: false });
-  return resource;
-}
-
 // Crear recurso directamente desde info de ytdl (evita pedir info de nuevo)
 function createResourceFromYtdlInfo(info, volume = 1.0) {
   try {
@@ -1932,15 +1517,13 @@ function createResourceFromYtdlInfo(info, volume = 1.0) {
         ...buildYtdlRequestOptions(vidRef),
       };
       const stream = ytdl.downloadFromInfo(info, ytdlOpts);
-      const vol = Number(volume) || 1;
-      if (Math.abs(vol - 1) > 1e-3) {
-        // Transcodificar para aplicar volumen de forma consistente en móviles
-        return createOpusResourceFromStream(stream, vol);
-      }
-      return createAudioResource(stream, {
+      const resource = createAudioResource(stream, {
         inputType: StreamType.WebmOpus,
-        inlineVolume: false,
+        inlineVolume: true,
       });
+      if (resource.volume)
+        resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, volume)));
+      return resource;
     }
     const vidRef =
       info?.videoDetails?.video_url ||
@@ -1953,8 +1536,13 @@ function createResourceFromYtdlInfo(info, volume = 1.0) {
       highWaterMark: 1 << 25,
       ...buildYtdlRequestOptions(vidRef),
     });
-    // Transcodificar a Ogg/Opus y aplicar volumen en ffmpeg
-    return createOpusResourceFromStream(fallbackStream, volume);
+    const resource = createAudioResource(fallbackStream, {
+      inputType: StreamType.Arbitrary,
+      inlineVolume: true,
+    });
+    if (resource.volume)
+      resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, volume)));
+    return resource;
   } catch (e) {
     return null;
   }
@@ -1975,14 +1563,13 @@ function createFastStartResourceFromYtdlInfo(info, volume = 1.0) {
       dlChunkSize: 1 << 20,
       ...buildYtdlRequestOptions(vidRef),
     });
-    const vol = Number(volume) || 1;
-    if (Math.abs(vol - 1) > 1e-3) {
-      return createOpusResourceFromStream(stream, vol);
-    }
-    return createAudioResource(stream, {
+    const resource = createAudioResource(stream, {
       inputType: StreamType.WebmOpus,
-      inlineVolume: false,
+      inlineVolume: true,
     });
+    if (resource.volume)
+      resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, volume)));
+    return resource;
   } catch {
     return null;
   }
@@ -1992,7 +1579,6 @@ async function playNext(guildId) {
   const q = queues.get(guildId);
   if (!q || q.songs.length === 0) return;
   const current = q.songs[0];
-  const tStart = Date.now();
   try {
     // cancelar cualquier upgrade pendiente de pista anterior
     if (q.upgradeTimer) {
@@ -2005,28 +1591,26 @@ async function playNext(guildId) {
     let resource = null;
     const fastStartEnabled = String(process.env.FAST_START || "1") === "1";
     const fastDelayMs = Math.max(
-      300,
-      Math.min(5000, Number(process.env.FAST_START_MS || 1200))
+      500,
+      Math.min(8000, Number(process.env.FAST_START_MS || 2000))
     );
-    const longEnough = (current.durationSec || 0) >= 20;
-    const forceYtDlp = String(process.env.YT_FORCE_YTDLP || "0") === "1";
+    const longEnough = (current.durationSec || 0) >= 60;
+  const forceYtDlp = String(process.env.YT_FORCE_YTDLP || "0") === "1";
 
-    if (current.ytdlInfo && fastStartEnabled && longEnough) {
+  if (!forceYtDlp && current.ytdlInfo && fastStartEnabled && longEnough) {
       resource =
         createFastStartResourceFromYtdlInfo(
           current.ytdlInfo,
           q.volume ?? 1.0
         ) || createResourceFromYtdlInfo(current.ytdlInfo, q.volume ?? 1.0);
-    } else if (current.ytdlInfo) {
+  } else if (!forceYtDlp && current.ytdlInfo) {
       resource = createResourceFromYtdlInfo(current.ytdlInfo, q.volume ?? 1.0);
     }
     if (!resource) {
       resource = await createResourceFromUrl(current.url, q.volume ?? 1.0);
     }
 
-  q.currentSong = current;
-  q.player.play(resource);
-  try { console.log(`[timing] play_start queued ${current.title || current.url}`); } catch {}
+    q.player.play(resource);
 
     // Programar upgrade a mayor calidad si aplica
     if (current.ytdlInfo && fastStartEnabled && longEnough) {
@@ -2038,20 +1622,10 @@ async function playNext(guildId) {
           const qq = queues.get(guildId);
           if (!qq || qq.currentTrackToken !== token) return;
           if (qq.player?.state?.status !== AudioPlayerStatus.Playing) return;
-          // Si está forzado yt-dlp, hacer upgrade al pipeline de yt-dlp para máxima robustez
-          let bestRes = null;
-          const forceYtDlp2 = String(process.env.YT_FORCE_YTDLP || "0") === "1";
-          if (forceYtDlp2) {
-            try {
-              bestRes = await createResourceFromUrl(current.url, qq.volume ?? 1.0);
-            } catch {}
-          }
-          if (!bestRes) {
-            bestRes = createResourceFromYtdlInfo(
-              current.ytdlInfo,
-              qq.volume ?? 1.0
-            );
-          }
+          const bestRes = createResourceFromYtdlInfo(
+            current.ytdlInfo,
+            qq.volume ?? 1.0
+          );
           if (!bestRes) return;
           qq.player.play(bestRes);
           if (DEBUG_AUDIO) console.log("[fast-start] upgraded to high quality");
@@ -2071,14 +1645,6 @@ async function playNext(guildId) {
         startNowPlayingTicker(guildId);
       } catch {}
     }
-    // Escuchar el cambio a Playing para medir
-    const onStateChange = (oldS, newS) => {
-      if (newS?.status === AudioPlayerStatus.Playing) {
-        try { console.log(`[timing] playing_after ${Date.now() - tStart}ms`); } catch {}
-        try { q.player.off("stateChange", onStateChange); } catch {}
-      }
-    };
-    try { q.player.on("stateChange", onStateChange); } catch {}
   } catch (e) {
     console.error("[playNext:error]", e?.message || e, "url:", current?.url);
     // Fallback: forzar play-dl para esta URL
@@ -2119,9 +1685,7 @@ async function playNext(guildId) {
         }
       }
     } catch {}
-  // al fallar, eliminar sólo la pista actual
-  if (q.songs[0] === q.currentSong) q.songs.shift();
-  q.currentSong = null;
+    q.songs.shift();
     if (q.songs.length > 0) {
       playNext(guildId).catch((err) =>
         console.error("[playNext:chain:error]", err)
@@ -2153,7 +1717,7 @@ function startNowPlayingTicker(guildId) {
     // Solo refrescar cuando realmente está reproduciendo
     if (qq.player?.state?.status !== AudioPlayerStatus.Playing) return;
     renderNowPlaying(guildId).catch(() => {});
-  }, 1_000);
+  }, 3_000);
 }
 
 function stopNowPlayingTicker(guildId) {
@@ -2191,7 +1755,7 @@ function buildControlsComponents(q) {
     new ButtonBuilder()
       .setCustomId("music_skip")
   .setEmoji("⏭️")
-      .setLabel("Siguiente")
+      .setLabel("Saltar")
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(!hasSong),
     new ButtonBuilder()
@@ -2222,7 +1786,7 @@ function buildControlsComponents(q) {
     new ButtonBuilder()
       .setCustomId("music_shuffle")
       .setEmoji("🔀")
-      .setLabel("Aleatorio")
+      .setLabel("Barajar")
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(!canShuffle),
     new ButtonBuilder()
@@ -2391,7 +1955,6 @@ client.on("messageCreate", async (message) => {
         const items = (pl.videos || []).slice(0, MAX_PLAYLIST_ITEMS);
         if (items.length === 0)
           return message.reply("❌ No pude leer la playlist.");
-        const added = [];
         for (const vid of items) {
           const url =
             vid.url ||
@@ -2401,18 +1964,14 @@ client.on("messageCreate", async (message) => {
           const title = vid.title || vid.name || url;
           const dur =
             Number(vid.durationInSec || vid.durationInMs / 1000 || 0) || 0;
-          const song = {
+          q.songs.push({
             url: canonicalizeYouTubeUrl(url),
             title,
             durationSec: dur ? Math.floor(dur) : 0,
             thumbnailUrl: deriveYouTubeThumb(url),
             requestedById: message.author.id,
-          };
-          q.songs.push(song);
-          added.push(song);
+          });
         }
-        maybeWarmupOnAdd(message.guild.id, added);
-  schedulePrefetch(message.guild.id).catch(() => {});
         if (
           q.songs.length > 0 &&
           q.player.state.status !== AudioPlayerStatus.Playing
@@ -2493,18 +2052,16 @@ client.on("messageCreate", async (message) => {
         };
       }
       await connectP;
-  q.songs.push(songData);
-  maybeWarmupOnAdd(message.guild.id, [songData]);
-  schedulePrefetch(message.guild.id).catch(() => {});
+      q.songs.push(songData);
       let header;
-  if (q.player.state.status !== AudioPlayerStatus.Playing && q.songs.length === 1) {
+      if (q.songs.length === 1) {
         await playNext(message.guild.id);
         header = `🎶 Reproduciendo: ${songData.title}${
           songData.durationSec
             ? ` [${formatDuration(songData.durationSec)}]`
             : ""
         }`;
-  } else {
+      } else {
         header = `➕ Añadido a la cola: ${songData.title}${
           songData.durationSec
             ? ` [${formatDuration(songData.durationSec)}]`
@@ -2862,7 +2419,6 @@ client.on("interactionCreate", async (interaction) => {
             return safeRespond(interaction, "❌ No pude leer la playlist.", {
               edit: true,
             });
-          const added = [];
           for (const vid of items) {
             const url =
               vid.url ||
@@ -2872,18 +2428,14 @@ client.on("interactionCreate", async (interaction) => {
             const title = vid.title || vid.name || url;
             const dur =
               Number(vid.durationInSec || vid.durationInMs / 1000 || 0) || 0;
-            const song = {
+            q.songs.push({
               url: canonicalizeYouTubeUrl(url),
               title,
               durationSec: dur ? Math.floor(dur) : 0,
               thumbnailUrl: deriveYouTubeThumb(url),
               requestedById: member?.user?.id,
-            };
-            q.songs.push(song);
-            added.push(song);
+            });
           }
-          maybeWarmupOnAdd(guild.id, added);
-          schedulePrefetch(guild.id).catch(() => {});
           if (
             q.songs.length > 0 &&
             q.player.state.status !== AudioPlayerStatus.Playing
@@ -2998,18 +2550,16 @@ client.on("interactionCreate", async (interaction) => {
           { edit: true }
         );
       }
-  q.songs.push(songData);
-  maybeWarmupOnAdd(guild.id, [songData]);
-  schedulePrefetch(guild.id).catch(() => {});
+      q.songs.push(songData);
       let header;
-  if (q.player.state.status !== AudioPlayerStatus.Playing && q.songs.length === 1) {
+      if (q.songs.length === 1) {
         await playNext(guild.id);
         header = `🎶 Reproduciendo: ${songData.title}${
           songData.durationSec
             ? ` [${formatDuration(songData.durationSec)}]`
             : ""
         }`;
-  } else {
+      } else {
         header = `➕ Añadido a la cola: ${songData.title}${
           songData.durationSec
             ? ` [${formatDuration(songData.durationSec)}]`
