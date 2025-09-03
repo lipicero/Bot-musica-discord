@@ -1,4 +1,4 @@
-# Bot de música con panel Now Playing
+0# Bot de música con panel Now Playing
 
 Este bot muestra un panel "Now Playing" con botones de control:
 
@@ -11,7 +11,7 @@ Este bot muestra un panel "Now Playing" con botones de control:
 - 🔀 Mezclar cola (sin mover la pista actual)
 - ⏹️ Detener
 
-Además, comandos por texto: `!play`, `!skip`, `!pause`, `!resume`, `!queue`, `!nowplaying`, `!stop`, `!volume <0-200>` y equivalentes mediante slash.
+Los comandos funcionan sólo con slash: `/play`, `/skip`, `/pause`, `/resume`, `/queue`, `/nowplaying`, `/stop`, `/volume`.
 
 ## Requisitos
 
@@ -23,7 +23,7 @@ Además, comandos por texto: `!play`, `!skip`, `!pause`, `!resume`, `!queue`, `!
 ## Ejecutar
 
 - Windows (fondo): `start-bot-bg.bat` o `status-bot.bat` para ver estado.
-- Primer arranque: usa `/play <url o búsqueda>` o `!play <url>`.
+- Primer arranque: usa `/play <URL>`.
 
 Si el panel no aparece, asegúrate de:
 - Que el bot tenga permiso para ver/escribir en el canal de texto y usar botones.

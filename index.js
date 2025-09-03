@@ -52,210 +52,43 @@ try {
 } catch {}
 const { spawn, spawnSync } = require("child_process");
 
-// Helpers de cookies YouTube
-function parseNetscapeCookieFileToHeader(content) {
-  try {
-    const lines = String(content).split(/\r?\n/);
-    const parts = [];
-    for (const line of lines) {
-      const s = line.trim();
-      if (!s || s.startsWith("#")) continue;
-      const cols = s.split(/\t+/);
-      if (cols.length < 7) continue;
-      const name = cols[5];
-      const value = cols[6];
-      if (!name) continue;
-      parts.push(`${name}=${value}`);
-    }
-    const uniq = Array.from(new Map(parts.map((p) => {
-      const idx = p.indexOf("=");
-      const k = idx === -1 ? p : p.slice(0, idx);
-      return [k, p];
-    })).values());
-    return uniq.join("; ");
-  } catch {
-    return "";
-  }
-}
-
-function getYouTubeCookieHeaderFromEnv() {
-  try {
-    // Prioridad: YT_COOKIE (header) > YT_COOKIE_B64 (netscape o header) > YT_COOKIE_FILE > YOUTUBE_COOKIE
-    if (process.env.YT_COOKIE) return String(process.env.YT_COOKIE);
-    let raw = null;
-    if (process.env.YT_COOKIE_B64) {
-      try {
-        raw = Buffer.from(String(process.env.YT_COOKIE_B64).trim(), "base64").toString("utf8");
-      } catch {}
-      if (raw) {
-        const looksNetscape = /\t/.test(raw) || /Netscape HTTP Cookie File/i.test(raw);
-        return looksNetscape ? parseNetscapeCookieFileToHeader(raw) : raw;
-      }
-    }
-    if (process.env.YT_COOKIE_FILE) {
-      try {
-        const p = String(process.env.YT_COOKIE_FILE).trim();
-        if (p && fs.existsSync(p)) {
-          const txt = fs.readFileSync(p, "utf8");
-          const looksNetscape = /\t/.test(txt) || /Netscape HTTP Cookie File/i.test(txt);
-          return looksNetscape ? parseNetscapeCookieFileToHeader(txt) : txt;
-        }
-      } catch {}
-    }
-    if (process.env.YOUTUBE_COOKIE) return String(process.env.YOUTUBE_COOKIE);
-  } catch {}
-  return "";
-}
-
-// Config opcional de YouTube para play-dl (evita bloqueos/edad/consent)
-try {
-  const ytCookieHdr = getYouTubeCookieHeaderFromEnv();
-  if (ytCookieHdr) {
-    playdl.setToken({ youtube: { cookie: ytCookieHdr } });
-    console.log("[play-dl] cookie de YouTube configurada");
-  }
-} catch (e) {
-  console.warn("[play-dl] No se pudo configurar cookie:", e?.message || e);
-}
-
-// Inicializamos el cliente de Discord
+// ======================
+// Cliente Discord e Intents (slash-only)
+// ======================
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildVoiceStates,
   ],
 });
 
-// Evento recomendado en v14: 'clientReady' (evita warning de deprecación)
-client.once("clientReady", async (c) => {
-  console.log(`✅ Bot conectado como ${c.user.tag}`);
-  // Registro rápido por cada servidor donde está el bot
-  for (const guild of c.guilds.cache.values()) {
-    await registerGuildCommands(guild);
-  }
-});
-
-// ======================
-// Slash Commands (por servidor, registro inmediato)
-// ======================
-const slashCommands = [
-  {
-    name: "play",
-    description: "Reproduce audio desde YouTube (URL o búsqueda)",
-    type: 1,
-    options: [
-      { name: "query", description: "URL o búsqueda", type: 3, required: true },
-    ],
-  },
-  { name: "skip", description: "Saltar a la siguiente pista", type: 1 },
-  { name: "pause", description: "Pausar la reproducción", type: 1 },
-  { name: "resume", description: "Reanudar la reproducción", type: 1 },
-  { name: "queue", description: "Mostrar la cola", type: 1 },
-  { name: "stop", description: "Detener y salir del canal", type: 1 },
-  { name: "remove", description: "Remueve una canción de la cola por índice", type: 1, options: [ { name: "index", description: "Posición en la cola (1 = actual)", type: 4, required: true, min_value: 1 } ] },
-  { name: "clear", description: "Limpia la cola (mantiene la canción actual)", type: 1 },
-  {
-    name: "nowplaying",
-    description: "Mostrar la canción en reproducción",
-    type: 1,
-  },
-  {
-    name: "volume",
-    description: "Ajusta el volumen (0-200%)",
-    type: 1,
-    options: [
-      {
-        name: "level",
-        description: "Porcentaje de volumen (0-200)",
-        type: 4,
-        required: true,
-        min_value: 0,
-        max_value: 200,
-      },
-    ],
-  },
-];
-
 // ======================
 // Persistencia de volumen por servidor
 // ======================
-const VOLUME_FILE = path.resolve(__dirname, "volumes.json");
 function loadVolumes() {
   try {
-    const txt = fs.readFileSync(VOLUME_FILE, "utf8");
-    const obj = JSON.parse(txt);
-    return obj && typeof obj === "object" ? obj : {};
-  } catch {
-    return {};
-  }
-}
-function saveVolumes(vols) {
-  try {
-    fs.writeFileSync(VOLUME_FILE, JSON.stringify(vols, null, 2), "utf8");
-  } catch (e) {
-    console.error("[volume:save:error]", e);
-  }
-}
-const guildVolumes = loadVolumes(); // { [guildId]: number 0..2 }
-
-function isKnownInteractionError(err) {
-  return err && (err.code === 10062 || err.code === 40060);
-}
-
-async function safeRespond(interaction, data, opts = {}) {
-  const { edit = false, ephemeral = false } = opts;
-  try {
-    if (edit || interaction.deferred || interaction.replied) {
-      if (typeof data === "string") return await interaction.editReply(data);
-      return await interaction.editReply(data);
-    } else {
-      if (typeof data === "string") {
-        return await interaction.reply({
-          content: data,
-          flags: ephemeral ? 64 : undefined,
-        });
-      }
-      if (ephemeral) data.flags = 64;
-      return await interaction.reply(data);
+    const p = path.join(process.cwd(), "volumes.json");
+    if (fs.existsSync(p)) {
+      const j = JSON.parse(fs.readFileSync(p, "utf8"));
+      return j && typeof j === "object" ? j : {};
     }
-  } catch (e) {
-    if (isKnownInteractionError(e)) return; // ignorar errores típicos de interacción
-    console.error("[safeRespond:error]", e);
-  }
+  } catch {}
+  return {};
 }
-
-async function safeDefer(interaction) {
-  if (interaction.deferred || interaction.replied) return true;
+function saveVolumes(obj) {
   try {
-    await interaction.deferReply();
-    return true;
+    const p = path.join(process.cwd(), "volumes.json");
+    fs.writeFileSync(p, JSON.stringify(obj, null, 2), "utf8");
   } catch (e) {
-    if (isKnownInteractionError(e)) return false;
-    console.error("[safeDefer:error]", e);
-    return false;
+    console.warn("[volumes:save:error]", e?.message || e);
   }
 }
-
-async function registerGuildCommands(guild) {
-  try {
-    await guild.commands.set(slashCommands);
-  } catch (e) {
-    console.error("[registerGuildCommands:error]", e);
-  }
-}
-
-client.on("guildCreate", async (guild) => {
-  await registerGuildCommands(guild);
-});
-
-// Nota: ya registramos en 'clientReady'
+const guildVolumes = loadVolumes();
 
 // ======================
 // Cola por servidor
 // ======================
-const queues = new Map(); // guildId -> { songs: Array<{url,title,durationSec,thumbnailUrl,requestedById,retries?:number, ytdlInfo?:any, videoId?:string}>, player, connection, textChannelId, nowPlayingMessageId, loop:boolean, volume:number, uiInterval?: NodeJS.Timer, currentRetry?:number, upgradeTimer?:NodeJS.Timer, currentTrackToken?:string }
+const queues = new Map();
 
 function getQueue(guildId) {
   let q = queues.get(guildId);
@@ -276,115 +109,29 @@ function getQueue(guildId) {
       });
     }
     player.on("error", async (err) => {
-      console.error("[player:error]", err);
+      console.error("[player:error]", err?.message || err);
       const qq = queues.get(guildId);
-      if (!qq || !qq.songs.length) return;
-      // Si es un 403 de miniget/ytdl, intentar re-crear el recurso con play-dl directamente
-      const is403 = /\b403\b/.test(String(err?.message || ""));
-      if (is403) {
-        try {
-          const current = qq.songs[0];
-          if (current?.url) {
-            const forceYtDlp = String(process.env.YT_FORCE_YTDLP || "0") === "1";
-            if (forceYtDlp && ytdlp) {
-              const res2 = await createResourceFromYtDlp(
-                current.url,
-                qq.volume ?? 1.0,
-                {
-                  userAgent:
-                    process.env.YTDL_USER_AGENT ||
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                  acceptLang:
-                    process.env.YTDL_ACCEPT_LANGUAGE ||
-                    "es-ES,es;q=0.9,en;q=0.8",
-                  cookie: process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE,
-                }
-              );
-              qq.player.play(res2);
-              return;
-            }
-            // Primero intentar con play-dl
-            const resource = await createResourceFromUrl(
-              current.url,
-              qq.volume ?? 1.0,
-              { preferPlayDl: true }
-            ).catch(() => null);
-            if (resource) {
-              qq.player.play(resource);
-              return;
-            }
-            // Luego probar con yt-dlp si está disponible
-            if (!forceYtDlp && ytdlp) {
-              const res3 = await createResourceFromYtDlp(
-                current.url,
-                qq.volume ?? 1.0,
-                {
-                  userAgent:
-                    process.env.YTDL_USER_AGENT ||
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                  acceptLang:
-                    process.env.YTDL_ACCEPT_LANGUAGE ||
-                    "es-ES,es;q=0.9,en;q=0.8",
-                  cookie: process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE,
-                }
-              );
-              qq.player.play(res3);
-              return;
-            }
-            qq.player.play(resource);
-            return;
-          }
-        } catch (e403) {
-          if (DEBUG_AUDIO)
-            console.warn(
-              "[player:error:403-fallback-failed]",
-              e403?.message || e403
-            );
-        }
-      }
-      // Reintentar la pista actual hasta 2 veces, luego saltar
-      qq.currentRetry = (qq.currentRetry || 0) + 1;
-      if (qq.currentRetry <= 2) {
-        try {
-          await playNext(guildId);
-        } catch (e) {
-          console.error("[player:error:retry-failed]", e?.message || e);
-        }
+      if (!qq || !qq.songs?.length) return;
+      // Saltar la pista que falló
+      qq.songs.shift();
+      if (qq.songs.length > 0) {
+        try { await playNext(guildId); } catch {}
       } else {
-        qq.currentRetry = 0;
-        qq.songs.shift();
-        if (qq.songs.length > 0) {
-          try {
-            await playNext(guildId);
-          } catch (e) {
-            console.error("[player:error:skip-next-failed]", e?.message || e);
-          }
-        } else {
-          const conn = getVoiceConnection(guildId);
-          conn?.destroy();
-          queues.delete(guildId);
-          clearNowPlaying(guildId).catch(() => {});
-          try {
-            stopNowPlayingTicker(guildId);
-          } catch {}
-        }
+        try { getVoiceConnection(guildId)?.destroy(); } catch {}
+        queues.delete(guildId);
+        try { await clearNowPlaying(guildId); } catch {}
+        try { stopNowPlayingTicker(guildId); } catch {}
       }
     });
     player.on(AudioPlayerStatus.Idle, () => {
       const qq = queues.get(guildId);
       if (!qq) return;
-      // limpiar upgrade timer si existe al finalizar pista
-      if (qq.upgradeTimer) {
-        try {
-          clearTimeout(qq.upgradeTimer);
-        } catch {}
-        qq.upgradeTimer = null;
-      }
-      // Si está en loop, vuelve a reproducir el mismo tema sin avanzar
+      // Si está en loop, vuelve a reproducir sin avanzar
       if (qq.loop && qq.songs.length > 0) {
         playNext(guildId).catch((e) => console.error("[playNext:error]", e));
         return;
       }
+      // Avanzar cola
       qq.songs.shift();
       if (qq.songs.length > 0) {
         playNext(guildId).catch((e) => console.error("[playNext:error]", e));
@@ -392,13 +139,8 @@ function getQueue(guildId) {
         const conn = getVoiceConnection(guildId);
         conn?.destroy();
         queues.delete(guildId);
-        // intentar borrar/eliminar mensaje de Now Playing si existe
         clearNowPlaying(guildId).catch(() => {});
-        // detener ticker de progreso
-        try {
-          const q = queues.get(guildId);
-          if (q?.uiInterval) clearInterval(q.uiInterval);
-        } catch {}
+        try { stopNowPlayingTicker(guildId); } catch {}
       }
     });
     const initialVol = Math.max(
@@ -415,10 +157,42 @@ function getQueue(guildId) {
       volume: initialVol,
       uiInterval: null,
       currentRetry: 0,
+      connectingPromise: null,
+      upgradeTimer: null,
+      currentTrackToken: null,
     };
     queues.set(guildId, q);
   }
   return q;
+}
+
+// ======================
+// Utilidades de respuesta para interacciones
+// ======================
+async function safeRespond(interaction, data, opts = {}) {
+  try {
+    if (opts.edit) {
+      return await interaction.editReply(data);
+    }
+    return await interaction.reply(data);
+  } catch (e) {
+    try {
+      if (interaction.deferred || interaction.replied) {
+        return await interaction.editReply(data);
+      }
+      return await interaction.reply(data);
+    } catch {}
+  }
+}
+
+async function safeDefer(interaction) {
+  try {
+    if (interaction.deferred || interaction.replied) return true;
+  await interaction.deferReply();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function tryEnqueue(q, song) {
@@ -428,13 +202,12 @@ function tryEnqueue(q, song) {
   return true;
 }
 
-function sameVoiceChannelRequiredPass(guild, user) {
+function sameVoiceChannelRequiredPass(guild, member) {
   if (!REQUIRE_SAME_VC) return true;
   try {
     const meConn = getVoiceConnection(guild.id);
     const botChannelId = meConn?.joinConfig?.channelId;
-    const member = guild.members.cache.get(user.id);
-    const userChannelId = member?.voice?.channelId;
+  const userChannelId = member?.voice?.channelId;
     if (!botChannelId || !userChannelId) return false;
     return botChannelId === userChannelId;
   } catch {
@@ -1243,6 +1016,33 @@ function parseCookieHeaderToArray(header) {
   }
 }
 
+// Lee cookie de YouTube desde variables de entorno en formato de header "a=b; c=d"
+function getYouTubeCookieHeaderFromEnv() {
+  try {
+    // Prioridad: YT_COOKIE_B64 (base64 de header), YT_COOKIE/YOUTUBE_COOKIE (header plano), YT_COOKIE_FILE (si contiene header plano)
+    if (process.env.YT_COOKIE_B64) {
+      try {
+        const raw = Buffer.from(String(process.env.YT_COOKIE_B64).trim(), "base64").toString("utf8");
+        if (raw && raw.includes("=")) return raw.trim();
+      } catch {}
+    }
+    if (process.env.YT_COOKIE) return String(process.env.YT_COOKIE).trim();
+    if (process.env.YOUTUBE_COOKIE) return String(process.env.YOUTUBE_COOKIE).trim();
+    if (process.env.YT_COOKIE_FILE) {
+      try {
+        const p = String(process.env.YT_COOKIE_FILE).trim();
+        if (p && fs.existsSync(p)) {
+          const txt = fs.readFileSync(p, "utf8");
+          // Si es Netscape (tabs/cabecera) no sirve para header; retornamos null y se usará archivo para yt-dlp.
+          const looksNetscape = /\t/.test(txt) || /Netscape HTTP Cookie File/i.test(txt);
+          if (!looksNetscape && txt.includes("=")) return txt.trim();
+        }
+      } catch {}
+    }
+  } catch {}
+  return null;
+}
+
 // Crea (si no existe) un archivo temporal de cookies en formato Netscape
 // a partir de la variable de entorno YT_COOKIE/YOUTUBE_COOKIE.
 // Devuelve la ruta al archivo o null si no hay cookie.
@@ -1358,24 +1158,7 @@ function ensureYtDlpCookiesFileFromEnv() {
   }
 }
 
-async function resolvePlayableUrl(input) {
-  let url = input.replace(/^<(.+)>$/, "$1").trim();
-  if (/^https?:\/\//i.test(url)) {
-    if (isYouTubeUrl(url)) {
-      return canonicalizeYouTubeUrl(url);
-    }
-    return url;
-  }
-  try {
-    const results = await playdl.search(url, {
-      limit: 1,
-      source: { youtube: "video" },
-    });
-    const first = results?.[0];
-    if (first?.url) return canonicalizeYouTubeUrl(first.url);
-  } catch {}
-  return null;
-}
+// Búsqueda deshabilitada: se requiere URL directa
 
 async function fetchTitle(url) {
   try {
@@ -1470,6 +1253,68 @@ function formatQueueMessage(q, limit = 10) {
   if (q.songs.length > limit) lines.push(`... y ${q.songs.length - limit} más`);
   return lines.join("\n");
 }
+
+// ======================
+// Registro de Slash Commands
+// ======================
+async function registerSlashCommands() {
+  const commands = [
+    {
+      name: "play",
+      description: "Reproducir por URL o playlist (YouTube)",
+      options: [
+        {
+          name: "query",
+          description: "URL a reproducir (o playlist de YouTube)",
+          type: 3, // STRING
+          required: true,
+        },
+      ],
+    },
+    { name: "skip", description: "Saltar la canción actual" },
+    { name: "pause", description: "Pausar reproducción" },
+    { name: "resume", description: "Reanudar reproducción" },
+    { name: "queue", description: "Mostrar la cola" },
+    {
+      name: "remove",
+      description: "Eliminar un elemento de la cola por índice",
+      options: [
+        {
+          name: "index",
+          description: "Índice en la cola (1..n)",
+          type: 4, // INTEGER
+          required: true,
+        },
+      ],
+    },
+    { name: "clear", description: "Limpiar la cola (mantiene la actual)" },
+    { name: "nowplaying", description: "Mostrar lo que suena" },
+    { name: "stop", description: "Detener y desconectar" },
+    {
+      name: "volume",
+      description: "Ajustar volumen (0-200)",
+      options: [
+        {
+          name: "level",
+          description: "Nivel de volumen en % (0-200)",
+          type: 4, // INTEGER
+          required: true,
+        },
+      ],
+    },
+  ];
+  try {
+    await client.application.commands.set(commands);
+    console.log("[slash] Comandos registrados globalmente");
+  } catch (e) {
+    console.error("[slash:register:error]", e?.message || e);
+  }
+}
+
+client.once("clientReady", async () => {
+  console.log(`[bot] Conectado como ${client.user?.tag || client.user?.id}`);
+  try { await registerSlashCommands(); } catch {}
+});
 
 function canonicalizeYouTubeUrl(input) {
   try {
@@ -2029,334 +1874,7 @@ async function clearNowPlaying(guildId) {
   q.nowPlayingMessageId = null;
 }
 
-// Comandos básicos
-client.on("messageCreate", async (message) => {
-  if (message.author.bot) return;
-
-  // !play <URL|búsqueda>
-  if (message.content.startsWith("!play")) {
-    const raw = message.content.slice("!play".length).trim();
-    const candidate =
-      raw || (message.content.match(/https?:\/\/\S+/)?.[0] ?? "");
-    if (!candidate) return message.reply("📌 Usá: `!play <link>`");
-    // Playlist YouTube: encolar múltiples items
-    try {
-      const vType = await playdl.validate(canonicalizeYouTubeUrl(candidate));
-      if (vType === "yt_playlist") {
-        const voiceChannel = message.member.voice.channel;
-        if (!voiceChannel)
-          return message.reply("❌ Tenés que estar en un canal de voz.");
-        const perms = voiceChannel.permissionsFor(message.client.user);
-        if (
-          !perms?.has(PermissionsBitField.Flags.Connect) ||
-          !perms?.has(PermissionsBitField.Flags.Speak)
-        ) {
-          return message.reply(
-            "❌ No tengo permisos para unirme o hablar en ese canal."
-          );
-        }
-  const q = getQueue(message.guild.id);
-  if (!q.textChannelId) q.textChannelId = message.channel.id;
-        await ensureConnection(message.guild, voiceChannel);
-        const pl = await playdl.playlist_info(candidate, { incomplete: true });
-        await pl.fetch();
-        const items = (pl.videos || []).slice(0, MAX_PLAYLIST_ITEMS);
-        if (items.length === 0)
-          return message.reply("❌ No pude leer la playlist.");
-        let added = 0;
-        for (const vid of items) {
-          const url =
-            vid.url ||
-            vid.video_url ||
-            (vid.id ? `https://www.youtube.com/watch?v=${vid.id}` : null);
-          if (!url) continue;
-          const title = vid.title || vid.name || url;
-          const dur =
-            Number(vid.durationInSec || vid.durationInMs / 1000 || 0) || 0;
-          if ((q.songs?.length || 0) >= MAX_QUEUE_LENGTH) break;
-          q.songs.push({
-            url: canonicalizeYouTubeUrl(url),
-            title,
-            durationSec: dur ? Math.floor(dur) : 0,
-            thumbnailUrl: deriveYouTubeThumb(url),
-            requestedById: message.author.id,
-          });
-          added++;
-        }
-        if (
-          q.songs.length > 0 &&
-          q.player.state.status !== AudioPlayerStatus.Playing
-        ) {
-          await playNext(message.guild.id);
-        }
-        const queueText = formatQueueMessage(q);
-        const sent = await message.reply(
-          `📚 Añadidos ${added} temas de la playlist "${
-            pl.title || ""
-          }" (máx ${MAX_PLAYLIST_ITEMS}${added < items.length ? `, truncado por límite de cola (${MAX_QUEUE_LENGTH})` : ""}).\n\nCola actual:\n${queueText}`
-        );
-        // Asegurar/actualizar panel sin sobreescribir con el reply
-        await ensurePanel(message.guild.id, sent.channel.id);
-        await renderNowPlaying(message.guild.id).catch(() => {});
-        return sent;
-      }
-    } catch {}
-    const finalUrl = await resolvePlayableUrl(candidate);
-    if (!finalUrl) return message.reply("❌ Link inválido o no soportado.");
-
-    const voiceChannel = message.member.voice.channel;
-    if (!voiceChannel)
-      return message.reply("❌ Tenés que estar en un canal de voz.");
-
-    const perms = voiceChannel.permissionsFor(message.client.user);
-    if (
-      !perms?.has(PermissionsBitField.Flags.Connect) ||
-      !perms?.has(PermissionsBitField.Flags.Speak)
-    ) {
-      return message.reply(
-        "❌ No tengo permisos para unirme o hablar en ese canal."
-      );
-    }
-
-    try {
-  const q = getQueue(message.guild.id);
-  if (!q.textChannelId) q.textChannelId = message.channel.id;
-      // Paralelizar conexión con fetch de info/metadata
-      const connectP = ensureConnection(message.guild, voiceChannel);
-      const ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
-      let songData = null;
-      if (isYouTubeUrl(finalUrl)) {
-  if (String(process.env.YT_FORCE_YTDLP || "0") === "1") {
-          const meta = await fetchMetadata(finalUrl);
-          songData = {
-            url: finalUrl,
-            title: meta.title,
-            durationSec: meta.durationSec || 0,
-            thumbnailUrl: meta.thumbnailUrl,
-            requestedById: message.author.id,
-          };
-        } else {
-          const id = extractYouTubeId(finalUrl) || finalUrl;
-          const info = await ytdl.getInfo(id);
-          const title = info?.videoDetails?.title || finalUrl;
-          const dur = Number(info?.videoDetails?.lengthSeconds || 0) || 0;
-          const thumb =
-            (info?.videoDetails?.thumbnails || [])[0]?.url ||
-            deriveYouTubeThumb(finalUrl);
-          songData = {
-            url: finalUrl,
-            title,
-            durationSec: dur ? Math.floor(dur) : 0,
-            thumbnailUrl: thumb,
-            requestedById: message.author.id,
-            ytdlInfo: info,
-          };
-        }
-      } else {
-        const meta = await fetchMetadata(finalUrl);
-        songData = {
-          url: finalUrl,
-          title: meta.title,
-          durationSec: meta.durationSec || 0,
-          thumbnailUrl: meta.thumbnailUrl,
-          requestedById: message.author.id,
-        };
-      }
-      await connectP;
-      if (!tryEnqueue(q, songData)) {
-        const queueText = formatQueueMessage(q);
-        const sent = await message.reply(`⚠️ La cola está llena (máx ${MAX_QUEUE_LENGTH}).\n\nCola actual:\n${queueText}`);
-        await ensurePanel(message.guild.id, sent.channel.id);
-        await renderNowPlaying(message.guild.id).catch(() => {});
-        return;
-      }
-      let header;
-      if (q.songs.length === 1) {
-        await playNext(message.guild.id);
-        header = `🎶 Reproduciendo: ${songData.title}${
-          songData.durationSec
-            ? ` [${formatDuration(songData.durationSec)}]`
-            : ""
-        }`;
-      } else {
-        header = `➕ Añadido a la cola: ${songData.title}${
-          songData.durationSec
-            ? ` [${formatDuration(songData.durationSec)}]`
-            : ""
-        } (pos. ${q.songs.length})`;
-      }
-      const queueText = formatQueueMessage(q);
-      const sent = await message.reply(
-        `${header}\n\nCola actual:\n${queueText}`
-      );
-      // Mantener un único panel por servidor (no usar el reply como panel)
-      await ensurePanel(message.guild.id, sent.channel.id);
-      await renderNowPlaying(message.guild.id).catch(() => {});
-    } catch (err) {
-      console.error("[play:error]", err);
-      message.reply("⚠️ No se pudo reproducir el audio.");
-    }
-  }
-
-  // !skip
-  if (message.content === "!skip") {
-    const q = queues.get(message.guild.id);
-    if (!q || q.songs.length === 0)
-      return message.reply("No hay nada en reproducción.");
-    // Saltar ignorando loop
-    q.loop = false;
-    q.songs.shift();
-    if (q.songs.length > 0) {
-      await playNext(message.guild.id);
-    } else {
-      const connection = getVoiceConnection(message.guild.id);
-      connection?.destroy();
-      queues.delete(message.guild.id);
-      clearNowPlaying(message.guild.id).catch(() => {});
-    }
-    const queueText = formatQueueMessage(q);
-    return message.reply(`⏭️ Saltado.\n\nCola actual:\n${queueText}`);
-  }
-
-  // !pause
-  if (message.content === "!pause") {
-    const q = queues.get(message.guild.id);
-    if (!q) return message.reply("No hay nada en reproducción.");
-    q.player.pause();
-    try {
-      stopNowPlayingTicker(message.guild.id);
-    } catch {}
-    const queueText = formatQueueMessage(q);
-    const r = await message.reply(`⏸️ Pausado.\n\nCola actual:\n${queueText}`);
-    renderNowPlaying(message.guild.id).catch(() => {});
-    return r;
-  }
-
-  // !remove <index>
-  if (message.content.startsWith("!remove")) {
-    const arg = message.content.split(/\s+/)[1];
-    const idx = parseInt(arg, 10);
-    const q = queues.get(message.guild.id);
-    if (!q || q.songs.length === 0) return message.reply("La cola está vacía.");
-    if (!idx || idx < 1 || idx > q.songs.length) return message.reply(`Índice inválido. Rango: 1-${q.songs.length}.`);
-    if (idx === 1) {
-      q.loop = false;
-      q.songs.shift();
-      if (q.songs.length > 0) {
-        await playNext(message.guild.id);
-      } else {
-        const connection = getVoiceConnection(message.guild.id);
-        connection?.destroy();
-        queues.delete(message.guild.id);
-        clearNowPlaying(message.guild.id).catch(() => {});
-      }
-    } else {
-      q.songs.splice(idx - 1, 1);
-    }
-    const queueText = formatQueueMessage(q);
-    await renderNowPlaying(message.guild.id).catch(() => {});
-    return message.reply(`🗑️ Eliminado el elemento ${idx}.\n\nCola actual:\n${queueText}`);
-  }
-
-  // !clear
-  if (message.content === "!clear") {
-    const q = queues.get(message.guild.id);
-    if (!q || q.songs.length === 0) return message.reply("La cola está vacía.");
-    if (q.songs.length > 1) q.songs = [q.songs[0]]; // mantener la actual
-    const queueText = formatQueueMessage(q);
-    await renderNowPlaying(message.guild.id).catch(() => {});
-    return message.reply(`🧹 Cola limpiada (se mantiene la canción actual).\n\nCola actual:\n${queueText}`);
-  }
-
-  // !resume
-  if (message.content === "!resume") {
-    const q = queues.get(message.guild.id);
-    if (!q) return message.reply("No hay nada en reproducción.");
-    q.player.unpause();
-    try {
-      startNowPlayingTicker(message.guild.id);
-    } catch {}
-    const queueText = formatQueueMessage(q);
-    const r = await message.reply(
-      `▶️ Reanudado.\n\nCola actual:\n${queueText}`
-    );
-    renderNowPlaying(message.guild.id).catch(() => {});
-    return r;
-  }
-  if (message.content === "!queue") {
-    const q = queues.get(message.guild.id);
-    if (!q || q.songs.length === 0) return message.reply("La cola está vacía.");
-    const elapsed = Math.floor(
-      (q.player.state?.resource?.playbackDuration || 0) / 1000
-    );
-    const lines = q.songs.slice(0, 10).map((s, i) => {
-      const dur = s.durationSec ? ` [${formatDuration(s.durationSec)}]` : "";
-      if (i === 0) {
-        const left = s.durationSec
-          ? ` (${formatDuration(elapsed)} / ${formatDuration(s.durationSec)})`
-          : "";
-        return `▶️ ${s.title}${dur}${left}`;
-      }
-      return `${i + 1}. ${s.title}${dur}`;
-    });
-    return message.reply(lines.join("\n"));
-  }
-
-  // !nowplaying | !np
-  if (message.content === "!nowplaying" || message.content === "!np") {
-    const q = queues.get(message.guild.id);
-    if (!q || q.songs.length === 0)
-      return message.reply("No hay nada en reproducción.");
-    const s = q.songs[0];
-    const elapsed = Math.floor(
-      (q.player.state?.resource?.playbackDuration || 0) / 1000
-    );
-    const total = s.durationSec || 0;
-    const header = total
-      ? `🎶 Ahora: ${s.title} [${formatDuration(elapsed)} / ${formatDuration(
-          total
-        )}] • Vol: ${Math.round((q.volume ?? 1) * 100)}%`
-      : `🎶 Ahora: ${s.title} • Vol: ${Math.round((q.volume ?? 1) * 100)}%`;
-    const bar = total ? `\n${buildProgressBar(total, elapsed)}` : "";
-    return message.reply(header + bar);
-  }
-
-  // !stop
-  if (message.content === "!stop") {
-    const q = queues.get(message.guild.id);
-    const connection = getVoiceConnection(message.guild.id);
-    const queueText = q ? formatQueueMessage(q) : "La cola está vacía.";
-    if (q) q.songs = [];
-    connection?.destroy();
-    queues.delete(message.guild.id);
-    const r = await message.reply(
-      `⏹️ Música detenida y bot desconectado.\n\nCola final:\n${queueText}`
-    );
-    clearNowPlaying(message.guild.id).catch(() => {});
-    try {
-      stopNowPlayingTicker(message.guild.id);
-    } catch {}
-    return r;
-  }
-
-  // !volume <0-200>
-  if (message.content.startsWith("!volume")) {
-    const arg = message.content.split(/\s+/)[1];
-    if (!arg || isNaN(parseInt(arg)))
-      return message.reply("📌 Usá: `!volume <0-200>`. Ej: `!volume 100`");
-    const pct = Math.max(0, Math.min(200, parseInt(arg)));
-    const q = getQueue(message.guild.id);
-    q.volume = pct / 100;
-    guildVolumes[message.guild.id] = q.volume;
-    saveVolumes(guildVolumes);
-    const res = q.player.state?.resource;
-    if (res?.volume?.setVolumeLogarithmic)
-      res.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, q.volume)));
-    const r = await message.reply(`🔊 Volumen: ${pct}%`);
-    renderNowPlaying(message.guild.id).catch(() => {});
-    return r;
-  }
-});
+// (Eliminado) Handler de mensajes con prefijo "!" para dejar el bot sólo con Slash Commands
 
 // ======================
 // Interacciones de Slash Commands
@@ -2364,23 +1882,17 @@ client.on("messageCreate", async (message) => {
 client.on("interactionCreate", async (interaction) => {
   // Botones de control
   if (interaction.isButton()) {
-    const { guild, user } = interaction;
+  const { guild, member } = interaction;
     const q = guild ? queues.get(guild.id) : null;
     if (!q) {
       try {
-        await interaction.reply({
-          content: "No hay nada en reproducción.",
-          ephemeral: true,
-        });
+  await interaction.reply({ content: "No hay nada en reproducción.", flags: 1 << 6 });
       } catch {}
       return;
     }
-    if (!sameVoiceChannelRequiredPass(guild, user)) {
+  if (!sameVoiceChannelRequiredPass(guild, member)) {
       try {
-        await interaction.reply({
-          content: "❌ Debés estar en el mismo canal de voz que el bot para usar los controles.",
-          ephemeral: true,
-        });
+  await interaction.reply({ content: "❌ Debés estar en el mismo canal de voz que el bot para usar los controles.", flags: 1 << 6 });
       } catch {}
       return;
     }
@@ -2461,7 +1973,7 @@ client.on("interactionCreate", async (interaction) => {
       // Responder efímero con la cola formateada
       const text = formatQueueMessage(q, 20);
       try {
-        await interaction.reply({ content: `📋 Cola actual:\n${text}` , ephemeral: true });
+  await interaction.reply({ content: `📋 Cola actual:\n${text}` , flags: 1 << 6 });
       } catch (e) {
         // Si ya fue respondida, intentar editReply
         try { await interaction.editReply({ content: `📋 Cola actual:\n${text}` }); } catch {}
@@ -2524,11 +2036,7 @@ client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   const { commandName, guild, member } = interaction;
   if (!guild) {
-    await safeRespond(
-      interaction,
-      "Este comando sólo funciona en servidores.",
-      { ephemeral: true }
-    );
+  await safeRespond(interaction, { content: "Este comando sólo funciona en servidores.", flags: 1 << 6 });
     return;
   }
 
@@ -2618,11 +2126,15 @@ client.on("interactionCreate", async (interaction) => {
         }
       } catch {}
 
-      const finalUrl = await resolvePlayableUrl(query);
+      // Exigir URL directa
+      const finalUrl = (() => {
+        try {
+          const u = new URL(query);
+          return u.href;
+        } catch { return null; }
+      })();
       if (!finalUrl)
-        return safeRespond(interaction, "❌ Link inválido o no soportado.", {
-          edit: true,
-        });
+        return safeRespond(interaction, "❌ URL inválida.", { edit: true });
 
       const voiceChannel = member.voice?.channel;
       if (!voiceChannel)
@@ -2936,9 +2448,7 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.deferred || interaction.replied) {
       await safeRespond(interaction, "⚠️ Ocurrió un error.", { edit: true });
     } else {
-      await safeRespond(interaction, "⚠️ Ocurrió un error.", {
-        ephemeral: true,
-      });
+  await safeRespond(interaction, { content: "⚠️ Ocurrió un error.", flags: 1 << 6 });
     }
   }
 });
