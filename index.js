@@ -1907,6 +1907,20 @@ async function renderNowPlaying(guildId) {
   return sent;
 }
 
+// Garantiza que exista un único panel por servidor; si no existe, lo crea en el canal dado
+async function ensurePanel(guildId, channelId) {
+  const q = getQueue(guildId);
+  // Si no hay canal configurado, usar el provisto
+  if (!q.textChannelId) q.textChannelId = channelId;
+  // Si no hay panel, crearlo en el canal indicado
+  if (!q.nowPlayingMessageId) {
+    q.textChannelId = channelId;
+    try {
+      await renderNowPlaying(guildId);
+    } catch {}
+  }
+}
+
 async function clearNowPlaying(guildId) {
   const q = queues.get(guildId);
   if (!q || !q.textChannelId || !q.nowPlayingMessageId) return;
@@ -1947,8 +1961,8 @@ client.on("messageCreate", async (message) => {
             "❌ No tengo permisos para unirme o hablar en ese canal."
           );
         }
-        const q = getQueue(message.guild.id);
-        q.textChannelId = message.channel.id;
+  const q = getQueue(message.guild.id);
+  if (!q.textChannelId) q.textChannelId = message.channel.id;
         await ensureConnection(message.guild, voiceChannel);
         const pl = await playdl.playlist_info(candidate, { incomplete: true });
         await pl.fetch();
@@ -1984,9 +1998,9 @@ client.on("messageCreate", async (message) => {
             pl.title || ""
           }" (máx ${MAX_PLAYLIST_ITEMS}).\n\nCola actual:\n${queueText}`
         );
-        q.textChannelId = sent.channel.id;
-        q.nowPlayingMessageId = sent.id;
-        renderNowPlaying(message.guild.id).catch(() => {});
+        // Asegurar/actualizar panel sin sobreescribir con el reply
+        await ensurePanel(message.guild.id, sent.channel.id);
+        await renderNowPlaying(message.guild.id).catch(() => {});
         return sent;
       }
     } catch {}
@@ -2008,8 +2022,8 @@ client.on("messageCreate", async (message) => {
     }
 
     try {
-      const q = getQueue(message.guild.id);
-      q.textChannelId = message.channel.id;
+  const q = getQueue(message.guild.id);
+  if (!q.textChannelId) q.textChannelId = message.channel.id;
       // Paralelizar conexión con fetch de info/metadata
       const connectP = ensureConnection(message.guild, voiceChannel);
       const ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
@@ -2072,11 +2086,9 @@ client.on("messageCreate", async (message) => {
       const sent = await message.reply(
         `${header}\n\nCola actual:\n${queueText}`
       );
-      // usar el reply como panel
-      q.textChannelId = sent.channel.id;
-      q.nowPlayingMessageId = sent.id;
-      // refrescar panel (edita el reply y agrega botones/embed)
-      renderNowPlaying(message.guild.id).catch(() => {});
+      // Mantener un único panel por servidor (no usar el reply como panel)
+      await ensurePanel(message.guild.id, sent.channel.id);
+      await renderNowPlaying(message.guild.id).catch(() => {});
     } catch (err) {
       console.error("[play:error]", err);
       message.reply("⚠️ No se pudo reproducir el audio.");
@@ -2132,8 +2144,6 @@ client.on("messageCreate", async (message) => {
     renderNowPlaying(message.guild.id).catch(() => {});
     return r;
   }
-
-  // !queue
   if (message.content === "!queue") {
     const q = queues.get(message.guild.id);
     if (!q || q.songs.length === 0) return message.reply("La cola está vacía.");
@@ -2402,7 +2412,7 @@ client.on("interactionCreate", async (interaction) => {
             );
           }
           const q = getQueue(guild.id);
-          q.textChannelId = interaction.channelId;
+          if (!q.textChannelId) q.textChannelId = interaction.channelId;
           try {
             await ensureConnection(guild, voiceChannel);
           } catch (e) {
@@ -2450,15 +2460,9 @@ client.on("interactionCreate", async (interaction) => {
             }" (máx ${MAX_PLAYLIST_ITEMS}).\n\nCola actual:\n${queueText}`,
             { edit: true }
           );
-          try {
-            if (resp && resp.id) {
-              q.textChannelId = resp.channel?.id || interaction.channelId;
-              q.nowPlayingMessageId = resp.id;
-            }
-          } catch {}
-          try {
-            await renderNowPlaying(guild.id);
-          } catch {}
+          // Asegurar un único panel
+          await ensurePanel(guild.id, interaction.channelId);
+          await renderNowPlaying(guild.id).catch(() => {});
           return resp;
         }
       } catch {}
@@ -2488,8 +2492,8 @@ client.on("interactionCreate", async (interaction) => {
         );
       }
 
-      const q = getQueue(guild.id);
-      q.textChannelId = interaction.channelId;
+  const q = getQueue(guild.id);
+  if (!q.textChannelId) q.textChannelId = interaction.channelId;
       // Paralelizar conexión con fetch de info/metadata
       const connectP = ensureConnection(guild, voiceChannel).catch((e) => e);
       const ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
@@ -2567,21 +2571,14 @@ client.on("interactionCreate", async (interaction) => {
         } (pos. ${q.songs.length})`;
       }
       const queueText = formatQueueMessage(q);
-      const r = await safeRespond(
+  const r = await safeRespond(
         interaction,
         `${header}\n\nCola actual:\n${queueText}`,
         { edit: true }
       );
-      // si es un mensaje (no ephemeral), guardarlo como panel
-      try {
-        if (r && r.id) {
-          q.textChannelId = r.channel?.id || interaction.channelId;
-          q.nowPlayingMessageId = r.id;
-        }
-      } catch {}
-      try {
-        await renderNowPlaying(guild.id);
-      } catch {}
+  // Mantener un único panel por servidor
+  await ensurePanel(guild.id, interaction.channelId);
+  await renderNowPlaying(guild.id).catch(() => {});
       return r;
     }
 
