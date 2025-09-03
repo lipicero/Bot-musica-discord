@@ -1755,7 +1755,7 @@ function buildControlsComponents(q) {
     new ButtonBuilder()
       .setCustomId("music_skip")
   .setEmoji("⏭️")
-      .setLabel("Saltar")
+      .setLabel("Siguiente")
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(!hasSong),
     new ButtonBuilder()
@@ -1786,7 +1786,7 @@ function buildControlsComponents(q) {
     new ButtonBuilder()
       .setCustomId("music_shuffle")
       .setEmoji("🔀")
-      .setLabel("Barajar")
+      .setLabel("Aleatório")
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(!canShuffle),
     new ButtonBuilder()
