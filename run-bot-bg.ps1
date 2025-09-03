@@ -58,3 +58,22 @@ Set-Content -Path $pidFile -Value $ps.Id -Encoding ascii
 
 Write-Host "Bot iniciado en segundo plano. PID $($ps.Id)" -ForegroundColor Green
 Write-Host "Logs: $outLog (stdout), $errLog (stderr)"
+
+# Si se solicita, mostrar logs en vivo hasta que el usuario cierre
+if ($Log) {
+  Write-Host "\nMostrando logs en vivo (Ctrl+C para salir)..." -ForegroundColor Cyan
+  Write-Host "[OUT] -> $outLog" -ForegroundColor DarkGray
+  Write-Host "[ERR] -> $errLog" -ForegroundColor DarkGray
+  try {
+    $jobOut = Start-Job -ScriptBlock {
+      Get-Content -Path $using:outLog -Wait -Tail 20 | ForEach-Object { "[OUT] $_" }
+    }
+    $jobErr = Start-Job -ScriptBlock {
+      Get-Content -Path $using:errLog -Wait -Tail 20 | ForEach-Object { "[ERR] $_" }
+    }
+    Write-Host "(Cierra la ventana para dejar de ver logs)" -ForegroundColor DarkGray
+    Wait-Job -Any $jobOut,$jobErr | Out-Null
+  } catch {
+    Write-Host "No se pudo hacer tail de logs: $($_.Exception.Message)" -ForegroundColor Yellow
+  }
+}

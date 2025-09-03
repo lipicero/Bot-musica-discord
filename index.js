@@ -16,6 +16,11 @@ const MAX_PLAYLIST_ITEMS = Math.max(
   1,
   Math.min(100, Number(process.env.MAX_PLAYLIST_ITEMS || 25))
 );
+const MAX_QUEUE_LENGTH = Math.max(
+  1,
+  Math.min(500, Number(process.env.MAX_QUEUE_LENGTH || 200))
+);
+const REQUIRE_SAME_VC = String(process.env.REQUIRE_SAME_VC || "1") === "1";
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -149,6 +154,8 @@ const slashCommands = [
   { name: "resume", description: "Reanudar la reproducción", type: 1 },
   { name: "queue", description: "Mostrar la cola", type: 1 },
   { name: "stop", description: "Detener y salir del canal", type: 1 },
+  { name: "remove", description: "Remueve una canción de la cola por índice", type: 1, options: [ { name: "index", description: "Posición en la cola (1 = actual)", type: 4, required: true, min_value: 1 } ] },
+  { name: "clear", description: "Limpia la cola (mantiene la canción actual)", type: 1 },
   {
     name: "nowplaying",
     description: "Mostrar la canción en reproducción",
@@ -412,6 +419,27 @@ function getQueue(guildId) {
     queues.set(guildId, q);
   }
   return q;
+}
+
+function tryEnqueue(q, song) {
+  if (!q || !song) return false;
+  if ((q.songs?.length || 0) >= MAX_QUEUE_LENGTH) return false;
+  q.songs.push(song);
+  return true;
+}
+
+function sameVoiceChannelRequiredPass(guild, user) {
+  if (!REQUIRE_SAME_VC) return true;
+  try {
+    const meConn = getVoiceConnection(guild.id);
+    const botChannelId = meConn?.joinConfig?.channelId;
+    const member = guild.members.cache.get(user.id);
+    const userChannelId = member?.voice?.channelId;
+    if (!botChannelId || !userChannelId) return false;
+    return botChannelId === userChannelId;
+  } catch {
+    return false;
+  }
 }
 
 async function ensureConnection(guild, voiceChannel) {
@@ -931,6 +959,65 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   const ffmpegPath = process.env.FFMPEG_PATH || require("ffmpeg-static");
   if (!ffmpegPath) throw new Error("FFMPEG_REQUIRED");
 
+  // Opción: intentar obtener directamente un stream opus del origen (sin re-encode)
+  const preferDirectOpus = String(process.env.YT_DLP_DIRECT_OPUS || "0") === "1";
+  if (preferDirectOpus) {
+    try {
+      const f = "bestaudio[acodec=opus]"; // intentaremos obtener el mejor audio en opus (webm normalmente)
+      const cookieFile = ensureYtDlpCookiesFileFromEnv();
+      const commonArgs = ["--no-playlist", "-f", f, "-o", "-"];
+      if (headers?.userAgent) commonArgs.push("--user-agent", headers.userAgent);
+      if (headers?.acceptLang) commonArgs.push("--add-header", `Accept-Language: ${headers.acceptLang}`);
+      if (String(process.env.YT_FORCE_IPV4 || "0") === "1") commonArgs.push("--force-ipv4");
+      if (cookieFile) commonArgs.push("--cookies", cookieFile);
+
+      const yProc = binPath
+        ? spawn(binPath, [...commonArgs, url], { stdio: ["ignore", "pipe", "pipe"] })
+        : ytdlp.raw(url, {
+            noPlaylist: true,
+            f,
+            o: "-",
+            ...(headers?.userAgent ? { userAgent: headers.userAgent } : {}),
+            ...(headers?.acceptLang ? { addHeader: [`Accept-Language: ${headers.acceptLang}`] } : {}),
+            ...(cookieFile ? { cookies: cookieFile } : {}),
+            ...(String(process.env.YT_FORCE_IPV4 || "0") === "1" ? { forceIpv4: true } : {}),
+          });
+
+      if (DEBUG_AUDIO) {
+        yProc.stderr?.on("data", (d) => console.warn(`[yt-dlp] ${String(d).trim()}`));
+      }
+      // Entregamos directamente WebM Opus
+      const out = yProc.stdout;
+      const ignoreErr = (label) => (err) => {
+        if (!err) return;
+        const code = err?.code || "";
+        if (code === "EPIPE" || code === "ECONNRESET") {
+          if (DEBUG_AUDIO) console.warn(`[${label}] ${code} (ignorada)`);
+          return;
+        }
+        console.warn(`[${label}]`, err?.message || err);
+      };
+      yProc.on?.("error", ignoreErr("yt-dlp:proc"));
+      yProc.stdout?.on("error", ignoreErr("yt-dlp:stdout"));
+      yProc.stdin?.on?.("error", ignoreErr("yt-dlp:stdin"));
+
+      const cleanup = () => {
+        try { yProc.kill?.("SIGKILL"); } catch {}
+      };
+      out.on("close", cleanup);
+      out.on("end", cleanup);
+      out.on("error", ignoreErr("yt-dlp:out"));
+
+      const resource = createAudioResource(out, { inputType: StreamType.WebmOpus, inlineVolume: true });
+      if (resource.volume)
+        resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, volume)));
+      return resource;
+    } catch (e) {
+      if (DEBUG_AUDIO) console.warn("[yt-dlp] direct opus falló, reintento con ffmpeg:", e?.message || e);
+      // caemos al camino de ffmpeg más abajo
+    }
+  }
+
   // Preparar encabezados y cookie para yt-dlp (no para ffmpeg)
   const args = ["--no-playlist", "-f", "bestaudio/best", "-o", "-"];
   // Opcionales para mitigar captcha en YouTube
@@ -1001,6 +1088,7 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
       });
 
   // ffmpeg para transcodificar a ogg/opus por pipe
+  const opusTargetKbps = Math.max(64, Math.min(256, Number(process.env.OPUS_BITRATE || 160)));
   const ffArgs = [
     "-hide_banner",
     "-loglevel",
@@ -1018,11 +1106,17 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
     "-c:a",
     "libopus",
     "-b:a",
-    "160k",
+    `${opusTargetKbps}k`,
+    // Mejorar calidad: VBR activado y nivel de compresión alto
+    "-vbr",
+    "on",
+    "-compression_level",
+    "10",
     "-application",
     "audio",
+    // 20ms es estándar; 60ms ahorra ancho de banda pero no mejora calidad
     "-frame_duration",
-    "60",
+    "20",
     "-f",
     "ogg",
     "pipe:1",
@@ -1786,7 +1880,7 @@ function buildControlsComponents(q) {
     new ButtonBuilder()
       .setCustomId("music_shuffle")
       .setEmoji("🔀")
-      .setLabel("Aleatório")
+  .setLabel("Aleatorio")
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(!canShuffle),
     new ButtonBuilder()
@@ -1852,7 +1946,7 @@ function buildNowPlayingEmbed(q, guild) {
     .setFooter({
       text: `Controles debajo · Volumen: ${Math.round(
         (q.volume ?? 1) * 100
-      )}% · Loop: ${q.loop ? "ON" : "OFF"}`,
+      )}% · Repetir: ${q.loop ? "ON" : "OFF"}`,
     });
   if (total) {
     embed.setDescription(buildProgressBar(total, elapsed));
@@ -1969,6 +2063,7 @@ client.on("messageCreate", async (message) => {
         const items = (pl.videos || []).slice(0, MAX_PLAYLIST_ITEMS);
         if (items.length === 0)
           return message.reply("❌ No pude leer la playlist.");
+        let added = 0;
         for (const vid of items) {
           const url =
             vid.url ||
@@ -1978,6 +2073,7 @@ client.on("messageCreate", async (message) => {
           const title = vid.title || vid.name || url;
           const dur =
             Number(vid.durationInSec || vid.durationInMs / 1000 || 0) || 0;
+          if ((q.songs?.length || 0) >= MAX_QUEUE_LENGTH) break;
           q.songs.push({
             url: canonicalizeYouTubeUrl(url),
             title,
@@ -1985,6 +2081,7 @@ client.on("messageCreate", async (message) => {
             thumbnailUrl: deriveYouTubeThumb(url),
             requestedById: message.author.id,
           });
+          added++;
         }
         if (
           q.songs.length > 0 &&
@@ -1994,9 +2091,9 @@ client.on("messageCreate", async (message) => {
         }
         const queueText = formatQueueMessage(q);
         const sent = await message.reply(
-          `📚 Añadidos ${items.length} temas de la playlist "${
+          `📚 Añadidos ${added} temas de la playlist "${
             pl.title || ""
-          }" (máx ${MAX_PLAYLIST_ITEMS}).\n\nCola actual:\n${queueText}`
+          }" (máx ${MAX_PLAYLIST_ITEMS}${added < items.length ? `, truncado por límite de cola (${MAX_QUEUE_LENGTH})` : ""}).\n\nCola actual:\n${queueText}`
         );
         // Asegurar/actualizar panel sin sobreescribir con el reply
         await ensurePanel(message.guild.id, sent.channel.id);
@@ -2066,7 +2163,13 @@ client.on("messageCreate", async (message) => {
         };
       }
       await connectP;
-      q.songs.push(songData);
+      if (!tryEnqueue(q, songData)) {
+        const queueText = formatQueueMessage(q);
+        const sent = await message.reply(`⚠️ La cola está llena (máx ${MAX_QUEUE_LENGTH}).\n\nCola actual:\n${queueText}`);
+        await ensurePanel(message.guild.id, sent.channel.id);
+        await renderNowPlaying(message.guild.id).catch(() => {});
+        return;
+      }
       let header;
       if (q.songs.length === 1) {
         await playNext(message.guild.id);
@@ -2127,6 +2230,42 @@ client.on("messageCreate", async (message) => {
     const r = await message.reply(`⏸️ Pausado.\n\nCola actual:\n${queueText}`);
     renderNowPlaying(message.guild.id).catch(() => {});
     return r;
+  }
+
+  // !remove <index>
+  if (message.content.startsWith("!remove")) {
+    const arg = message.content.split(/\s+/)[1];
+    const idx = parseInt(arg, 10);
+    const q = queues.get(message.guild.id);
+    if (!q || q.songs.length === 0) return message.reply("La cola está vacía.");
+    if (!idx || idx < 1 || idx > q.songs.length) return message.reply(`Índice inválido. Rango: 1-${q.songs.length}.`);
+    if (idx === 1) {
+      q.loop = false;
+      q.songs.shift();
+      if (q.songs.length > 0) {
+        await playNext(message.guild.id);
+      } else {
+        const connection = getVoiceConnection(message.guild.id);
+        connection?.destroy();
+        queues.delete(message.guild.id);
+        clearNowPlaying(message.guild.id).catch(() => {});
+      }
+    } else {
+      q.songs.splice(idx - 1, 1);
+    }
+    const queueText = formatQueueMessage(q);
+    await renderNowPlaying(message.guild.id).catch(() => {});
+    return message.reply(`🗑️ Eliminado el elemento ${idx}.\n\nCola actual:\n${queueText}`);
+  }
+
+  // !clear
+  if (message.content === "!clear") {
+    const q = queues.get(message.guild.id);
+    if (!q || q.songs.length === 0) return message.reply("La cola está vacía.");
+    if (q.songs.length > 1) q.songs = [q.songs[0]]; // mantener la actual
+    const queueText = formatQueueMessage(q);
+    await renderNowPlaying(message.guild.id).catch(() => {});
+    return message.reply(`🧹 Cola limpiada (se mantiene la canción actual).\n\nCola actual:\n${queueText}`);
   }
 
   // !resume
@@ -2231,6 +2370,15 @@ client.on("interactionCreate", async (interaction) => {
       try {
         await interaction.reply({
           content: "No hay nada en reproducción.",
+          ephemeral: true,
+        });
+      } catch {}
+      return;
+    }
+    if (!sameVoiceChannelRequiredPass(guild, user)) {
+      try {
+        await interaction.reply({
+          content: "❌ Debés estar en el mismo canal de voz que el bot para usar los controles.",
           ephemeral: true,
         });
       } catch {}
@@ -2429,6 +2577,7 @@ client.on("interactionCreate", async (interaction) => {
             return safeRespond(interaction, "❌ No pude leer la playlist.", {
               edit: true,
             });
+          let added = 0;
           for (const vid of items) {
             const url =
               vid.url ||
@@ -2438,6 +2587,7 @@ client.on("interactionCreate", async (interaction) => {
             const title = vid.title || vid.name || url;
             const dur =
               Number(vid.durationInSec || vid.durationInMs / 1000 || 0) || 0;
+            if ((q.songs?.length || 0) >= MAX_QUEUE_LENGTH) break;
             q.songs.push({
               url: canonicalizeYouTubeUrl(url),
               title,
@@ -2445,6 +2595,7 @@ client.on("interactionCreate", async (interaction) => {
               thumbnailUrl: deriveYouTubeThumb(url),
               requestedById: member?.user?.id,
             });
+            added++;
           }
           if (
             q.songs.length > 0 &&
@@ -2455,9 +2606,9 @@ client.on("interactionCreate", async (interaction) => {
           const queueText = formatQueueMessage(q);
           const resp = await safeRespond(
             interaction,
-            `📚 Añadidos ${items.length} temas de la playlist "${
+            `📚 Añadidos ${added} temas de la playlist "${
               pl.title || ""
-            }" (máx ${MAX_PLAYLIST_ITEMS}).\n\nCola actual:\n${queueText}`,
+            }" (máx ${MAX_PLAYLIST_ITEMS}${added < items.length ? `, truncado por límite de cola (${MAX_QUEUE_LENGTH})` : ""}).\n\nCola actual:\n${queueText}`,
             { edit: true }
           );
           // Asegurar un único panel
@@ -2554,7 +2705,17 @@ client.on("interactionCreate", async (interaction) => {
           { edit: true }
         );
       }
-      q.songs.push(songData);
+      if (!tryEnqueue(q, songData)) {
+        const queueText = formatQueueMessage(q);
+        const r = await safeRespond(
+          interaction,
+          `⚠️ La cola está llena (máx ${MAX_QUEUE_LENGTH}).\n\nCola actual:\n${queueText}`,
+          { edit: true }
+        );
+        await ensurePanel(guild.id, interaction.channelId);
+        await renderNowPlaying(guild.id).catch(() => {});
+        return r;
+      }
       let header;
       if (q.songs.length === 1) {
         await playNext(guild.id);
@@ -2676,6 +2837,45 @@ client.on("interactionCreate", async (interaction) => {
       return safeRespond(interaction, lines.join("\n"), { edit: true });
     }
 
+    if (commandName === "remove") {
+      const ok = await safeDefer(interaction);
+      if (!ok) return;
+      const q = queues.get(guild.id);
+      if (!q || q.songs.length === 0)
+        return safeRespond(interaction, "La cola está vacía.", { edit: true });
+      const idx = interaction.options.getInteger("index", true);
+      if (idx < 1 || idx > q.songs.length)
+        return safeRespond(interaction, `Índice inválido. Rango: 1-${q.songs.length}.`, { edit: true });
+      if (idx === 1) {
+        q.loop = false;
+        q.songs.shift();
+        if (q.songs.length > 0) {
+          await playNext(guild.id);
+        } else {
+          const connection = getVoiceConnection(guild.id);
+          connection?.destroy();
+          queues.delete(guild.id);
+          await clearNowPlaying(guild.id).catch(() => {});
+        }
+      } else {
+        q.songs.splice(idx - 1, 1);
+      }
+      const queueText = formatQueueMessage(q);
+      await renderNowPlaying(guild.id).catch(() => {});
+      return safeRespond(interaction, `🗑️ Eliminado el elemento ${idx}.\n\nCola actual:\n${queueText}`, { edit: true });
+    }
+
+    if (commandName === "clear") {
+      const ok = await safeDefer(interaction);
+      if (!ok) return;
+      const q = queues.get(guild.id);
+      if (!q || q.songs.length === 0)
+        return safeRespond(interaction, "La cola está vacía.", { edit: true });
+      if (q.songs.length > 1) q.songs = [q.songs[0]]; // mantener la actual
+      const queueText = formatQueueMessage(q);
+      await renderNowPlaying(guild.id).catch(() => {});
+      return safeRespond(interaction, `🧹 Cola limpiada (se mantiene la canción actual).\n\nCola actual:\n${queueText}`, { edit: true });
+    }
     if (commandName === "nowplaying") {
       const ok = await safeDefer(interaction);
       if (!ok) return;
