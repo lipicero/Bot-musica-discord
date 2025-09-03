@@ -1227,6 +1227,45 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
     } catch {}
     return null;
   };
+  let switchedToAndroidNoCookies = false;
+  const trySwitchToAndroidNoCookies = () => {
+    if (switchedToAndroidNoCookies) return null;
+    switchedToAndroidNoCookies = true;
+    try {
+      if (binPath) {
+        // remover cookies si existen
+        let idxC = args.indexOf("--cookies");
+        if (idxC >= 0) {
+          args.splice(idxC, 2);
+        }
+        // setear cliente android
+        const idx = args.indexOf("--extractor-args");
+        if (idx >= 0) {
+          args[idx + 1] = "youtube:player_client=android";
+        } else {
+          args.push("--extractor-args", "youtube:player_client=android");
+        }
+        if (DEBUG_AUDIO) console.log("[yt-dlp] retry con player_client=android (sin cookies)");
+        return spawn(binPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+      } else if (ytdlp && ytdlp.raw) {
+        const opts = {
+          o: "-",
+          f: "bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio",
+          noPlaylist: true,
+          ...(headers?.userAgent ? { userAgent: headers.userAgent } : {}),
+          ...(headers?.acceptLang
+            ? { addHeader: [`Accept-Language: ${headers.acceptLang}`] }
+            : {}),
+          // sin cookies
+          extractorArgs: "youtube:player_client=android",
+          ...(forceIpv4 ? { forceIpv4: true } : {}),
+        };
+        if (DEBUG_AUDIO) console.log("[yt-dlp] retry (wrapper) con android sin cookies");
+        return ytdlp.raw(url, opts);
+      }
+    } catch {}
+    return null;
+  };
 
   // ffmpeg para transcodificar a ogg/opus por pipe (parametrizable)
   const targetBitrate = String(process.env.FFMPEG_OPUS_BITRATE || "128k");
@@ -1301,6 +1340,19 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
           }
           if (DEBUG_AUDIO) console.warn(`[yt-dlp] ${s2.trim()}`);
         });
+        yOut?.pipe(ff.stdin);
+        return;
+      }
+    }
+    // Reto de login/consent o bot challenge: intentar cliente android sin cookies
+    if (/Sign in to confirm/i.test(s) || /confirm you.?re not a bot/i.test(s) || /consent/i.test(s)) {
+      const alt = trySwitchToAndroidNoCookies();
+      if (alt) {
+        try { yOut?.unpipe?.(ff.stdin); } catch {}
+        yProc.stdout?.removeAllListeners?.();
+        yProc.stderr?.removeAllListeners?.();
+        yOut = alt.stdout;
+        alt.stderr?.on("data", (d4) => DEBUG_AUDIO && console.warn(`[yt-dlp] ${String(d4).trim()}`));
         yOut?.pipe(ff.stdin);
         return;
       }
