@@ -1717,7 +1717,7 @@ function startNowPlayingTicker(guildId) {
     // Solo refrescar cuando realmente está reproduciendo
     if (qq.player?.state?.status !== AudioPlayerStatus.Playing) return;
     renderNowPlaying(guildId).catch(() => {});
-  }, 3_000);
+  }, 1_000);
 }
 
 function stopNowPlayingTicker(guildId) {
