@@ -24,6 +24,14 @@ const MAX_QUEUE_LENGTH = Math.max(
 const DEFAULT_BASS_FREQ = Number(process.env.BASS_FREQ || 110); // Hz
 const DEFAULT_BASS_WIDTH = Number(process.env.BASS_WIDTH || 0.8); // ancho/slope
 const REQUIRE_SAME_VC = String(process.env.REQUIRE_SAME_VC || "1") === "1";
+// UI: fijar panel y respuestas efímeras por defecto
+const PIN_PANEL = String(process.env.PIN_PANEL || "1") === "1"; // fija el mensaje del panel si es posible
+const EPHEMERAL_SLASH = String(process.env.EPHEMERAL_SLASH || "1") === "1"; // hace respuestas de slash efímeras
+// Streaming: usar URL directa en ffmpeg (true) o pipe estable (false). Por defecto: false en Windows, true en otros.
+const FFMPEG_DIRECT_URL = (() => {
+  if (process.env.FFMPEG_DIRECT_URL != null) return String(process.env.FFMPEG_DIRECT_URL) === "1";
+  return process.platform !== "win32"; // Windows: usar pipe por defecto para evitar errores TLS (-138)
+})();
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
@@ -263,7 +271,8 @@ async function safeRespond(interaction, data, opts = {}) {
 async function safeDefer(interaction) {
   try {
     if (interaction.deferred || interaction.replied) return true;
-  await interaction.deferReply();
+  // Hacer que las respuestas de slash sean efímeras (no empujan el chat)
+  await interaction.deferReply({ ephemeral: EPHEMERAL_SLASH });
     return true;
   } catch {
     return false;
@@ -974,7 +983,9 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
     "warning",
     "-nostdin",
   ];
-  if (directUrl) {
+  // Política: en Windows evitamos input directo por estabilidad a menos que FFMPEG_DIRECT_URL=1
+  const useDirect = !!directUrl && (!!FFMPEG_DIRECT_URL);
+  if (useDirect) {
     // Cabeceras para acceso (User-Agent y Accept-Language). Evitar Cookie para reducir 400.
     const hdrs = [];
     if (headers?.userAgent) hdrs.push(`User-Agent: ${headers.userAgent}`);
@@ -982,6 +993,10 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
     if (hdrs.length) ffArgs.push("-headers", hdrs.join("\r\n") + "\r\n");
     // Reintentos para fuentes HTTP
     ffArgs.push("-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5");
+    // Timeouts y no persistencia para conexiones HTTP
+    ffArgs.push("-rw_timeout", "15000000"); // 15s en microsegundos
+    ffArgs.push("-http_persistent", "0");
+    ffArgs.push("-seekable", "1");
     // Seek antes de -i si corresponde
     if (startAtSec > 0) {
       ffArgs.push("-ss", String(startAtSec));
@@ -1031,20 +1046,34 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
     "ogg",
     "pipe:1",
   );
-  const ff = spawn(ffmpegPath, ffArgs, { stdio: [directUrl ? "ignore" : "pipe", "pipe", "pipe"] });
+  const ff = spawn(ffmpegPath, ffArgs, { stdio: [useDirect ? "ignore" : "pipe", "pipe", "pipe"] });
 
-  if (!directUrl) {
-    // Fallback estable: usar ytdl-core en lugar de yt-dlp -> stdout
+  if (!useDirect) {
+    // En modo yt-dlp, primero intentamos yt-dlp -> stdout -> ffmpeg (respeta cookies/IPv4)
+    let piped = false;
     try {
-      const id = extractYouTubeId(url) || url;
-      const info = await ytdl.getInfo(id, buildYtdlRequestOptions(id));
-      const fmt = selectWebmOpusFormat(info.formats) || ytdl.chooseFormat(info.formats, { quality: "highestaudio", filter: "audioonly" });
-      const yStream = ytdl.downloadFromInfo(info, {
-        format: fmt,
-        highWaterMark: 1 << 25,
-        ...buildYtdlRequestOptions(info?.videoDetails?.video_url || id),
-      });
-      yStream.pipe(ff.stdin);
+      const cookieFile2 = ensureYtDlpCookiesFileFromEnv();
+      const yArgs = ["--no-playlist", "-f", "bestaudio/best", "-o", "-"];
+      if (headers?.userAgent) yArgs.push("--user-agent", headers.userAgent);
+      if (headers?.acceptLang) yArgs.push("--add-header", `Accept-Language: ${headers.acceptLang}`);
+      if (String(process.env.YT_FORCE_IPV4 || "0") === "1") yArgs.push("--force-ipv4");
+      if (cookieFile2) yArgs.push("--cookies", cookieFile2);
+      yArgs.push(url);
+      const yProc = binPath
+        ? spawn(binPath, yArgs, { stdio: ["ignore", "pipe", "pipe"] })
+        : ytdlp.raw(url, {
+            noPlaylist: true,
+            f: "bestaudio/best",
+            o: "-",
+            ...(headers?.userAgent ? { userAgent: headers.userAgent } : {}),
+            ...(headers?.acceptLang ? { addHeader: [`Accept-Language: ${headers.acceptLang}`] } : {}),
+            ...(cookieFile2 ? { cookies: cookieFile2 } : {}),
+            ...(String(process.env.YT_FORCE_IPV4 || "0") === "1" ? { forceIpv4: true } : {}),
+          });
+      if (DEBUG_AUDIO) yProc.stderr?.on("data", (d) => console.warn(`[yt-dlp] ${String(d).trim()}`));
+      // Pipe a ffmpeg
+      yProc.stdout.pipe(ff.stdin);
+      piped = true;
       const ignoreErr = (label) => (err) => {
         if (!err) return;
         const code = err?.code || "";
@@ -1054,12 +1083,40 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
         }
         console.warn(`[${label}]`, err?.message || err);
       };
-      yStream.on("error", ignoreErr("ytdl:stream"));
+      yProc.on?.("error", ignoreErr("yt-dlp:proc"));
+      yProc.stdout?.on("error", ignoreErr("yt-dlp:stdout"));
+      yProc.stdin?.on?.("error", ignoreErr("yt-dlp:stdin"));
     } catch (e) {
-      // Si esto falla, cerrar ffmpeg y propagar error para que el caller haga otro fallback.
-      try { ff.stdin?.end?.(); } catch {}
-      try { ff.kill("SIGKILL"); } catch {}
-      throw e;
+      if (DEBUG_AUDIO) console.warn("[yt-dlp] pipe->ffmpeg falló, fallback ytdl-core:", e?.message || e);
+    }
+    if (!piped) {
+      // Fallback: ytdl-core -> ffmpeg
+      try {
+        const id = extractYouTubeId(url) || url;
+        const info = await ytdl.getInfo(id, buildYtdlRequestOptions(id));
+        const fmt = selectWebmOpusFormat(info.formats) || ytdl.chooseFormat(info.formats, { quality: "highestaudio", filter: "audioonly" });
+        const yStream = ytdl.downloadFromInfo(info, {
+          format: fmt,
+          highWaterMark: 1 << 25,
+          ...buildYtdlRequestOptions(info?.videoDetails?.video_url || id),
+        });
+        yStream.pipe(ff.stdin);
+        const ignoreErr = (label) => (err) => {
+          if (!err) return;
+          const code = err?.code || "";
+          if (code === "EPIPE" || code === "ECONNRESET") {
+            if (DEBUG_AUDIO) console.warn(`[${label}] ${code} (ignorada)`);
+            return;
+          }
+          console.warn(`[${label}]`, err?.message || err);
+        };
+        yStream.on("error", ignoreErr("ytdl:stream"));
+      } catch (e) {
+        // Si esto falla, cerrar ffmpeg y propagar error para que el caller haga otro fallback.
+        try { ff.stdin?.end?.(); } catch {}
+        try { ff.kill("SIGKILL"); } catch {}
+        throw e;
+      }
     }
   }
 
@@ -2061,6 +2118,16 @@ async function renderNowPlaying(guildId) {
       : { content: contentFallback, components }
   );
   q.nowPlayingMessageId = sent.id;
+  // Intentar fijar (pin) el mensaje del panel para que sea fácil de encontrar
+  if (PIN_PANEL) {
+    try {
+      const me = channel.guild?.members?.me;
+      const canPin = channel.permissionsFor?.(me)?.has(PermissionsBitField.Flags.ManageMessages);
+      if (canPin && !sent.pinned) {
+        await sent.pin().catch(() => {});
+      }
+    } catch {}
+  }
   return sent;
 }
 
