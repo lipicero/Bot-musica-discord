@@ -20,6 +20,9 @@ const MAX_QUEUE_LENGTH = Math.max(
   1,
   Math.min(500, Number(process.env.MAX_QUEUE_LENGTH || 200))
 );
+// Bass boost (por defecto desactivado). Puedes ajustar frecuencia/ancho por env
+const DEFAULT_BASS_FREQ = Number(process.env.BASS_FREQ || 110); // Hz
+const DEFAULT_BASS_WIDTH = Number(process.env.BASS_WIDTH || 0.8); // ancho/slope
 const REQUIRE_SAME_VC = String(process.env.REQUIRE_SAME_VC || "1") === "1";
 const fs = require("fs");
 const path = require("path");
@@ -63,27 +66,71 @@ const client = new Client({
 });
 
 // ======================
-// Persistencia de volumen por servidor
+// Persistencia unificada por servidor (state.json)
+// Estructura: { [guildId]: { volume: number (0..2), loop: boolean, bassGainDb: number } }
+// Migra desde volumes.json y bass.json si existen.
 // ======================
-function loadVolumes() {
+function loadState() {
+  const cwd = process.cwd();
+  const statePath = path.join(cwd, "state.json");
+  let state = {};
   try {
-    const p = path.join(process.cwd(), "volumes.json");
-    if (fs.existsSync(p)) {
-      const j = JSON.parse(fs.readFileSync(p, "utf8"));
-      return j && typeof j === "object" ? j : {};
+    if (fs.existsSync(statePath)) {
+      const j = JSON.parse(fs.readFileSync(statePath, "utf8"));
+      if (j && typeof j === "object") state = j;
     }
   } catch {}
-  return {};
-}
-function saveVolumes(obj) {
+  // Migrar desde archivos antiguos si faltan datos
   try {
-    const p = path.join(process.cwd(), "volumes.json");
+    const volPath = path.join(cwd, "volumes.json");
+    if (fs.existsSync(volPath)) {
+      const vols = JSON.parse(fs.readFileSync(volPath, "utf8")) || {};
+      for (const [gid, vol] of Object.entries(vols)) {
+        state[gid] = state[gid] || {};
+        if (typeof state[gid].volume !== "number") {
+          state[gid].volume = Math.max(0, Math.min(2, Number(vol) || 1));
+        }
+      }
+    }
+  } catch {}
+  try {
+    const bassPath = path.join(cwd, "bass.json");
+    if (fs.existsSync(bassPath)) {
+      const bass = JSON.parse(fs.readFileSync(bassPath, "utf8")) || {};
+      for (const [gid, g] of Object.entries(bass)) {
+        const val = Math.max(0, Math.min(24, Number(g) || 0));
+        state[gid] = state[gid] || {};
+        if (typeof state[gid].bassGainDb !== "number") {
+          state[gid].bassGainDb = val;
+        }
+      }
+    }
+  } catch {}
+  return state;
+}
+function saveState(obj) {
+  try {
+    const p = path.join(process.cwd(), "state.json");
     fs.writeFileSync(p, JSON.stringify(obj, null, 2), "utf8");
   } catch (e) {
-    console.warn("[volumes:save:error]", e?.message || e);
+    console.warn("[state:save:error]", e?.message || e);
   }
+  // Opcional: mantener archivos antiguos en sync por compatibilidad
+  try {
+    const vols = {};
+    const bass = {};
+    const shuffle = {};
+    for (const [gid, st] of Object.entries(obj || {})) {
+      if (typeof st.volume === "number") vols[gid] = st.volume;
+      if (typeof st.bassGainDb === "number") bass[gid] = st.bassGainDb;
+      if (typeof st.shuffleMode === "boolean") shuffle[gid] = st.shuffleMode;
+    }
+    fs.writeFileSync(path.join(process.cwd(), "volumes.json"), JSON.stringify(vols, null, 2), "utf8");
+    fs.writeFileSync(path.join(process.cwd(), "bass.json"), JSON.stringify(bass, null, 2), "utf8");
+    fs.writeFileSync(path.join(process.cwd(), "shuffle.json"), JSON.stringify(shuffle, null, 2), "utf8");
+  } catch {}
 }
-const guildVolumes = loadVolumes();
+const guildState = loadState();
 
 // ======================
 // Cola por servidor
@@ -95,6 +142,14 @@ function getQueue(guildId) {
   if (!q) {
     const player = createAudioPlayer({
       behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
+    });
+    // Limpiar bandera de reemplazo al entrar en Playing
+    player.on("stateChange", (oldState, newState) => {
+      const qq = queues.get(guildId);
+      if (!qq) return;
+      if (newState?.status === AudioPlayerStatus.Playing && qq.replacingResource) {
+        qq.replacingResource = false;
+      }
     });
     if (DEBUG_AUDIO) {
       player.on("stateChange", (oldState, newState) => {
@@ -112,6 +167,11 @@ function getQueue(guildId) {
       console.error("[player:error]", err?.message || err);
       const qq = queues.get(guildId);
       if (!qq || !qq.songs?.length) return;
+      if (qq.replacingResource) {
+        // Error durante un reemplazo: no avanzar cola
+        qq.replacingResource = false;
+        return;
+      }
       // Saltar la pista que falló
       qq.songs.shift();
       if (qq.songs.length > 0) {
@@ -126,13 +186,26 @@ function getQueue(guildId) {
     player.on(AudioPlayerStatus.Idle, () => {
       const qq = queues.get(guildId);
       if (!qq) return;
+      if (qq.replacingResource) {
+        // Idle disparado por un swap rápido: ignorar y limpiar flag
+        qq.replacingResource = false;
+        return;
+      }
       // Si está en loop, vuelve a reproducir sin avanzar
       if (qq.loop && qq.songs.length > 0) {
         playNext(guildId).catch((e) => console.error("[playNext:error]", e));
         return;
       }
-      // Avanzar cola
-      qq.songs.shift();
+      // Avanzar cola (aleatorio si shuffleMode ON)
+      if (qq.songs.length > 1 && qq.shuffleMode) {
+        const rest = qq.songs.slice(1);
+        const pick = Math.floor(Math.random() * rest.length);
+        const next = rest[pick];
+        const newRest = rest.filter((_, i) => i !== pick);
+        qq.songs = [next, ...newRest];
+      } else {
+        qq.songs.shift();
+      }
       if (qq.songs.length > 0) {
         playNext(guildId).catch((e) => console.error("[playNext:error]", e));
       } else {
@@ -143,23 +216,25 @@ function getQueue(guildId) {
         try { stopNowPlayingTicker(guildId); } catch {}
       }
     });
-    const initialVol = Math.max(
-      0,
-      Math.min(2, Number(guildVolumes[guildId] ?? 1.0))
-    );
+  const initialVol = Math.max(0, Math.min(2, Number(guildState[guildId]?.volume ?? 1.0)));
     q = {
       songs: [],
       player,
       connection: null,
       textChannelId: null,
       nowPlayingMessageId: null,
-      loop: false,
+  loop: Boolean(guildState[guildId]?.loop || false),
+  shuffleMode: Boolean(guildState[guildId]?.shuffleMode || false),
       volume: initialVol,
       uiInterval: null,
       currentRetry: 0,
       connectingPromise: null,
       upgradeTimer: null,
-      currentTrackToken: null,
+  currentTrackToken: null,
+  // Bass: ganancia en dB (0 = OFF)
+  bassGainDb: Math.max(0, Math.min(24, Number(guildState[guildId]?.bassGainDb ?? 0))),
+  // Flag interno para reemplazo de recurso sin avanzar cola
+  replacingResource: false,
     };
     queues.set(guildId, q);
   }
@@ -314,7 +389,14 @@ async function ensureConnection(guild, voiceChannel) {
 }
 
 async function createResourceFromUrl(url, volume = 1.0, options = {}) {
-  const { preferPlayDl = false } = options || {};
+  const {
+    preferPlayDl = false,
+    forceFfmpeg = false,
+    bassGainDb = 0,
+    bassFreq = DEFAULT_BASS_FREQ,
+    bassWidth = DEFAULT_BASS_WIDTH,
+  startAtSec = 0,
+  } = options || {};
   // Canonicalizar URL de YouTube para mayor compatibilidad
   url = canonicalizeYouTubeUrl(url);
   if (!url || typeof url !== "string" || !/^https?:\/\//i.test(url)) {
@@ -334,6 +416,21 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
       ...(ytCookie ? { cookie: ytCookie } : {}),
     },
   };
+  // Si necesitamos FFmpeg (por bass o forzado), priorizar ruta yt-dlp + ffmpeg
+  const needFfmpeg = forceFfmpeg || (Number(bassGainDb) || 0) > 0;
+  if (needFfmpeg) {
+    const hasBin = !!getYtDlpBinaryPath() || !!ytdlp;
+    if (hasBin) {
+      if (DEBUG_AUDIO) console.log(`[createResource] forzando ffmpeg (bass=${bassGainDb}dB)`);
+      return await createResourceFromYtDlp(
+        url,
+        volume,
+  { userAgent, acceptLang, cookie: ytCookie },
+  { bassGainDb, bassFreq, bassWidth, startAtSec }
+      );
+    }
+  }
+
   // Para YouTube
   if (isYouTubeUrl(url)) {
     // Resolver ID una sola vez para reutilizar en fallbacks
@@ -346,11 +443,15 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
       if (hasBin) {
         if (DEBUG_AUDIO)
           console.log(`[createResource] usando yt-dlp (forzado)`);
-        return await createResourceFromYtDlp(url, volume, {
-          userAgent,
-          acceptLang,
-          cookie: ytCookie,
-        });
+        return await createResourceFromYtDlp(
+          url,
+          volume,
+          {
+            userAgent,
+            acceptLang,
+            cookie: ytCookie,
+          }
+        );
       } else {
         if (DEBUG_AUDIO)
           console.warn(
@@ -466,11 +567,15 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
       // Intentar yt-dlp si está disponible o forzado
       try {
         if (ytdlp) {
-          const r = await createResourceFromYtDlp(url, volume, {
-            userAgent,
-            acceptLang,
-            cookie: ytCookie,
-          });
+          const r = await createResourceFromYtDlp(
+            url,
+            volume,
+            {
+              userAgent,
+              acceptLang,
+              cookie: ytCookie,
+            }
+          );
           return r;
         }
       } catch (eYtdlpA) {
@@ -649,7 +754,7 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
   throw err;
 }
 
-async function getDirectUrlFromYtDlp(targetUrl, headers = {}) {
+async function getDirectUrlFromYtDlp(targetUrl, headers = {}, opts = {}) {
   const binPath = getYtDlpBinaryPath();
   const addHeader = [];
   if (headers?.userAgent) addHeader.push(`User-Agent: ${headers.userAgent}`);
@@ -658,73 +763,81 @@ async function getDirectUrlFromYtDlp(targetUrl, headers = {}) {
   // No pasar cookies por header: yt-dlp depreca esto y además YouTube lo bloquea.
   // Usaremos archivo de cookies Netscape vía --cookies si está disponible.
   const cookieFile = ensureYtDlpCookiesFileFromEnv();
-  return await new Promise((resolve, reject) => {
-    if (binPath) {
-      const args = ["-g", "-f", "bestaudio/best", "--no-playlist"];
-      if (cookieFile) {
-        args.push("--cookies", cookieFile);
-      }
-      for (const h of addHeader) args.push("--add-header", h);
-      args.push(targetUrl);
-      const proc = spawn(binPath, args, { stdio: ["ignore", "pipe", "pipe"] });
-      let out = "";
-      let err = "";
-      proc.stdout.on("data", (d) => {
-        out += d.toString();
-      });
-      proc.stderr.on("data", (d) => {
-        err += d.toString();
-      });
-      proc.on("close", (code) => {
-        if (code === 0) {
-          const lines = out
-            .split(/\r?\n/)
-            .map((s) => s.trim())
-            .filter(Boolean);
-          if (lines.length) return resolve(lines[0]);
-          return reject(new Error("YTDLP_NO_URL"));
+  const formats = Array.isArray(opts.formats) && opts.formats.length
+    ? opts.formats
+    : [
+        "bestaudio[acodec=opus]/bestaudio/best",
+        "251",
+        "bestaudio/best",
+      ];
+  let lastErr = null;
+  for (const fmt of formats) {
+    try {
+      // Ejecutar -g por formato
+      const url = await new Promise((resolve, reject) => {
+        if (binPath) {
+          const args = ["-g", "-f", fmt, "--no-playlist"];
+          if (cookieFile) {
+            args.push("--cookies", cookieFile);
+          }
+          for (const h of addHeader) args.push("--add-header", h);
+          args.push(targetUrl);
+          const proc = spawn(binPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+          let out = "";
+          let err = "";
+          proc.stdout.on("data", (d) => { out += d.toString(); });
+          proc.stderr.on("data", (d) => { err += d.toString(); });
+          proc.on("close", (code) => {
+            if (code === 0) {
+              const lines = out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+              if (lines.length) return resolve(lines[0]);
+              return reject(new Error("YTDLP_NO_URL"));
+            }
+            if (DEBUG_AUDIO && err) console.warn(`[yt-dlp] ${err.trim()}`);
+            reject(new Error(`YTDLP_EXIT_${code}`));
+          });
+          proc.on("error", reject);
+        } else if (ytdlp && ytdlp.raw) {
+          const proc = ytdlp.raw(targetUrl, {
+            g: true,
+            format: fmt,
+            noPlaylist: true,
+            addHeader,
+            ...(cookieFile ? { cookies: cookieFile } : {}),
+          });
+          let out = "";
+          let err = "";
+          proc.stdout.on("data", (d) => { out += d.toString(); });
+          proc.stderr.on("data", (d) => { err += d.toString(); });
+          proc.on("close", (code) => {
+            if (code === 0) {
+              const lines = out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+              if (lines.length) return resolve(lines[0]);
+              return reject(new Error("YTDLP_NO_URL"));
+            }
+            if (DEBUG_AUDIO && err) console.warn(`[yt-dlp] ${err.trim()}`);
+            reject(new Error(`YTDLP_EXIT_${code}`));
+          });
+          proc.on("error", reject);
+        } else {
+          reject(new Error("YTDLP_NOT_AVAILABLE"));
         }
-        if (DEBUG_AUDIO && err) console.warn(`[yt-dlp] ${err.trim()}`);
-        reject(new Error(`YTDLP_EXIT_${code}`));
       });
-      proc.on("error", reject);
-  } else if (ytdlp && ytdlp.raw) {
-      const proc = ytdlp.raw(targetUrl, {
-        g: true,
-        format: "bestaudio/best",
-        noPlaylist: true,
-    addHeader,
-    // Si existe archivo de cookies, pasarlo también aquí
-    ...(cookieFile ? { cookies: cookieFile } : {}),
-      });
-      let out = "";
-      let err = "";
-      proc.stdout.on("data", (d) => {
-        out += d.toString();
-      });
-      proc.stderr.on("data", (d) => {
-        err += d.toString();
-      });
-      proc.on("close", (code) => {
-        if (code === 0) {
-          const lines = out
-            .split(/\r?\n/)
-            .map((s) => s.trim())
-            .filter(Boolean);
-          if (lines.length) return resolve(lines[0]);
-          return reject(new Error("YTDLP_NO_URL"));
-        }
-        if (DEBUG_AUDIO && err) console.warn(`[yt-dlp] ${err.trim()}`);
-        reject(new Error(`YTDLP_EXIT_${code}`));
-      });
-      proc.on("error", reject);
-    } else {
-      reject(new Error("YTDLP_NOT_AVAILABLE"));
+      if (url) return url;
+    } catch (e) {
+      lastErr = e;
     }
-  });
+  }
+  throw lastErr || new Error("YTDLP_NO_URL");
 }
 
 async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
+  // transcodeOptions opcional en headers._transcodeOptions para compatibilidad
+  let transcodeOptions = headers && headers._transcodeOptions ? headers._transcodeOptions : undefined;
+  if (!transcodeOptions && arguments.length >= 4) {
+    // Soportar firma extendida createResourceFromYtDlp(url, volume, headers, transcodeOptions)
+    transcodeOptions = arguments[3];
+  }
   if (DEBUG_AUDIO) console.log(`[yt-dlp] invocando yt-dlp para ${url}`);
   const binPath = getYtDlpBinaryPath();
   if (!binPath && !(ytdlp && ytdlp.raw)) throw new Error("YTDLP_NOT_AVAILABLE");
@@ -733,8 +846,12 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   if (!ffmpegPath) throw new Error("FFMPEG_REQUIRED");
 
   // Opción: intentar obtener directamente un stream opus del origen (sin re-encode)
-  const preferDirectOpus = String(process.env.YT_DLP_DIRECT_OPUS || "0") === "1";
-  if (preferDirectOpus) {
+  const preferDirectOpus = (process.platform !== "win32") && String(process.env.YT_DLP_DIRECT_OPUS || "0") === "1";
+  const bassGainDb = Number(transcodeOptions?.bassGainDb || 0) || 0;
+  const bassFreq = Number(transcodeOptions?.bassFreq || DEFAULT_BASS_FREQ);
+  const bassWidth = Number(transcodeOptions?.bassWidth || DEFAULT_BASS_WIDTH);
+  const startAtSec = Math.max(0, Number(transcodeOptions?.startAtSec || 0) || 0);
+  if (preferDirectOpus && bassGainDb <= 0) {
     try {
       const f = "bestaudio[acodec=opus]"; // intentaremos obtener el mejor audio en opus (webm normalmente)
       const cookieFile = ensureYtDlpCookiesFileFromEnv();
@@ -837,41 +954,61 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   }
   args.push(url);
 
-  // Lanzar yt-dlp (binario o wrapper)
-  const yProc = binPath
-    ? spawn(binPath, args, { stdio: ["ignore", "pipe", "pipe"] })
-    : ytdlp.raw(args[args.length - 1], {
-        o: "-",
-        f: "bestaudio/best",
-        noPlaylist: true,
-        ...(headers?.userAgent ? { userAgent: headers.userAgent } : {}),
-        ...(headers?.acceptLang
-          ? { addHeader: [`Accept-Language: ${headers.acceptLang}`] }
-          : {}),
-        ...(cookieFile ? { cookies: cookieFile } : {}),
-        ...(() => {
-          if (extractorArgsEnv) return { extractorArgs: extractorArgsEnv };
-          const clientForWrapper = (() => {
-            if (!effectiveClient) return null;
-            return `youtube:player_client=${effectiveClient}`;
-          })();
-          return clientForWrapper ? { extractorArgs: clientForWrapper } : {};
-        })(),
-        ...(forceIpv4 ? { forceIpv4: true } : {}),
-      });
+  // Preferir: obtener URL directa y alimentar FFmpeg (más estable en Windows)
+  let directUrl = null;
+  try {
+    directUrl = await getDirectUrlFromYtDlp(url, headers, { formats: [
+      "bestaudio[acodec=opus]/bestaudio/best",
+      "251",
+      "bestaudio/best",
+    ]});
+  } catch (e) {
+    if (DEBUG_AUDIO) console.warn("[yt-dlp] no se obtuvo URL directa:", e?.message || e);
+  }
 
-  // ffmpeg para transcodificar a ogg/opus por pipe
+  // ffmpeg para transcodificar a ogg/opus (desde URL directa o pipe como fallback)
   const opusTargetKbps = Math.max(64, Math.min(256, Number(process.env.OPUS_BITRATE || 160)));
   const ffArgs = [
     "-hide_banner",
     "-loglevel",
     "warning",
     "-nostdin",
-    "-i",
-    "pipe:0",
+  ];
+  if (directUrl) {
+    // Cabeceras para acceso (User-Agent y Accept-Language). Evitar Cookie para reducir 400.
+    const hdrs = [];
+    if (headers?.userAgent) hdrs.push(`User-Agent: ${headers.userAgent}`);
+    if (headers?.acceptLang) hdrs.push(`Accept-Language: ${headers.acceptLang}`);
+    if (hdrs.length) ffArgs.push("-headers", hdrs.join("\r\n") + "\r\n");
+    // Reintentos para fuentes HTTP
+    ffArgs.push("-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5");
+    // Seek antes de -i si corresponde
+    if (startAtSec > 0) {
+      ffArgs.push("-ss", String(startAtSec));
+    }
+    ffArgs.push("-i", directUrl);
+  } else {
+    // Si no hay URL directa, evitamos usar yt-dlp -> stdout por inestabilidad en Windows.
+    // En su lugar, obtenemos un stream desde ytdl-core y lo pasamos a ffmpeg.
+    // Para el seek, -ss antes de -i para input seek.
+    if (startAtSec > 0) {
+      ffArgs.push("-ss", String(startAtSec));
+    }
+    ffArgs.push("-i", "pipe:0");
+  }
+  ffArgs.push(
     "-vn",
     "-sn",
-    "-dn",
+    "-dn"
+  );
+  // Filtro de bajos si se configuró
+  if (bassGainDb > 0) {
+    const g = Math.max(1, Math.min(24, Math.round(bassGainDb)));
+    const f = Math.max(20, Math.min(250, Math.round(bassFreq)));
+    const w = Math.max(0.1, Math.min(5, Number(bassWidth)));
+    ffArgs.push("-af", `bass=g=${g}:f=${f}:w=${w}`);
+  }
+  ffArgs.push(
     "-ac",
     "2",
     "-ar",
@@ -893,17 +1030,44 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
     "-f",
     "ogg",
     "pipe:1",
-  ];
-  const ff = spawn(ffmpegPath, ffArgs, { stdio: ["pipe", "pipe", "pipe"] });
+  );
+  const ff = spawn(ffmpegPath, ffArgs, { stdio: [directUrl ? "ignore" : "pipe", "pipe", "pipe"] });
 
-  // Encadenar salida de yt-dlp a ffmpeg
-  yProc.stdout?.pipe(ff.stdin);
+  if (!directUrl) {
+    // Fallback estable: usar ytdl-core en lugar de yt-dlp -> stdout
+    try {
+      const id = extractYouTubeId(url) || url;
+      const info = await ytdl.getInfo(id, buildYtdlRequestOptions(id));
+      const fmt = selectWebmOpusFormat(info.formats) || ytdl.chooseFormat(info.formats, { quality: "highestaudio", filter: "audioonly" });
+      const yStream = ytdl.downloadFromInfo(info, {
+        format: fmt,
+        highWaterMark: 1 << 25,
+        ...buildYtdlRequestOptions(info?.videoDetails?.video_url || id),
+      });
+      yStream.pipe(ff.stdin);
+      const ignoreErr = (label) => (err) => {
+        if (!err) return;
+        const code = err?.code || "";
+        if (code === "EPIPE" || code === "ECONNRESET") {
+          if (DEBUG_AUDIO) console.warn(`[${label}] ${code} (ignorada)`);
+          return;
+        }
+        console.warn(`[${label}]`, err?.message || err);
+      };
+      yStream.on("error", ignoreErr("ytdl:stream"));
+    } catch (e) {
+      // Si esto falla, cerrar ffmpeg y propagar error para que el caller haga otro fallback.
+      try { ff.stdin?.end?.(); } catch {}
+      try { ff.kill("SIGKILL"); } catch {}
+      throw e;
+    }
+  }
+
   if (DEBUG_AUDIO) {
-    yProc.stderr?.on("data", (d) => console.warn(`[yt-dlp] ${String(d).trim()}`));
     ff.stderr?.on("data", (d) => console.warn(`[ffmpeg] ${String(d).trim()}`));
   }
 
-  // Manejo de errores de streams para evitar EPIPE/ECONNRESET no capturados
+  // Manejo de errores para ffmpeg
   const ignoreErr = (label) => (err) => {
     if (!err) return;
     const code = err?.code || "";
@@ -913,22 +1077,14 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
     }
     console.warn(`[${label}]`, err?.message || err);
   };
-  yProc.on?.("error", ignoreErr("yt-dlp:proc"));
-  yProc.stdout?.on("error", ignoreErr("yt-dlp:stdout"));
-  yProc.stdin?.on?.("error", ignoreErr("yt-dlp:stdin"));
   ff.on("error", ignoreErr("ffmpeg:proc"));
   ff.stdout.on("error", ignoreErr("ffmpeg:stdout"));
-  ff.stdin.on("error", ignoreErr("ffmpeg:stdin"));
+  ff.stdin?.on?.("error", ignoreErr("ffmpeg:stdin"));
 
   // Crear recurso
   const out = ff.stdout;
   const cleanup = () => {
-    try {
-      ff.kill("SIGKILL");
-    } catch {}
-    try {
-      yProc.kill?.("SIGKILL");
-    } catch {}
+    try { ff.kill("SIGKILL"); } catch {}
   };
   out.on("close", cleanup);
   out.on("end", cleanup);
@@ -1276,6 +1432,23 @@ async function registerSlashCommands() {
     { name: "resume", description: "Reanudar reproducción" },
     { name: "queue", description: "Mostrar la cola" },
     {
+      name: "loop",
+      description: "Controlar el bucle de la canción actual",
+      options: [
+        {
+          name: "mode",
+          description: "Seleccioná el modo",
+          type: 3, // STRING
+          required: true,
+          choices: [
+            { name: "TOGGLE", value: "toggle" },
+            { name: "ON", value: "on" },
+            { name: "OFF", value: "off" },
+          ],
+        },
+      ],
+    },
+    {
       name: "remove",
       description: "Eliminar un elemento de la cola por índice",
       options: [
@@ -1302,6 +1475,25 @@ async function registerSlashCommands() {
         },
       ],
     },
+    {
+      name: "bass",
+      description: "Refuerzo de bajos (OFF/LOW/MED/HIGH/EXTREME)",
+      options: [
+        {
+          name: "preset",
+          description: "Nivel de bass",
+          type: 3, // STRING
+          required: true,
+          choices: [
+            { name: "OFF", value: "off" },
+            { name: "LOW", value: "low" },
+            { name: "MED", value: "med" },
+            { name: "HIGH", value: "high" },
+            { name: "EXTREME", value: "extreme" },
+          ],
+        },
+      ],
+    },
   ];
   try {
     await client.application.commands.set(commands);
@@ -1319,6 +1511,22 @@ client.once("clientReady", async () => {
 function canonicalizeYouTubeUrl(input) {
   try {
     const u = new URL(input);
+    // Normalizar YouTube Music playlists a YouTube web
+    if (/(^|\.)music\.youtube\.com$/i.test(u.hostname)) {
+      // playlist -> youtube.com/playlist?list=...
+      const list = u.searchParams.get("list");
+      if (u.pathname === "/playlist" && list) {
+        return `https://www.youtube.com/playlist?list=${list}`;
+      }
+      // watch -> youtube.com/watch?v=... (mantener list si viene)
+      const v = u.searchParams.get("v");
+      if (u.pathname === "/watch" && v) {
+        const listQ = u.searchParams.get("list");
+        return listQ
+          ? `https://www.youtube.com/watch?v=${v}&list=${listQ}`
+          : `https://www.youtube.com/watch?v=${v}`;
+      }
+    }
     // youtu.be short links -> watch?v=
     if (/^youtu\.be$/i.test(u.hostname)) {
       const id = u.pathname.replace(/^\//, "").split(/[/?&]/)[0];
@@ -1333,7 +1541,7 @@ function canonicalizeYouTubeUrl(input) {
       return id ? `https://www.youtube.com/watch?v=${id}` : input;
     }
     // youtube.com with v param -> normalize to watch?v=
-    if (/youtube\.com$/i.test(u.hostname)) {
+  if (/youtube\.com$/i.test(u.hostname)) {
       const v = u.searchParams.get("v");
       if (v) return `https://www.youtube.com/watch?v=${v}`;
     }
@@ -1368,8 +1576,12 @@ function extractYouTubeId(input) {
         const id = u.pathname.split("/")[2];
         return id || null;
       }
-      const v = u.searchParams.get("v");
-      if (v) return v;
+      if (u.pathname === "/watch") {
+        const v = u.searchParams.get("v");
+        if (v) return v;
+      }
+      // Si es playlist URL, no tiene videoId
+      if (u.pathname === "/playlist") return null;
     }
   } catch {}
   // Regex extra por si viene texto raro
@@ -1527,7 +1739,7 @@ async function playNext(guildId) {
       q.upgradeTimer = null;
     }
 
-    let resource = null;
+  let resource = null;
     const fastStartEnabled = String(process.env.FAST_START || "1") === "1";
     const fastDelayMs = Math.max(
       500,
@@ -1536,17 +1748,23 @@ async function playNext(guildId) {
     const longEnough = (current.durationSec || 0) >= 60;
   const forceYtDlp = String(process.env.YT_FORCE_YTDLP || "0") === "1";
 
-  if (!forceYtDlp && current.ytdlInfo && fastStartEnabled && longEnough) {
+  const bassActive = (Number(q.bassGainDb) || 0) > 0;
+  if (!forceYtDlp && !bassActive && current.ytdlInfo && fastStartEnabled && longEnough) {
       resource =
         createFastStartResourceFromYtdlInfo(
           current.ytdlInfo,
           q.volume ?? 1.0
         ) || createResourceFromYtdlInfo(current.ytdlInfo, q.volume ?? 1.0);
-  } else if (!forceYtDlp && current.ytdlInfo) {
+  } else if (!forceYtDlp && !bassActive && current.ytdlInfo) {
       resource = createResourceFromYtdlInfo(current.ytdlInfo, q.volume ?? 1.0);
     }
     if (!resource) {
-      resource = await createResourceFromUrl(current.url, q.volume ?? 1.0);
+      resource = await createResourceFromUrl(current.url, q.volume ?? 1.0, {
+        forceFfmpeg: bassActive,
+        bassGainDb: q.bassGainDb,
+        bassFreq: DEFAULT_BASS_FREQ,
+        bassWidth: DEFAULT_BASS_WIDTH,
+      });
     }
 
     q.player.play(resource);
@@ -1561,10 +1779,10 @@ async function playNext(guildId) {
           const qq = queues.get(guildId);
           if (!qq || qq.currentTrackToken !== token) return;
           if (qq.player?.state?.status !== AudioPlayerStatus.Playing) return;
-          const bestRes = createResourceFromYtdlInfo(
+          const bestRes = (!bassActive) ? createResourceFromYtdlInfo(
             current.ytdlInfo,
             qq.volume ?? 1.0
-          );
+          ) : null;
           if (!bestRes) return;
           qq.player.play(bestRes);
           if (DEBUG_AUDIO) console.log("[fast-start] upgraded to high quality");
@@ -1726,7 +1944,7 @@ function buildControlsComponents(q) {
       .setCustomId("music_shuffle")
       .setEmoji("🔀")
   .setLabel("Aleatorio")
-      .setStyle(ButtonStyle.Secondary)
+      .setStyle(q.shuffleMode ? ButtonStyle.Success : ButtonStyle.Secondary)
       .setDisabled(!canShuffle),
     new ButtonBuilder()
       .setCustomId("music_save")
@@ -1789,9 +2007,9 @@ function buildNowPlayingEmbed(q, guild) {
       }
     )
     .setFooter({
-      text: `Controles debajo · Volumen: ${Math.round(
+  text: `Controles debajo · Volumen: ${Math.round(
         (q.volume ?? 1) * 100
-      )}% · Repetir: ${q.loop ? "ON" : "OFF"}`,
+  )}% · Repetir: ${q.loop ? "ON" : "OFF"} · Aleatorio: ${q.shuffleMode ? "ON" : "OFF"} · Bass: ${q.bassGainDb > 0 ? `+${q.bassGainDb}dB` : "OFF"}`,
     });
   if (total) {
     embed.setDescription(buildProgressBar(total, elapsed));
@@ -1931,7 +2149,17 @@ client.on("interactionCreate", async (interaction) => {
     }
     if (id === "music_skip") {
       // Saltar ignorando loop
-      if (q.songs.length > 0) q.songs.shift();
+      if (q.songs.length > 0) {
+        if (q.songs.length > 1 && q.shuffleMode) {
+          const rest = q.songs.slice(1);
+          const pick = Math.floor(Math.random() * rest.length);
+          const next = rest[pick];
+          const newRest = rest.filter((_, i) => i !== pick);
+          q.songs = [next, ...newRest];
+        } else {
+          q.songs.shift();
+        }
+      }
       if (q.songs.length > 0) {
         await playNext(guild.id);
       } else {
@@ -1953,11 +2181,20 @@ client.on("interactionCreate", async (interaction) => {
     }
     if (id === "music_loop") {
       q.loop = !q.loop;
+  guildState[guild.id] = guildState[guild.id] || {};
+  guildState[guild.id].loop = q.loop;
+  saveState(guildState);
       await renderNowPlaying(guild.id).catch(() => {});
       return;
     }
     if (id === "music_shuffle") {
-      if (q.songs.length > 2) {
+      // Alternar modo aleatorio y persistir
+      q.shuffleMode = !q.shuffleMode;
+      guildState[guild.id] = guildState[guild.id] || {};
+      guildState[guild.id].shuffleMode = q.shuffleMode;
+      saveState(guildState);
+      // Si se activó y hay más de 2 temas, mezclar la cola restante una vez
+      if (q.shuffleMode && q.songs.length > 2) {
         const head = q.songs[0];
         const rest = q.songs.slice(1);
         for (let i = rest.length - 1; i > 0; i--) {
@@ -1985,10 +2222,16 @@ client.on("interactionCreate", async (interaction) => {
       const song = q.songs[0];
       if (song) {
         try {
-          const resource = await createResourceFromUrl(
-            song.url,
-            q.volume ?? 1.0
-          );
+          const bassActive = (Number(q.bassGainDb) || 0) > 0;
+          q.replacingResource = true;
+          const elapsedSec = Math.floor((q.player?.state?.resource?.playbackDuration || 0) / 1000);
+          const resource = await createResourceFromUrl(song.url, q.volume ?? 1.0, {
+            forceFfmpeg: bassActive,
+            bassGainDb: q.bassGainDb,
+            bassFreq: DEFAULT_BASS_FREQ,
+            bassWidth: DEFAULT_BASS_WIDTH,
+            startAtSec: elapsedSec,
+          });
           q.player.play(resource);
           await renderNowPlaying(guild.id).catch(() => {});
         } catch {}
@@ -1998,8 +2241,9 @@ client.on("interactionCreate", async (interaction) => {
     if (id === "music_vol_down" || id === "music_vol_up") {
       const delta = id === "music_vol_up" ? 0.1 : -0.1;
       q.volume = Math.max(0, Math.min(2, (q.volume ?? 1) + delta));
-      guildVolumes[guild.id] = q.volume;
-      saveVolumes(guildVolumes);
+  guildState[guild.id] = guildState[guild.id] || {};
+  guildState[guild.id].volume = q.volume;
+  saveState(guildState);
       const res = q.player.state?.resource;
       if (res?.volume?.setVolumeLogarithmic)
         res.volume.setVolumeLogarithmic(q.volume);
@@ -2042,12 +2286,13 @@ client.on("interactionCreate", async (interaction) => {
 
   try {
     if (commandName === "play") {
-      const query = interaction.options.getString("query", true);
+  const query = interaction.options.getString("query", true);
+  const normalizedQuery = canonicalizeYouTubeUrl(query);
       const ok = await safeDefer(interaction);
       if (!ok) return;
       // Playlist en /play
       try {
-        const vType = await playdl.validate(canonicalizeYouTubeUrl(query));
+  const vType = await playdl.validate(normalizedQuery);
         if (vType === "yt_playlist") {
           const voiceChannel = member.voice?.channel;
           if (!voiceChannel)
@@ -2078,7 +2323,7 @@ client.on("interactionCreate", async (interaction) => {
               { edit: true }
             );
           }
-          const pl = await playdl.playlist_info(query, { incomplete: true });
+          const pl = await playdl.playlist_info(normalizedQuery, { incomplete: true });
           await pl.fetch();
           const items = (pl.videos || []).slice(0, MAX_PLAYLIST_ITEMS);
           if (items.length === 0)
@@ -2127,10 +2372,10 @@ client.on("interactionCreate", async (interaction) => {
       } catch {}
 
       // Exigir URL directa
-      const finalUrl = (() => {
+    const finalUrl = (() => {
         try {
-          const u = new URL(query);
-          return u.href;
+      const u = new URL(normalizedQuery);
+      return u.href;
         } catch { return null; }
       })();
       if (!finalUrl)
@@ -2255,6 +2500,23 @@ client.on("interactionCreate", async (interaction) => {
       return r;
     }
 
+    if (commandName === "loop") {
+      const ok = await safeDefer(interaction);
+      if (!ok) return;
+      const mode = String(interaction.options.getString("mode", true)).toLowerCase();
+      const q = getQueue(guild.id);
+      if (!q || q.songs.length === 0)
+        return safeRespond(interaction, "No hay nada en reproducción.", { edit: true });
+      if (mode === "on") q.loop = true;
+      else if (mode === "off") q.loop = false;
+      else q.loop = !q.loop; // toggle
+      guildState[guild.id] = guildState[guild.id] || {};
+      guildState[guild.id].loop = q.loop;
+      saveState(guildState);
+      await renderNowPlaying(guild.id).catch(() => {});
+      return safeRespond(interaction, `🔁 Bucle: ${q.loop ? "ON" : "OFF"}`, { edit: true });
+    }
+
     if (commandName === "skip") {
       const ok = await safeDefer(interaction);
       if (!ok) return;
@@ -2360,7 +2622,20 @@ client.on("interactionCreate", async (interaction) => {
         return safeRespond(interaction, `Índice inválido. Rango: 1-${q.songs.length}.`, { edit: true });
       if (idx === 1) {
         q.loop = false;
-        q.songs.shift();
+  guildState[guild.id] = guildState[guild.id] || {};
+  guildState[guild.id].loop = q.loop;
+  saveState(guildState);
+        if (q.songs.length > 0) {
+          if (q.songs.length > 1 && q.shuffleMode) {
+            const rest = q.songs.slice(1);
+            const pick = Math.floor(Math.random() * rest.length);
+            const next = rest[pick];
+            const newRest = rest.filter((_, i) => i !== pick);
+            q.songs = [next, ...newRest];
+          } else {
+            q.songs.shift();
+          }
+        }
         if (q.songs.length > 0) {
           await playNext(guild.id);
         } else {
@@ -2435,13 +2710,59 @@ client.on("interactionCreate", async (interaction) => {
       const pct = Math.max(0, Math.min(200, level));
       const q = getQueue(guild.id);
       q.volume = pct / 100;
-      guildVolumes[guild.id] = q.volume;
-      saveVolumes(guildVolumes);
+  guildState[guild.id] = guildState[guild.id] || {};
+  guildState[guild.id].volume = q.volume;
+  saveState(guildState);
       const res = q.player.state?.resource;
       if (res?.volume?.setVolumeLogarithmic)
         res.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, q.volume)));
       await renderNowPlaying(guild.id).catch(() => {});
       return safeRespond(interaction, `🔊 Volumen: ${pct}%`, { edit: true });
+    }
+
+    if (commandName === "bass") {
+      const ok = await safeDefer(interaction);
+      if (!ok) return;
+      const preset = String(interaction.options.getString("preset", true)).toLowerCase();
+      const q = getQueue(guild.id);
+      let gainDb = 0;
+      if (preset === "low") gainDb = 4;
+      else if (preset === "med") gainDb = 8;
+      else if (preset === "high") gainDb = 12;
+      else if (preset === "extreme") gainDb = 16;
+      else gainDb = 0; // off
+      q.bassGainDb = gainDb;
+  guildState[guild.id] = guildState[guild.id] || {};
+  guildState[guild.id].bassGainDb = q.bassGainDb;
+  saveState(guildState);
+  // Aplicar al instante: reiniciar la pista actual con ffmpeg si hay algo sonando (conseek)
+      const current = q.songs?.[0];
+      if (current && q.player?.state?.status === AudioPlayerStatus.Playing) {
+        try {
+      // Señalar reemplazo controlado para que no avance la cola
+      q.replacingResource = true;
+          const elapsedSec = Math.floor((q.player?.state?.resource?.playbackDuration || 0) / 1000);
+          const res = await createResourceFromUrl(current.url, q.volume ?? 1.0, {
+            forceFfmpeg: true,
+            bassGainDb: q.bassGainDb,
+            bassFreq: DEFAULT_BASS_FREQ,
+            bassWidth: DEFAULT_BASS_WIDTH,
+            startAtSec: elapsedSec,
+          });
+          q.player.play(res);
+        } catch (e) {
+          if (DEBUG_AUDIO) console.warn("[bass] reapply failed:", e?.message || e);
+      q.replacingResource = false;
+        }
+      }
+      await renderNowPlaying(guild.id).catch(() => {});
+      return safeRespond(
+        interaction,
+        q.bassGainDb > 0
+          ? `🎚️ Bass: ${preset.toUpperCase()} (+${q.bassGainDb} dB)`
+          : "🎚️ Bass: OFF",
+        { edit: true }
+      );
     }
   } catch (e) {
     console.error("[interaction:error]", e);
