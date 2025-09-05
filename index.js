@@ -12,6 +12,10 @@ try {
   console.warn("[ffmpeg] ffmpeg-static no instalado; se intentará sin FFmpeg");
 }
 const DEBUG_AUDIO = process.env.DEBUG_AUDIO === "1";
+// Cache global para optimizaciones
+let G_YTDLP_PATH_CACHE = null; // memo para getYtDlpBinaryPath()
+const G_COOKIE_CACHE = { path: null, lastHash: null, wrote: false }; // memo para ensureYtDlpCookiesFileFromEnv()
+let G_YTDLP_SUPPORTS_NO_SLEEP = undefined; // cache de soporte para --no-sleep-requests
 const MAX_PLAYLIST_ITEMS = Math.max(
   1,
   Math.min(100, Number(process.env.MAX_PLAYLIST_ITEMS || 25))
@@ -272,7 +276,9 @@ async function safeDefer(interaction) {
   try {
     if (interaction.deferred || interaction.replied) return true;
   // Hacer que las respuestas de slash sean efímeras (no empujan el chat)
-  await interaction.deferReply({ ephemeral: EPHEMERAL_SLASH });
+  // Nota: usar flags en lugar de 'ephemeral' (deprecado)
+  const flags = EPHEMERAL_SLASH ? (1 << 6) : undefined;
+  await interaction.deferReply(flags != null ? { flags } : {});
     return true;
   } catch {
     return false;
@@ -963,16 +969,21 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   }
   args.push(url);
 
-  // Preferir: obtener URL directa y alimentar FFmpeg (más estable en Windows)
+  // Preferir: obtener URL directa SOLO si vamos a usarla (evita una invocación extra de yt-dlp en Windows)
   let directUrl = null;
-  try {
-    directUrl = await getDirectUrlFromYtDlp(url, headers, { formats: [
-      "bestaudio[acodec=opus]/bestaudio/best",
-      "251",
-      "bestaudio/best",
-    ]});
-  } catch (e) {
-    if (DEBUG_AUDIO) console.warn("[yt-dlp] no se obtuvo URL directa:", e?.message || e);
+  if (FFMPEG_DIRECT_URL) {
+    try {
+      directUrl = await getDirectUrlFromYtDlp(url, headers, {
+        formats: [
+          "bestaudio[acodec=opus]/bestaudio/best",
+          "251",
+          "bestaudio/best",
+        ],
+      });
+    } catch (e) {
+      if (DEBUG_AUDIO)
+        console.warn("[yt-dlp] no se obtuvo URL directa:", e?.message || e);
+    }
   }
 
   // ffmpeg para transcodificar a ogg/opus (desde URL directa o pipe como fallback)
@@ -1057,6 +1068,13 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
       if (headers?.userAgent) yArgs.push("--user-agent", headers.userAgent);
       if (headers?.acceptLang) yArgs.push("--add-header", `Accept-Language: ${headers.acceptLang}`);
       if (String(process.env.YT_FORCE_IPV4 || "0") === "1") yArgs.push("--force-ipv4");
+      // Agregar --no-sleep-requests solo si la versión de yt-dlp lo soporta
+      if (String(process.env.YT_NO_SLEEP_REQUESTS || "0") === "1") {
+        try {
+          const supports = await ytDlpSupportsNoSleep();
+          if (supports) yArgs.push("--no-sleep-requests");
+        } catch {}
+      }
       if (cookieFile2) yArgs.push("--cookies", cookieFile2);
       yArgs.push(url);
       const yProc = binPath
@@ -1069,6 +1087,12 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
             ...(headers?.acceptLang ? { addHeader: [`Accept-Language: ${headers.acceptLang}`] } : {}),
             ...(cookieFile2 ? { cookies: cookieFile2 } : {}),
             ...(String(process.env.YT_FORCE_IPV4 || "0") === "1" ? { forceIpv4: true } : {}),
+            // Opción no-sleep solo si está soportada
+            ...(await (async () => {
+              if (String(process.env.YT_NO_SLEEP_REQUESTS || "0") !== "1") return {};
+              try { if (await ytDlpSupportsNoSleep()) return { noSleepRequests: true }; } catch {}
+              return {};
+            })()),
           });
       if (DEBUG_AUDIO) yProc.stderr?.on("data", (d) => console.warn(`[yt-dlp] ${String(d).trim()}`));
       // Pipe a ffmpeg
@@ -1161,9 +1185,11 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
 }
 
 function getYtDlpBinaryPath() {
+  if (G_YTDLP_PATH_CACHE && fs.existsSync(G_YTDLP_PATH_CACHE)) return G_YTDLP_PATH_CACHE;
   // 1) Variable de entorno explícita
   if (process.env.YT_DLP_PATH && fs.existsSync(process.env.YT_DLP_PATH)) {
-    return process.env.YT_DLP_PATH;
+    G_YTDLP_PATH_CACHE = process.env.YT_DLP_PATH;
+    return G_YTDLP_PATH_CACHE;
   }
   // 2) Buscar en PATH con where/which
   try {
@@ -1173,14 +1199,20 @@ function getYtDlpBinaryPath() {
         const line = String(r.stdout || "")
           .split(/\r?\n/)
           .find(Boolean);
-        if (line && fs.existsSync(line.trim())) return line.trim();
+        if (line && fs.existsSync(line.trim())) {
+          G_YTDLP_PATH_CACHE = line.trim();
+          return G_YTDLP_PATH_CACHE;
+        }
       }
       const r2 = spawnSync("where", ["yt-dlp"], { encoding: "utf8" });
       if (r2.status === 0) {
         const line = String(r2.stdout || "")
           .split(/\r?\n/)
           .find(Boolean);
-        if (line && fs.existsSync(line.trim())) return line.trim();
+        if (line && fs.existsSync(line.trim())) {
+          G_YTDLP_PATH_CACHE = line.trim();
+          return G_YTDLP_PATH_CACHE;
+        }
       }
     } else {
       const r = spawnSync("which", ["yt-dlp"], { encoding: "utf8" });
@@ -1188,7 +1220,10 @@ function getYtDlpBinaryPath() {
         const line = String(r.stdout || "")
           .split(/\r?\n/)
           .find(Boolean);
-        if (line && fs.existsSync(line.trim())) return line.trim();
+        if (line && fs.existsSync(line.trim())) {
+          G_YTDLP_PATH_CACHE = line.trim();
+          return G_YTDLP_PATH_CACHE;
+        }
       }
     }
   } catch {}
@@ -1201,11 +1236,41 @@ function getYtDlpBinaryPath() {
     ];
     for (const p of guesses) {
       try {
-        if (fs.existsSync(p)) return p;
+        if (fs.existsSync(p)) {
+          G_YTDLP_PATH_CACHE = p;
+          return G_YTDLP_PATH_CACHE;
+        }
       } catch {}
     }
   }
   return null;
+}
+
+async function ytDlpSupportsNoSleep() {
+  if (G_YTDLP_SUPPORTS_NO_SLEEP !== undefined) return G_YTDLP_SUPPORTS_NO_SLEEP;
+  const bin = getYtDlpBinaryPath();
+  if (!bin) {
+    G_YTDLP_SUPPORTS_NO_SLEEP = false;
+    return false;
+  }
+  try {
+    const out = await new Promise((resolve) => {
+      try {
+        const p = spawn(bin, ["--help"], { stdio: ["ignore", "pipe", "pipe"] });
+        let buf = "";
+        p.stdout.on("data", (d) => (buf += String(d)));
+        p.on("close", () => resolve(buf));
+        p.on("error", () => resolve(""));
+      } catch {
+        resolve("");
+      }
+    });
+    G_YTDLP_SUPPORTS_NO_SLEEP = /--no-sleep-requests/.test(String(out || ""));
+    return G_YTDLP_SUPPORTS_NO_SLEEP;
+  } catch {
+    G_YTDLP_SUPPORTS_NO_SLEEP = false;
+    return false;
+  }
 }
 
 // Convierte "a=b; c=d" en [{name:'a',value:'b'}, {name:'c',value:'d'}]
@@ -1283,10 +1348,18 @@ function ensureYtDlpCookiesFileFromEnv() {
       }
     }
     if (!raw) raw = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
-    if (!raw) return null;
-    const tmpPath = path.join(os.tmpdir(), `yt_cookies_${process.pid}.txt`);
+    if (!raw) return G_COOKIE_CACHE.path || null;
+    const tmpPath = G_COOKIE_CACHE.path || path.join(os.tmpdir(), `yt_cookies_${process.pid}.txt`);
 
-  let content = String(raw);
+    let content = String(raw);
+    // Si ya calculamos un hash de contenido y no cambió, reutilizamos archivo existente
+    const hash = (() => {
+      try { return require("crypto").createHash("sha1").update(content).digest("hex"); } catch { return null; }
+    })();
+    if (G_COOKIE_CACHE.lastHash && hash && hash === G_COOKIE_CACHE.lastHash && G_COOKIE_CACHE.path && fs.existsSync(G_COOKIE_CACHE.path)) {
+      if (DEBUG_AUDIO) console.log(`[yt-dlp] usando cookie cache: ${G_COOKIE_CACHE.path}`);
+      return G_COOKIE_CACHE.path;
+    }
     // Si parece ya ser Netscape (tiene tabs o cabecera), lo usamos tal cual
     const looksNetscape = content.includes("\t") || /Netscape HTTP Cookie File/i.test(content);
     if (!looksNetscape) {
@@ -1361,10 +1434,13 @@ function ensureYtDlpCookiesFileFromEnv() {
         }
       } catch {}
     }
-  // Reescribir siempre para evitar cookies obsoletas si cambió el env
+  // Escribir sólo si es nuevo o cambió
   fs.writeFileSync(tmpPath, content, { encoding: "utf8" });
-    if (DEBUG_AUDIO) console.log(`[yt-dlp] archivo de cookies creado: ${tmpPath}`);
-    return tmpPath;
+  G_COOKIE_CACHE.path = tmpPath;
+  G_COOKIE_CACHE.lastHash = hash;
+  G_COOKIE_CACHE.wrote = true;
+  if (DEBUG_AUDIO) console.log(`[yt-dlp] archivo de cookies ${G_COOKIE_CACHE.wrote ? "creado/actualizado" : "reutilizado"}: ${tmpPath}`);
+  return G_COOKIE_CACHE.path;
   } catch (e) {
     if (DEBUG_AUDIO) console.warn("[yt-dlp] No se pudo crear archivo de cookies:", e?.message || e);
     return null;
