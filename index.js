@@ -1657,9 +1657,43 @@ async function registerSlashCommands() {
       ],
     },
   ];
+
+  const scope = String(process.env.COMMANDS_SCOPE || "global").toLowerCase();
+  const devGuildId = process.env.DEV_GUILD_ID && String(process.env.DEV_GUILD_ID);
   try {
-    await client.application.commands.set(commands);
-    console.log("[slash] Comandos registrados globalmente");
+    if (scope === "guild") {
+      // Limpiar global para evitar duplicados y registrar por guild
+      try {
+        await client.application.commands.set([]);
+        console.log("[slash] Global limpiados (scope=guild)");
+      } catch (e) {
+        console.warn("[slash] No se pudieron limpiar global:", e?.message || e);
+      }
+
+      const targets = [];
+      if (devGuildId) {
+        const g = client.guilds.cache.get(devGuildId);
+        if (g) targets.push(g);
+        else console.warn(`[slash] DEV_GUILD_ID=${devGuildId} no está en caché`);
+      } else {
+        for (const g of client.guilds.cache.values()) targets.push(g);
+      }
+      for (const g of targets) {
+        try {
+          await g.commands.set(commands);
+          console.log(`[slash] Registrados en guild ${g.id}`);
+        } catch (e) {
+          console.error(`[slash] Error registrando en guild ${g?.id}:`, e?.message || e);
+        }
+      }
+    } else {
+      // Limpiar comandos por guild para evitar duplicados y registrar global
+      for (const g of client.guilds.cache.values()) {
+        try { await g.commands.set([]); } catch {}
+      }
+      await client.application.commands.set(commands);
+      console.log("[slash] Comandos registrados globalmente (scope=global)");
+    }
   } catch (e) {
     console.error("[slash:register:error]", e?.message || e);
   }
