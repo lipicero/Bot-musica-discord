@@ -1510,6 +1510,17 @@ function formatDuration(totalSeconds) {
   return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
 }
 
+function formatBytes(n) {
+  const units = ["B", "KB", "MB", "GB", "TB"]; let i = 0; let v = Math.max(0, Number(n)||0);
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(i ? 1 : 0)} ${units[i]}`;
+}
+
+function getUptime() {
+  const sec = Math.floor(process.uptime());
+  return formatDuration(sec);
+}
+
 function buildProgressBar(totalSec, elapsedSec, size = 20) {
   totalSec = Math.max(1, Number(totalSec) || 1);
   elapsedSec = Math.max(0, Math.min(totalSec, Number(elapsedSec) || 0));
@@ -1627,6 +1638,24 @@ async function registerSlashCommands() {
         },
       ],
     },
+    { name: "ping", description: "Ping y latencia del bot" },
+    { name: "stats", description: "Estadísticas del bot" },
+    {
+      name: "shuffle",
+      description: "Alternar modo aleatorio para la cola",
+    },
+    {
+      name: "seek",
+      description: "Saltar a un segundo específico de la canción actual",
+      options: [
+        {
+          name: "seconds",
+          description: "Segundo al que quieres saltar (0..duración)",
+          type: 4, // INTEGER
+          required: true,
+        },
+      ],
+    },
   ];
   try {
     await client.application.commands.set(commands);
@@ -1636,7 +1665,8 @@ async function registerSlashCommands() {
   }
 }
 
-client.once("clientReady", async () => {
+// ready: se emite cuando el bot está listo
+client.once("ready", async () => {
   console.log(`[bot] Conectado como ${client.user?.tag || client.user?.id}`);
   try { await registerSlashCommands(); } catch {}
 });
@@ -2641,6 +2671,78 @@ client.on("interactionCreate", async (interaction) => {
   await ensurePanel(guild.id, interaction.channelId);
   await renderNowPlaying(guild.id).catch(() => {});
       return r;
+    }
+
+    if (commandName === "ping") {
+      const ok = await safeDefer(interaction);
+      if (!ok) return;
+      const ping = Math.max(0, client.ws.ping || 0);
+      return safeRespond(interaction, `Pong! Latencia WS: ${ping}ms`, { edit: true });
+    }
+
+    if (commandName === "stats") {
+      const ok = await safeDefer(interaction);
+      if (!ok) return;
+      const mem = process.memoryUsage();
+      const guilds = client.guilds?.cache?.size || 0;
+      const conns = [...queues.values()].filter(q => q.connection).length;
+      const songs = [...queues.values()].reduce((a,q)=>a+(q.songs?.length||0),0);
+      const txt = [
+        `Uptime: ${getUptime()}`,
+        `RAM: ${formatBytes(mem.rss)} rss · ${formatBytes(mem.heapUsed)} heap`,
+        `Guilds: ${guilds} · Conexiones voz: ${conns} · En cola: ${songs}`,
+        `Node: ${process.version}`,
+      ].join("\n");
+      return safeRespond(interaction, txt, { edit: true });
+    }
+
+    if (commandName === "shuffle") {
+      const ok = await safeDefer(interaction);
+      if (!ok) return;
+      const q = getQueue(guild.id);
+      if (!q || q.songs.length === 0) return safeRespond(interaction, "La cola está vacía.", { edit: true });
+      q.shuffleMode = !q.shuffleMode;
+      guildState[guild.id] = guildState[guild.id] || {};
+      guildState[guild.id].shuffleMode = q.shuffleMode;
+      saveState(guildState);
+      if (q.shuffleMode && q.songs.length > 2) {
+        const head = q.songs[0];
+        const rest = q.songs.slice(1);
+        for (let i = rest.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [rest[i], rest[j]] = [rest[j], rest[i]];
+        }
+        q.songs = [head, ...rest];
+      }
+      await renderNowPlaying(guild.id).catch(() => {});
+      return safeRespond(interaction, `🔀 Aleatorio: ${q.shuffleMode ? "ON" : "OFF"}`, { edit: true });
+    }
+
+    if (commandName === "seek") {
+      const ok = await safeDefer(interaction);
+      if (!ok) return;
+      const seconds = Math.max(0, interaction.options.getInteger("seconds", true));
+      const q = getQueue(guild.id);
+      if (!q || q.songs.length === 0) return safeRespond(interaction, "No hay nada en reproducción.", { edit: true });
+      const current = q.songs[0];
+      const total = Math.max(0, current.durationSec || 0);
+      const target = total ? Math.min(seconds, total - 1) : seconds;
+      try {
+        q.replacingResource = true;
+        const bassActive = (Number(q.bassGainDb) || 0) > 0;
+        const res = await createResourceFromUrl(current.url, q.volume ?? 1.0, {
+          forceFfmpeg: bassActive,
+          bassGainDb: q.bassGainDb,
+          bassFreq: DEFAULT_BASS_FREQ,
+          bassWidth: DEFAULT_BASS_WIDTH,
+          startAtSec: target,
+        });
+        q.player.play(res);
+        await renderNowPlaying(guild.id).catch(() => {});
+        return safeRespond(interaction, `⏩ Seek a ${formatDuration(target)}${total?` / ${formatDuration(total)}`:""}`, { edit: true });
+      } catch (e) {
+        return safeRespond(interaction, "No se pudo hacer seek.", { edit: true });
+      }
     }
 
     if (commandName === "loop") {
