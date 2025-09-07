@@ -1699,9 +1699,9 @@ async function registerSlashCommands() {
   }
 }
 
-// ready: se emite cuando el bot está listo
-client.once("ready", async () => {
-  console.log(`[bot] Conectado como ${client.user?.tag || client.user?.id}`);
+// clientReady: evento recomendado ("ready" quedará deprecado en v15)
+client.once("clientReady", async (c) => {
+  console.log(`[bot] Conectado como ${c.user?.tag || c.user?.id}`);
   try { await registerSlashCommands(); } catch {}
 });
 
