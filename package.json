@@ -13,13 +13,17 @@
   "type": "commonjs",
   "dependencies": {
     "@discordjs/voice": "^0.19.0",
-    "opusscript": "^0.0.8",
     "@distube/ytdl-core": "^4.16.12",
     "@snazzah/davey": "^0.1.6",
+    "cors": "^2.8.5",
     "discord.js": "^14.22.1",
     "dotenv": "^17.2.1",
+    "express": "^5.1.0",
+    "ffmpeg-static": "^5.2.0",
+    "helmet": "^8.1.0",
+    "opusscript": "^0.0.8",
     "play-dl": "^1.9.7",
-    "ytdl-core": "^4.11.5",
-  "ffmpeg-static": "^5.2.0"
+    "socket.io": "^4.8.1",
+    "ytdl-core": "^4.11.5"
   }
 }

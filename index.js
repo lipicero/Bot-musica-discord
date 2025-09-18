@@ -12,10 +12,46 @@ try {
   console.warn("[ffmpeg] ffmpeg-static no instalado; se intentará sin FFmpeg");
 }
 const DEBUG_AUDIO = process.env.DEBUG_AUDIO === "1";
+
+// =================== CONFIGURACIÓN AVANZADA DE CALIDAD ===================
+const PREFER_WEBM_OPUS = process.env.PREFER_WEBM_OPUS === "1";
+const FORCE_BEST_AUDIO = process.env.FORCE_BEST_AUDIO === "1";
+const AUDIO_BUFFER_SIZE = Math.max(16, Math.min(64, Number(process.env.AUDIO_BUFFER_SIZE || 32)));
+const FFMPEG_OPTIMIZE_AUDIO = process.env.FFMPEG_OPTIMIZE_AUDIO === "1";
+const HIGH_WATER_MARK = 1 << (AUDIO_BUFFER_SIZE > 32 ? 26 : 25); // Buffer más grande para mejor calidad
+
+// =================== CONFIGURACIÓN DE VELOCIDAD ===================
+const ENABLE_PRELOAD = process.env.ENABLE_PRELOAD !== "0"; // Habilitado por defecto
+const PRELOAD_AHEAD = Math.max(1, Math.min(5, Number(process.env.PRELOAD_AHEAD || 2)));
+const YT_PARALLEL_DOWNLOADS = Math.max(1, Math.min(5, Number(process.env.YT_PARALLEL_DOWNLOADS || 3)));
+const YT_DOWNLOAD_TIMEOUT = Math.max(30, Math.min(120, Number(process.env.YT_DOWNLOAD_TIMEOUT || 60))) * 1000;
+const YT_AGGRESSIVE_CACHE = process.env.YT_AGGRESSIVE_CACHE === "1";
+
+if (DEBUG_AUDIO) {
+  console.log(`[config] PREFER_WEBM_OPUS: ${PREFER_WEBM_OPUS}`);
+  console.log(`[config] FORCE_BEST_AUDIO: ${FORCE_BEST_AUDIO}`);
+  console.log(`[config] AUDIO_BUFFER_SIZE: ${AUDIO_BUFFER_SIZE}MB`);
+  console.log(`[config] HIGH_WATER_MARK: ${HIGH_WATER_MARK}`);
+  console.log(`[config] FFMPEG_OPTIMIZE_AUDIO: ${FFMPEG_OPTIMIZE_AUDIO}`);
+  console.log(`[config] OPUS_BITRATE: ${process.env.OPUS_BITRATE || 160}kbps`);
+  console.log(`[config] ENABLE_PRELOAD: ${ENABLE_PRELOAD}`);
+  console.log(`[config] PRELOAD_AHEAD: ${PRELOAD_AHEAD} canciones`);
+  console.log(`[config] YT_PARALLEL_DOWNLOADS: ${YT_PARALLEL_DOWNLOADS} conexiones`);
+  console.log(`[config] YT_DOWNLOAD_TIMEOUT: ${YT_DOWNLOAD_TIMEOUT/1000}s`);
+}
+
 // Cache global para optimizaciones
 let G_YTDLP_PATH_CACHE = null; // memo para getYtDlpBinaryPath()
 const G_COOKIE_CACHE = { path: null, lastHash: null, wrote: false }; // memo para ensureYtDlpCookiesFileFromEnv()
 let G_YTDLP_SUPPORTS_NO_SLEEP = undefined; // cache de soporte para --no-sleep-requests
+
+// =================== SISTEMA DE CACHE AVANZADO ===================
+const METADATA_CACHE = new Map(); // Cache de metadatos {url: {title, duration, thumbnail, quality, etc}}
+const PRELOAD_CACHE = new Map(); // Cache de recursos precargados {url: audioResource}
+const USER_STATS = new Map(); // Estadísticas por usuario {userId: {listenTime, songsPlayed, favorites}}
+const CACHE_TTL = 24 * 60 * 60 * 1000; // 24 horas para cache de metadatos
+const MAX_CACHE_SIZE = 1000; // Máximo de elementos en cache
+const MAX_PRELOAD_SIZE = 3; // Máximo de canciones precargadas por servidor
 const MAX_PLAYLIST_ITEMS = Math.max(
   1,
   Math.min(100, Number(process.env.MAX_PLAYLIST_ITEMS || 25))
@@ -27,6 +63,7 @@ const MAX_QUEUE_LENGTH = Math.max(
 // Bass boost (por defecto desactivado). Puedes ajustar frecuencia/ancho por env
 const DEFAULT_BASS_FREQ = Number(process.env.BASS_FREQ || 110); // Hz
 const DEFAULT_BASS_WIDTH = Number(process.env.BASS_WIDTH || 0.8); // ancho/slope
+const SEEK_STEP_SECONDS = Math.max(5, Math.min(30, Number(process.env.SEEK_STEP_SECONDS || 10))); // Paso de seek configurable
 const REQUIRE_SAME_VC = String(process.env.REQUIRE_SAME_VC || "1") === "1";
 // UI: fijar panel y respuestas efímeras por defecto
 const PIN_PANEL = String(process.env.PIN_PANEL || "1") === "1"; // fija el mensaje del panel si es posible
@@ -66,6 +103,13 @@ try {
   ytdlp = require("yt-dlp-exec");
 } catch {}
 const { spawn, spawnSync } = require("child_process");
+
+// =================== SERVIDOR WEB PARA DASHBOARD ===================
+const express = require("express");
+const http = require("http");
+const socketIo = require("socket.io");
+const cors = require("cors");
+const helmet = require("helmet");
 
 // ======================
 // Cliente Discord e Intents (slash-only)
@@ -144,6 +188,705 @@ function saveState(obj) {
 }
 const guildState = loadState();
 
+// =================== FUNCIONES DE CACHE Y OPTIMIZACIÓN ===================
+function cleanupExpiredCache() {
+  const now = Date.now();
+  for (const [key, data] of METADATA_CACHE.entries()) {
+    if (now - data.timestamp > CACHE_TTL) {
+      METADATA_CACHE.delete(key);
+    }
+  }
+  // Limitar tamaño del cache
+  if (METADATA_CACHE.size > MAX_CACHE_SIZE) {
+    const entries = Array.from(METADATA_CACHE.entries());
+    entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
+    for (let i = 0; i < entries.length - MAX_CACHE_SIZE; i++) {
+      METADATA_CACHE.delete(entries[i][0]);
+    }
+  }
+}
+
+function getCachedMetadata(url) {
+  const cached = METADATA_CACHE.get(url);
+  if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
+    return cached.data;
+  }
+  return null;
+}
+
+function setCachedMetadata(url, metadata) {
+  METADATA_CACHE.set(url, {
+    data: metadata,
+    timestamp: Date.now()
+  });
+  // Cleanup periódico cada 100 inserciones
+  if (METADATA_CACHE.size % 100 === 0) {
+    cleanupExpiredCache();
+  }
+}
+
+// ================== FUNCIÓN PARA ACTUALIZAR CALIDAD EN TIEMPO REAL ==================
+function updateMetadataQuality(url, format) {
+  try {
+    const cached = METADATA_CACHE.get(url);
+    if (cached && format) {
+      let qualityInfo = cached.quality || "Unknown";
+      
+      // Obtener información de calidad del formato seleccionado
+      if (format.audioBitrate) {
+        qualityInfo = `${format.audioBitrate}kbps`;
+      } else if (format.audioQuality) {
+        qualityInfo = format.audioQuality;
+      } else if (format.quality) {
+        qualityInfo = format.quality;
+      } else if (format.audioCodec || format.acodec) {
+        const codec = format.audioCodec || format.acodec;
+        qualityInfo = codec.includes('opus') ? 'Opus' : codec;
+      }
+      
+      // Actualizar cache con la nueva información
+      cached.quality = qualityInfo;
+      METADATA_CACHE.set(url, cached);
+      
+      if (DEBUG_AUDIO) console.log(`[metadata] Actualizada calidad para ${url}: ${qualityInfo}`);
+    }
+  } catch (error) {
+    console.warn(`[metadata] Error actualizando calidad:`, error?.message);
+  }
+}
+
+function getHighQualityThumbnail(basicInfo) {
+  try {
+    const thumbnails = basicInfo?.videoDetails?.thumbnails || basicInfo?.thumbnails;
+    if (!thumbnails || !Array.isArray(thumbnails)) return null;
+    
+    // Buscar la mejor calidad disponible
+    const sorted = thumbnails.sort((a, b) => (b.width * b.height) - (a.width * a.height));
+    return sorted[0]?.url || null;
+  } catch {
+    return null;
+  }
+}
+
+function formatDurationDisplay(seconds) {
+  if (!seconds || seconds === 0) return "🔴 LIVE";
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+// Función para obtener metadatos con cache
+async function getEnhancedMetadata(url) {
+  try {
+    // Intentar obtener del cache primero
+    const cached = getCachedMetadata(url);
+    if (cached) {
+      return cached;
+    }
+
+    let basicInfo = null;
+    let title = "Desconocido";
+    let duration = 0;
+    let thumbnail = null;
+    let quality = "desconocida";
+    let views = null;
+
+    // Intentar obtener info con yt-dlp primero (más confiable)
+    if (ytdlp) {
+      try {
+        const info = await ytdlp(url, {
+          dumpSingleJson: true,
+          noPlaylist: true,
+          noCheckCertificates: true,
+          preferFreeFormats: true,
+          youtubeSkipDashManifest: true,
+          listFormats: false, // Para obtener información de formato
+        });
+        
+        if (info) {
+          title = info.title || title;
+          duration = Math.floor(info.duration || 0);
+          thumbnail = getHighQualityThumbnail(info) || info.thumbnail;
+          views = info.view_count;
+          
+          // MEJORAR DETECCIÓN DE CALIDAD CON YT-DLP
+          let qualityDetected = false;
+          
+          // 1. Intentar obtener desde formatos disponibles (más preciso)
+          if (info.formats && Array.isArray(info.formats)) {
+            // Buscar el mejor formato de audio
+            const audioFormats = info.formats.filter(f => 
+              f.acodec && f.acodec !== 'none' && !f.vcodec || f.vcodec === 'none'
+            ).sort((a, b) => (b.abr || 0) - (a.abr || 0));
+            
+            if (audioFormats.length > 0) {
+              const bestAudio = audioFormats[0];
+              if (bestAudio.abr) {
+                quality = `${bestAudio.abr}kbps`;
+                qualityDetected = true;
+                if (DEBUG_AUDIO) console.log(`[metadata:yt-dlp] Calidad desde formato audio: ${quality} (codec: ${bestAudio.acodec})`);
+              } else if (bestAudio.tbr) {
+                quality = `${bestAudio.tbr}kbps`;
+                qualityDetected = true;
+                if (DEBUG_AUDIO) console.log(`[metadata:yt-dlp] Calidad desde total bitrate: ${quality}`);
+              }
+            }
+          }
+          
+          // 2. Fallback a propiedades directas
+          if (!qualityDetected) {
+            if (info.abr) {
+              quality = `${info.abr}kbps`;
+              qualityDetected = true;
+              if (DEBUG_AUDIO) console.log(`[metadata:yt-dlp] Calidad desde ABR directo: ${quality}`);
+            } else if (info.tbr) {
+              quality = `${info.tbr}kbps`;
+              qualityDetected = true;
+              if (DEBUG_AUDIO) console.log(`[metadata:yt-dlp] Calidad desde TBR: ${quality}`);
+            }
+          }
+          
+          // 3. Información cualitativa si no hay bitrate
+          if (!qualityDetected) {
+            if (info.format_note) {
+              quality = info.format_note;
+              qualityDetected = true;
+              if (DEBUG_AUDIO) console.log(`[metadata:yt-dlp] Calidad cualitativa: ${quality}`);
+            } else if (info.acodec && info.acodec !== 'none') {
+              quality = info.acodec;
+              qualityDetected = true;
+              if (DEBUG_AUDIO) console.log(`[metadata:yt-dlp] Calidad desde codec: ${quality}`);
+            }
+          }
+          
+          if (!qualityDetected) {
+            quality = "128kbps (estimado)";
+            if (DEBUG_AUDIO) console.log(`[metadata:yt-dlp] No se pudo determinar calidad, usando estimado`);
+          }
+        }
+      } catch (ytdlpErr) {
+        console.warn("[metadata:yt-dlp] Fallback to ytdl-core:", ytdlpErr?.message);
+      }
+    }
+
+    // Fallback a ytdl-core si yt-dlp falla o no obtuvimos calidad
+    if ((!basicInfo && title === "Desconocido") || quality === "desconocida") {
+      try {
+        basicInfo = await ytdl.getBasicInfo(url);
+        if (basicInfo?.videoDetails) {
+          if (title === "Desconocido") {
+            title = basicInfo.videoDetails.title || title;
+            duration = parseInt(basicInfo.videoDetails.lengthSeconds) || duration;
+            thumbnail = getHighQualityThumbnail(basicInfo) || thumbnail;
+            views = parseInt(basicInfo.videoDetails.viewCount) || views;
+          }
+          
+          // Intentar obtener calidad de audio mejorado
+          if (quality === "desconocida" || quality === "128kbps (estimado)") {
+            try {
+              let qualityFound = false;
+              
+              // Obtener todos los formatos de audio disponibles
+              if (basicInfo.formats && Array.isArray(basicInfo.formats)) {
+                const audioFormats = basicInfo.formats
+                  .filter(format => format.hasAudio && (!format.hasVideo || format.audioOnly))
+                  .sort((a, b) => (b.audioBitrate || 0) - (a.audioBitrate || 0));
+                
+                if (audioFormats.length > 0) {
+                  const bestFormat = audioFormats[0];
+                  if (bestFormat.audioBitrate) {
+                    quality = `${bestFormat.audioBitrate}kbps`;
+                    qualityFound = true;
+                    if (DEBUG_AUDIO) console.log(`[metadata:ytdl-core] Calidad desde formato: ${quality} (${bestFormat.audioCodec || 'unknown codec'})`);
+                  } else if (bestFormat.audioQuality) {
+                    quality = bestFormat.audioQuality;
+                    qualityFound = true;
+                    if (DEBUG_AUDIO) console.log(`[metadata:ytdl-core] Calidad cualitativa: ${quality}`);
+                  } else if (bestFormat.itag) {
+                    // Mapear itags conocidos a calidades
+                    const itagQualityMap = {
+                      140: '128kbps', // m4a 128kbps
+                      141: '256kbps', // m4a 256kbps  
+                      171: '128kbps', // webm 128kbps
+                      249: '50kbps',  // webm opus 50kbps
+                      250: '70kbps',  // webm opus 70kbps
+                      251: '160kbps', // webm opus 160kbps
+                    };
+                    if (itagQualityMap[bestFormat.itag]) {
+                      quality = itagQualityMap[bestFormat.itag];
+                      qualityFound = true;
+                      if (DEBUG_AUDIO) console.log(`[metadata:ytdl-core] Calidad desde itag ${bestFormat.itag}: ${quality}`);
+                    }
+                  }
+                }
+              }
+              
+              if (!qualityFound) {
+                quality = "128kbps (estimado)";
+                if (DEBUG_AUDIO) console.log(`[metadata:ytdl-core] No se pudo determinar calidad, usando estimado`);
+              }
+              
+            } catch (formatErr) {
+              if (DEBUG_AUDIO) console.warn(`[metadata:ytdl-core] Error obteniendo formato:`, formatErr?.message);
+              quality = "128kbps (estimado)";
+            }
+          }
+        }
+      } catch (ytdlErr) {
+        console.warn("[metadata:ytdl-core]", ytdlErr?.message);
+        if (quality === "desconocida") {
+          quality = "128kbps (estimado)";
+        }
+      }
+    }
+
+    // Asegurar que siempre tengamos una calidad
+    if (quality === "desconocida") {
+      quality = "128kbps (estimado)";
+    }
+
+    const metadata = {
+      title,
+      duration,
+      thumbnail,
+      quality,
+      views,
+      url,
+      durationDisplay: formatDurationDisplay(duration)
+    };
+
+    // Debug: mostrar metadatos finales
+    if (DEBUG_AUDIO) {
+      console.log(`[metadata:final] URL: ${url}`);
+      console.log(`[metadata:final] Quality: ${quality}`);
+      console.log(`[metadata:final] Complete metadata:`, metadata);
+    }
+
+    // Guardar en cache
+    setCachedMetadata(url, metadata);
+    return metadata;
+
+  } catch (error) {
+    console.error("[metadata:error]", error?.message || error);
+    return {
+      title: "Error al cargar",
+      duration: 0,
+      thumbnail: null,
+      quality: "Unknown",
+      views: null,
+      url,
+      durationDisplay: "0:00"
+    };
+  }
+}
+
+// =================== SISTEMA DE PRECARGA OPTIMIZADO ===================
+async function preloadNextSong(guildId) {
+  if (!ENABLE_PRELOAD) return;
+  
+  try {
+    const q = queues.get(guildId);
+    if (!q || !q.songs || q.songs.length < 2) return;
+
+    let songsToPreload = [];
+    
+    if (q.shuffleMode && q.songs.length > 1) {
+      // Modo shuffle: precargar canciones aleatorias de las restantes
+      const remainingSongs = q.songs.slice(1);
+      const numToPreload = Math.min(PRELOAD_AHEAD, remainingSongs.length);
+      
+      // Crear una copia y seleccionar aleatoriamente
+      const shuffledRemaining = [...remainingSongs];
+      for (let i = shuffledRemaining.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffledRemaining[i], shuffledRemaining[j]] = [shuffledRemaining[j], shuffledRemaining[i]];
+      }
+      
+      songsToPreload = shuffledRemaining.slice(0, numToPreload);
+      if (DEBUG_AUDIO) console.log(`[preload] 🔀 Modo shuffle: precargando ${songsToPreload.length} canciones aleatorias`);
+    } else {
+      // Modo normal: precargar siguientes canciones en orden
+      songsToPreload = q.songs.slice(1, 1 + PRELOAD_AHEAD);
+      if (DEBUG_AUDIO) console.log(`[preload] 📝 Modo normal: precargando ${songsToPreload.length} canciones en orden`);
+    }
+    
+    for (const [index, song] of songsToPreload.entries()) {
+      const cacheKey = `${guildId}_${song.url}`;
+      
+      // Saltar si ya está precargada
+      if (PRELOAD_CACHE.has(cacheKey)) continue;
+      
+      // Limitar cantidad de precarga total por memoria
+      if (PRELOAD_CACHE.size >= MAX_PRELOAD_SIZE * 2) {
+        // Limpiar cache más viejo
+        cleanupPreloadCache();
+      }
+
+      // Precargar en paralelo con prioridad (siguiente canción = más prioridad)
+      const priority = index + 1;
+      preloadSongInBackground(guildId, song, priority);
+    }
+  } catch (error) {
+    console.warn(`[preload] Error en precarga automática:`, error?.message);
+  }
+}
+
+async function preloadSongInBackground(guildId, song, priority = 1) {
+  const cacheKey = `${guildId}_${song.url}`;
+  
+  try {
+    if (DEBUG_AUDIO) console.log(`[preload] Iniciando precarga (prioridad ${priority}): ${song.title}`);
+    
+    // Obtener metadatos primero (rápido)
+    const metadata = await getEnhancedMetadata(song.url);
+    
+    // Crear recurso con timeout ajustable
+    const q = queues.get(guildId);
+    const resource = await Promise.race([
+      createResourceFromUrl(song.url, q?.volume ?? 1.0, {
+        bassGainDb: q?.bassGainDb,
+        bassFreq: DEFAULT_BASS_FREQ,
+        bassWidth: DEFAULT_BASS_WIDTH,
+      }),
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Timeout en precarga')), YT_DOWNLOAD_TIMEOUT)
+      )
+    ]);
+
+    // Guardar en cache con información adicional
+    PRELOAD_CACHE.set(cacheKey, {
+      resource,
+      metadata,
+      timestamp: Date.now(),
+      guildId,
+      priority,
+      song
+    });
+
+    if (DEBUG_AUDIO) console.log(`[preload] ✅ Precargada: ${song.title} (${Math.floor(metadata.duration || 0)}s)`);
+
+    // Limpiar cache automáticamente (10 minutos para prioridad 1, 5 para otros)
+    const cacheTime = priority === 1 ? 600000 : 300000;
+    setTimeout(() => {
+      PRELOAD_CACHE.delete(cacheKey);
+      if (DEBUG_AUDIO) console.log(`[preload] 🗑️ Limpiada precarga expirada: ${song.title}`);
+    }, cacheTime);
+
+  } catch (error) {
+    if (DEBUG_AUDIO) console.warn(`[preload] ❌ Error precargando ${song.title}:`, error?.message);
+  }
+}
+
+function getPreloadedResource(guildId, url) {
+  const key = `${guildId}_${url}`;
+  const cached = PRELOAD_CACHE.get(key);
+  if (cached && (Date.now() - cached.timestamp < 600000)) { // 10 min TTL extendido
+    PRELOAD_CACHE.delete(key); // Usar una sola vez
+    if (DEBUG_AUDIO) console.log(`[preload] ✅ Usando recurso precargado: ${cached.song?.title || 'desconocido'}`);
+    return cached.resource;
+  }
+  return null;
+}
+
+function cleanupPreloadCache() {
+  try {
+    const now = Date.now();
+    let cleaned = 0;
+    
+    // Limpiar por antigüedad y prioridad
+    const entries = Array.from(PRELOAD_CACHE.entries());
+    
+    // Ordenar por antigüedad y prioridad (mantener prioridad 1 más tiempo)
+    entries.sort(([,a], [,b]) => {
+      if (a.priority !== b.priority) return b.priority - a.priority; // Prioridad más alta primero
+      return a.timestamp - b.timestamp; // Más viejo primero
+    });
+    
+    // Limpiar los más viejos si hay demasiados
+    while (PRELOAD_CACHE.size > MAX_PRELOAD_SIZE && entries.length > 0) {
+      const [key, data] = entries.shift();
+      const age = now - data.timestamp;
+      const maxAge = data.priority === 1 ? 600000 : 300000; // 10min vs 5min
+      
+      if (age > maxAge || PRELOAD_CACHE.size > MAX_PRELOAD_SIZE * 1.5) {
+        PRELOAD_CACHE.delete(key);
+        cleaned++;
+        if (DEBUG_AUDIO) console.log(`[preload] 🧹 Limpiada precarga antigua: ${data.song?.title || 'desconocido'}`);
+      }
+    }
+    
+    if (cleaned > 0 && DEBUG_AUDIO) {
+      console.log(`[preload] Limpiadas ${cleaned} precargas. Cache actual: ${PRELOAD_CACHE.size}`);
+    }
+    
+    return cleaned;
+  } catch (error) {
+    console.warn("[preload:cleanup:error]", error?.message);
+    return 0;
+  }
+}
+
+function cleanupMemory(guildId = null) {
+  try {
+    // Limpiar preload cache expirado
+    const now = Date.now();
+    for (const [key, data] of PRELOAD_CACHE.entries()) {
+      if (now - data.timestamp > 300000) { // 5 minutos
+        PRELOAD_CACHE.delete(key);
+      }
+    }
+
+    // Limpiar cache específico de un servidor si se especifica
+    if (guildId) {
+      for (const [key] of PRELOAD_CACHE.entries()) {
+        if (key.startsWith(guildId)) {
+          PRELOAD_CACHE.delete(key);
+        }
+      }
+    }
+
+    // Force garbage collection si está disponible
+    if (global.gc) {
+      global.gc();
+    }
+  } catch (error) {
+    console.warn("[cleanup:error]", error?.message);
+  }
+}
+
+// =================== ESTADÍSTICAS DE USUARIO ===================
+function updateUserStats(userId, guildId, action, data = {}) {
+  try {
+    const key = `${guildId}_${userId}`;
+    if (!USER_STATS.has(key)) {
+      USER_STATS.set(key, {
+        userId,
+        guildId,
+        songsPlayed: 0,
+        totalListenTime: 0,
+        favorites: [],
+        lastActivity: Date.now(),
+        sessionStart: Date.now()
+      });
+    }
+
+    const stats = USER_STATS.get(key);
+    
+    switch (action) {
+      case 'song_played':
+        stats.songsPlayed++;
+        stats.lastActivity = Date.now();
+        break;
+      case 'listen_time':
+        stats.totalListenTime += data.seconds || 0;
+        stats.lastActivity = Date.now();
+        break;
+      case 'favorite':
+        if (!stats.favorites.includes(data.url)) {
+          stats.favorites.push(data.url);
+        }
+        break;
+      case 'session_start':
+        stats.sessionStart = Date.now();
+        break;
+    }
+
+    // Limitar cantidad de usuarios en memoria
+    if (USER_STATS.size > 500) { // Límite para evitar memory leak
+      const entries = Array.from(USER_STATS.entries());
+      entries.sort((a, b) => a[1].lastActivity - b[1].lastActivity);
+      for (let i = 0; i < 100; i++) { // Eliminar los 100 menos activos
+        USER_STATS.delete(entries[i][0]);
+      }
+    }
+
+  } catch (error) {
+    console.warn("[user-stats:error]", error?.message);
+  }
+}
+
+function getUserStats(userId, guildId) {
+  const key = `${guildId}_${userId}`;
+  return USER_STATS.get(key) || {
+    songsPlayed: 0,
+    totalListenTime: 0,
+    favorites: [],
+    lastActivity: 0
+  };
+}
+
+// Limpieza automática cada 10 minutos
+setInterval(() => {
+  cleanupExpiredCache();
+  cleanupMemory();
+}, 600000);
+
+// =================== CONFIGURACIÓN SERVIDOR WEB ===================
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
+
+const WEB_PORT = Number(process.env.WEB_PORT || 3000);
+const WEB_PASSWORD = process.env.WEB_PASSWORD || "admin123";
+
+// Middleware de seguridad
+app.use(helmet({
+  contentSecurityPolicy: false, // Permitir scripts inline para Chart.js
+}));
+app.use(cors());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'web')));
+
+// Variables para estadísticas web
+let webStats = {
+  startTime: Date.now(),
+  totalCommands: 0,
+  totalSongs: 0,
+  uniqueUsers: new Set(),
+  guildStats: new Map(),
+  topSongs: new Map(),
+  recentActivity: []
+};
+
+function updateWebStats(action, data = {}) {
+  const timestamp = Date.now();
+  
+  switch (action) {
+    case 'command_used':
+      webStats.totalCommands++;
+      webStats.uniqueUsers.add(data.userId);
+      if (data.guildId) {
+        const guildStat = webStats.guildStats.get(data.guildId) || { 
+          name: data.guildName || 'Unknown', 
+          commands: 0, 
+          songs: 0 
+        };
+        guildStat.commands++;
+        webStats.guildStats.set(data.guildId, guildStat);
+      }
+      break;
+      
+    case 'song_played':
+      webStats.totalSongs++;
+      webStats.uniqueUsers.add(data.userId);
+      if (data.title) {
+        const count = webStats.topSongs.get(data.title) || 0;
+        webStats.topSongs.set(data.title, count + 1);
+      }
+      if (data.guildId) {
+        const guildStat = webStats.guildStats.get(data.guildId) || { 
+          name: data.guildName || 'Unknown', 
+          commands: 0, 
+          songs: 0 
+        };
+        guildStat.songs++;
+        webStats.guildStats.set(data.guildId, guildStat);
+      }
+      break;
+  }
+  
+  // Agregar a actividad reciente
+  webStats.recentActivity.unshift({
+    action,
+    data,
+    timestamp
+  });
+  
+  // Limitar actividad reciente a 100 elementos
+  if (webStats.recentActivity.length > 100) {
+    webStats.recentActivity = webStats.recentActivity.slice(0, 100);
+  }
+  
+  // Emitir actualización en tiempo real
+  io.emit('stats_update', getStatsForWeb());
+}
+
+function getStatsForWeb() {
+  const now = Date.now();
+  const uptime = now - webStats.startTime;
+  
+  // Top 10 canciones más reproducidas
+  const topSongsArray = Array.from(webStats.topSongs.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([title, count]) => ({ title, count }));
+    
+  // Estadísticas por servidor
+  const guildsArray = Array.from(webStats.guildStats.entries())
+    .map(([id, stats]) => ({ id, ...stats }));
+  
+  return {
+    uptime: Math.floor(uptime / 1000),
+    totalCommands: webStats.totalCommands,
+    totalSongs: webStats.totalSongs,
+    uniqueUsers: webStats.uniqueUsers.size,
+    activeConnections: [...queues.values()].filter(q => q.connection).length,
+    totalQueued: [...queues.values()].reduce((total, q) => total + (q.songs?.length || 0), 0),
+    topSongs: topSongsArray,
+    guilds: guildsArray,
+    recentActivity: webStats.recentActivity.slice(0, 20),
+    memoryUsage: process.memoryUsage(),
+    cacheStats: {
+      metadata: METADATA_CACHE.size,
+      preload: PRELOAD_CACHE.size,
+      userStats: USER_STATS.size
+    }
+  };
+}
+
+// =================== INTEGRACIÓN SPOTIFY ===================
+function isSpotifyUrl(url) {
+  return url.includes('spotify.com/') && (url.includes('/track/') || url.includes('/album/') || url.includes('/playlist/'));
+}
+
+function extractSpotifyId(url) {
+  const match = url.match(/\/track\/([a-zA-Z0-9]+)/);
+  return match ? match[1] : null;
+}
+
+async function getSpotifyTrackInfo(trackId) {
+  try {
+    // Esta función simularía el uso de la API de Spotify
+    // Por ahora, extraemos la información básica de la URL
+    console.log(`[spotify] Procesando track ID: ${trackId}`);
+    return null; // Placeholder - necesitaría implementación completa de Spotify API
+  } catch (error) {
+    console.warn('[spotify:error]', error?.message);
+    return null;
+  }
+}
+
+async function searchYouTubeForSpotifyTrack(spotifyUrl) {
+  try {
+    // Extraer información básica del URL de Spotify
+    const urlParts = spotifyUrl.split('/');
+    const trackIndex = urlParts.findIndex(part => part === 'track');
+    
+    if (trackIndex === -1) {
+      throw new Error('No es un enlace de track de Spotify');
+    }
+    
+    // Por ahora, instruir al usuario sobre cómo convertir manualmente
+    // En una implementación completa, esto usaría Spotify API + búsqueda de YouTube
+    return {
+      error: true,
+      message: "🎵 **Enlace de Spotify detectado**\n\nPor ahora, copia el nombre de la canción y artista de Spotify y búscalo manualmente en YouTube.\n\n💡 **Próximamente:** Integración automática Spotify → YouTube"
+    };
+  } catch (error) {
+    return {
+      error: true,
+      message: "❌ No se pudo procesar el enlace de Spotify"
+    };
+  }
+}
+
 // ======================
 // Cola por servidor
 // ======================
@@ -211,9 +954,35 @@ function getQueue(guildId) {
       // Avanzar cola (aleatorio si shuffleMode ON)
       if (qq.songs.length > 1 && qq.shuffleMode) {
         const rest = qq.songs.slice(1);
-        const pick = Math.floor(Math.random() * rest.length);
-        const next = rest[pick];
-        const newRest = rest.filter((_, i) => i !== pick);
+        
+        // OPTIMIZACIÓN SHUFFLE + PRECARGA: Priorizar canciones precargadas
+        let next = null;
+        const preloadedSongs = [];
+        
+        // Buscar canciones precargadas entre las restantes
+        for (const song of rest) {
+          const cacheKey = `${guildId}_${song.url}`;
+          if (PRELOAD_CACHE.has(cacheKey)) {
+            const cached = PRELOAD_CACHE.get(cacheKey);
+            if (cached && (Date.now() - cached.timestamp < 600000)) {
+              preloadedSongs.push(song);
+            }
+          }
+        }
+        
+        // Si hay canciones precargadas, usar una de ellas (aleatoria entre las precargadas)
+        if (preloadedSongs.length > 0) {
+          const pick = Math.floor(Math.random() * preloadedSongs.length);
+          next = preloadedSongs[pick];
+          if (DEBUG_AUDIO) console.log(`[shuffle] 🎯 Seleccionada canción precargada: ${next.title}`);
+        } else {
+          // No hay precargadas, seleccionar aleatoriamente como antes
+          const pick = Math.floor(Math.random() * rest.length);
+          next = rest[pick];
+          if (DEBUG_AUDIO) console.log(`[shuffle] 🎲 Seleccionada canción aleatoria: ${next.title}`);
+        }
+        
+        const newRest = rest.filter(song => song !== next);
         qq.songs = [next, ...newRest];
       } else {
         qq.songs.shift();
@@ -224,6 +993,8 @@ function getQueue(guildId) {
         const conn = getVoiceConnection(guildId);
         conn?.destroy();
         queues.delete(guildId);
+        // Limpiar memoria y cache cuando se termine la cola
+        cleanupMemory(guildId);
         clearNowPlaying(guildId).catch(() => {});
         try { stopNowPlayingTicker(guildId); } catch {}
       }
@@ -289,6 +1060,9 @@ function tryEnqueue(q, song) {
   if (!q || !song) return false;
   if ((q.songs?.length || 0) >= MAX_QUEUE_LENGTH) return false;
   q.songs.push(song);
+  
+  // 🚀 PRECARGA AUTOMÁTICA: Ahora se activa cuando la descarga actual termine (no inmediatamente)
+  
   return true;
 }
 
@@ -403,6 +1177,112 @@ async function ensureConnection(guild, voiceChannel) {
   }
 }
 
+// Función optimizada para crear recursos desde URL directa (para seek rápido)
+async function createOptimizedResourceFromDirectUrl(directUrl, startAtSec = 0, volume = 1.0, options = {}) {
+  const {
+    bassGainDb = 0,
+    bassFreq = DEFAULT_BASS_FREQ,
+    bassWidth = DEFAULT_BASS_WIDTH,
+  } = options || {};
+  
+  if (DEBUG_AUDIO) console.log(`[optimized-seek] ⚡ Creando recurso optimizado desde ${startAtSec}s`);
+  
+  const ffmpegPath = process.env.FFMPEG_PATH || require("ffmpeg-static");
+  if (!ffmpegPath) throw new Error("FFMPEG_REQUIRED");
+  
+  const opusTargetKbps = Math.max(64, Math.min(256, Number(process.env.OPUS_BITRATE || 160)));
+  const ffArgs = [
+    "-hide_banner",
+    "-loglevel", "warning",
+    "-nostdin",
+    "-reconnect", "1",
+    "-reconnect_streamed", "1", 
+    "-reconnect_delay_max", "3",
+    "-rw_timeout", "10000000", // 10s timeout
+    "-http_persistent", "0",
+    "-seekable", "1"
+  ];
+  
+  // Seek optimizado: usar input seek para máxima velocidad
+  if (startAtSec > 0) {
+    ffArgs.push("-ss", String(startAtSec));
+  }
+  
+  // Headers para evitar 403/400
+  const userAgent = process.env.YTDL_USER_AGENT || 
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+  const acceptLang = process.env.YTDL_ACCEPT_LANGUAGE || "es-ES,es;q=0.9,en;q=0.8";
+  
+  const hdrs = [`User-Agent: ${userAgent}`, `Accept-Language: ${acceptLang}`];
+  ffArgs.push("-headers", hdrs.join("\r\n") + "\r\n");
+  
+  ffArgs.push("-i", directUrl);
+  ffArgs.push("-vn", "-sn", "-dn");
+  
+  // Filtro de bajos si se configuró
+  if (bassGainDb > 0) {
+    const g = Math.max(1, Math.min(24, Math.round(bassGainDb)));
+    const f = Math.max(20, Math.min(250, Math.round(bassFreq)));
+    const w = Math.max(0.1, Math.min(5, Number(bassWidth)));
+    ffArgs.push("-af", `bass=g=${g}:f=${f}:w=${w}`);
+  }
+  
+  ffArgs.push(
+    "-ac", "2",
+    "-ar", "48000", 
+    "-c:a", "libopus",
+    "-b:a", `${opusTargetKbps}k`,
+    "-vbr", "on",
+    "-compression_level", "10",
+    "-application", "audio",
+    "-frame_duration", "20",
+    "-f", "ogg",
+    "pipe:1"
+  );
+  
+  const ff = spawn(ffmpegPath, ffArgs, { stdio: ["ignore", "pipe", "pipe"] });
+  
+  // Manejo de errores simplificado
+  const ignoreErr = (label) => (err) => {
+    if (!err) return;
+    const code = err?.code || "";
+    if (code === "EPIPE" || code === "ECONNRESET") {
+      if (DEBUG_AUDIO) console.warn(`[${label}] ${code} (ignorado)`);
+      return;
+    }
+    if (DEBUG_AUDIO) console.warn(`[${label}]`, err?.message || err);
+  };
+  
+  ff.on("error", ignoreErr("ffmpeg-opt:proc"));
+  ff.stdout.on("error", ignoreErr("ffmpeg-opt:stdout"));
+  if (ff.stderr && DEBUG_AUDIO) {
+    ff.stderr.on("data", (d) => {
+      const msg = String(d).trim();
+      if (msg && !msg.includes("time=") && !msg.includes("size=")) {
+        console.warn(`[ffmpeg-opt] ${msg}`);
+      }
+    });
+  }
+  
+  const cleanup = () => {
+    try { ff.kill("SIGKILL"); } catch {}
+  };
+  ff.stdout.on("close", cleanup);
+  ff.stdout.on("end", cleanup);
+  
+  const resource = createAudioResource(ff.stdout, { 
+    inputType: StreamType.OggOpus, 
+    inlineVolume: true 
+  });
+  
+  if (resource.volume) {
+    resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, volume)));
+  }
+  
+  if (DEBUG_AUDIO) console.log(`[optimized-seek] ✅ Recurso creado con seek a ${startAtSec}s`);
+  return resource;
+}
+
 async function createResourceFromUrl(url, volume = 1.0, options = {}) {
   const {
     preferPlayDl = false,
@@ -412,6 +1292,16 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
     bassWidth = DEFAULT_BASS_WIDTH,
   startAtSec = 0,
   } = options || {};
+  
+  // 🚀 MODO VELOCIDAD: Optimizaciones para inicio más rápido
+  const speedPriority = String(process.env.FIRST_SONG_SPEED_PRIORITY || "0") === "1";
+  const ultraFastStart = String(process.env.FAST_START_ULTRA || "0") === "1";
+  const allowFallback = String(process.env.ALLOW_FALLBACK_QUALITY || "0") === "1";
+  
+  if (speedPriority || ultraFastStart) {
+    if (DEBUG_AUDIO) console.log(`[createResourceFromUrl] 🚀 Modo velocidad activado para: ${url.substring(0, 50)}...`);
+  }
+  
   // Canonicalizar URL de YouTube para mayor compatibilidad
   url = canonicalizeYouTubeUrl(url);
   if (!url || typeof url !== "string" || !/^https?:\/\//i.test(url)) {
@@ -452,6 +1342,22 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
     const id = extractYouTubeId(url) || url;
     const forcePlayDl = String(process.env.YT_FORCE_PLAYDL || "0") === "1";
     const forceYtDlp = String(process.env.YT_FORCE_YTDLP || "0") === "1";
+    
+    // 🚀 MODO VELOCIDAD: Usar el extractor más rápido (generalmente ytdl-core)
+    if ((speedPriority || ultraFastStart) && !forceYtDlp && !needFfmpeg) {
+      if (DEBUG_AUDIO) console.log(`[createResource] ⚡ Intentando ytdl-core para máxima velocidad`);
+      try {
+        return await createResourceFromYtdlCore(id, volume, baseReqOpts);
+      } catch (e) {
+        if (DEBUG_AUDIO) console.log(`[createResource] ⚡ ytdl-core falló, fallback a yt-dlp:`, e?.message);
+        if (allowFallback) {
+          // Continúa con yt-dlp como fallback
+        } else {
+          throw e;
+        }
+      }
+    }
+    
     // Si se fuerza yt-dlp, usarlo directo
     if (forceYtDlp) {
       const hasBin = !!getYtDlpBinaryPath() || !!ytdlp;
@@ -536,14 +1442,18 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
     }
     // En caso contrario, priorizar ytdl-core (a menos que se fuerce yt-dlp)
     try {
-      if (DEBUG_AUDIO) console.log(`[createResource] usando ytdl-core getInfo`);
+      if (DEBUG_AUDIO) console.log(`[createResource] ⚡ intentando ytdl-core getInfo (modo velocidad: ${speedPriority || ultraFastStart})`);
       const info = await ytdl.getInfo(id, buildYtdlRequestOptions(id));
       const fmt = selectWebmOpusFormat(info.formats);
       if (fmt) {
-        if (DEBUG_AUDIO) console.log(`[createResource] ytdl formato webm/opus`);
+        if (DEBUG_AUDIO) console.log(`[createResource] ⚡ ytdl formato webm/opus encontrado`);
+        
+        // Actualizar calidad en metadatos con el formato real seleccionado
+        updateMetadataQuality(url, fmt);
+        
         const stream = ytdl.downloadFromInfo(info, {
           format: fmt,
-          highWaterMark: 1 << 25,
+          highWaterMark: ultraFastStart ? (1 << 20) : HIGH_WATER_MARK, // Buffer más pequeño en modo ultra rápido
           ...buildYtdlRequestOptions(info?.videoDetails?.video_url || id),
         });
         const resource = createAudioResource(stream, {
@@ -554,14 +1464,22 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
           resource.volume.setVolumeLogarithmic(
             Math.max(0, Math.min(2, volume))
           );
+        if (DEBUG_AUDIO) console.log(`[createResource] ⚡ ¡Éxito con ytdl-core WebM/Opus!`);
         return resource;
       }
       // Si no hay WebM/Opus, usar audioonly y dejar que ffmpeg demux/transcode (requiere ffmpeg-static)
-      if (DEBUG_AUDIO) console.log(`[createResource] ytdl fallback audioonly`);
+      if (DEBUG_AUDIO) console.log(`[createResource] ⚡ ytdl fallback audioonly`);
+      
+      // Obtener formato de alta calidad y actualizar metadatos
+      const fallbackFormat = ytdl.chooseFormat(info.formats, { quality: "highestaudio", filter: "audioonly" });
+      if (fallbackFormat) {
+        updateMetadataQuality(url, fallbackFormat);
+      }
+      
       const fallbackStream = ytdl.downloadFromInfo(info, {
         quality: "highestaudio",
         filter: "audioonly",
-        highWaterMark: 1 << 25,
+        highWaterMark: ultraFastStart ? (1 << 20) : (1 << 25), // Buffer más pequeño en modo ultra rápido
         ...buildYtdlRequestOptions(info?.videoDetails?.video_url || id),
       });
       const resource = createAudioResource(fallbackStream, {
@@ -574,14 +1492,21 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
     } catch (eYtdl) {
       if (DEBUG_AUDIO)
         console.warn(
-          "[createResource:ytdl:fallback]",
+          "[createResource:ytdl:fallback] ⚠️ ytdl-core falló, intentando yt-dlp:",
           eYtdl?.message || eYtdl,
           "url:",
-          url
+          url.substring(0, 50)
         );
+      // En modo velocidad, solo intentar yt-dlp si es crítico, sino fallar rápido
+      if ((speedPriority || ultraFastStart) && !allowFallback) {
+        if (DEBUG_AUDIO) console.log("[createResource] ⚡ Modo velocidad: fallando rápido sin yt-dlp");
+        throw new Error(`ytdl-core falló en modo velocidad: ${eYtdl?.message}`);
+      }
+      
       // Intentar yt-dlp si está disponible o forzado
       try {
         if (ytdlp) {
+          if (DEBUG_AUDIO) console.log("[createResource] 🔄 Fallback a yt-dlp...");
           const r = await createResourceFromYtDlp(
             url,
             volume,
@@ -925,6 +1850,54 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
 
   // Preparar encabezados y cookie para yt-dlp (no para ffmpeg)
   const args = ["--no-playlist", "-f", "bestaudio/best", "-o", "-"];
+  
+  // 🚀 OPTIMIZACIONES DE VELOCIDAD
+  if (YT_PARALLEL_DOWNLOADS > 1) {
+    args.push("--concurrent-fragments", YT_PARALLEL_DOWNLOADS.toString());
+  }
+  
+  // Timeout de socket más largo para conexiones lentas
+  args.push("--socket-timeout", Math.floor(YT_DOWNLOAD_TIMEOUT / 1000).toString());
+  
+  // Reintentos para mejor estabilidad
+  const ytRetries = process.env.YT_RETRIES || "3";
+  const retryDelay = process.env.YT_RETRY_SLEEP || "2";
+  args.push("--retries", ytRetries);
+  args.push("--fragment-retries", "5");
+  args.push("--retry-sleep", `fragment:${retryDelay}`);
+  
+  // 🛡️ CONFIGURACIONES ANTI-BLOQUEO
+  // Usar user agent personalizado si está definido
+  if (process.env.YT_USER_AGENT) {
+    args.push("--user-agent", process.env.YT_USER_AGENT);
+  }
+  
+  // 🚀 CONFIGURACIONES ANTI-SLEEP MÁS AGRESIVAS
+  const forceNoSleep = String(process.env.YT_DLP_FORCE_NO_SLEEP || "0") === "1";
+  const ignoreSleep = String(process.env.YT_DLP_IGNORE_SLEEP || "0") === "1";
+  
+  if (forceNoSleep || ignoreSleep) {
+    args.push("--sleep-interval", "0");
+    args.push("--max-sleep-interval", "0");
+    args.push("--sleep-subtitles", "0");
+    args.push("--retry-sleep", "linear:0");
+    if (DEBUG_AUDIO) console.log(`[yt-dlp] 💥 Forzando eliminación total de delays`);
+  }
+  
+  // Reducir límite de velocidad para evitar detección
+  args.push("--limit-rate", "2M");
+  
+  // Simular browser más realista
+  args.push("--add-header", "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+  args.push("--add-header", "Accept-Language:es-ES,es;q=0.9,en;q=0.8");
+  args.push("--add-header", "Sec-Fetch-Dest:document");
+  args.push("--add-header", "Sec-Fetch-Mode:navigate");
+  
+  // Cache más agresivo si está habilitado
+  if (YT_AGGRESSIVE_CACHE) {
+    args.push("--cache-dir", "./temp/yt-cache");
+  }
+  
   // Opcionales para mitigar captcha en YouTube
   const extractorArgsEnv = (process.env.YT_YTDLP_EXTRACTOR_ARGS || "").trim();
   const ytClient = (process.env.YT_YTDLP_CLIENT || "").trim().toLowerCase(); // p.ej.: android | tvhtml5 | web | ios | mweb
@@ -949,17 +1922,27 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   let effectiveClient = ytClient;
   if (!extractorArgsEnv) {
     if (!effectiveClient) {
-      effectiveClient = cookieFile ? "web" : "android";
+      // Sin cookies: usar android (más estable) 
+      // Con cookies: usar android_embedded (menos bloqueado)
+      effectiveClient = cookieFile ? "android_embedded" : "android";
     }
     if (cookieFile && effectiveClient === "android" && !strictClient) {
-      effectiveClient = "web";
+      // Sin cookies: mantener android para evitar warnings de "yt initial data"
+      // Con cookies: usar android_embedded que es más estable
+      effectiveClient = "android_embedded";
       if (DEBUG_AUDIO)
         console.log(
-          `[yt-dlp] cambiando player_client=android -> web (cookies presentes)`
+          `[yt-dlp] cambiando player_client=android -> android_embedded (cookies presentes)`
         );
     }
+    
+    // 🛡️ CONFIGURACIÓN ANTI-WARNING: Evitar "unable to extract yt initial data"
     if (effectiveClient) {
       args.push("--extractor-args", `youtube:player_client=${effectiveClient}`);
+      // Agregar configuración para evitar API fallbacks que causan warnings
+      if (effectiveClient.includes('android')) {
+        args.push("--extractor-args", "youtube:player_skip=webpage,configs");
+      }
       if (DEBUG_AUDIO)
         console.log(`[yt-dlp] usando player_client=${effectiveClient}`);
     }
@@ -1068,6 +2051,25 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
       if (headers?.userAgent) yArgs.push("--user-agent", headers.userAgent);
       if (headers?.acceptLang) yArgs.push("--add-header", `Accept-Language: ${headers.acceptLang}`);
       if (String(process.env.YT_FORCE_IPV4 || "0") === "1") yArgs.push("--force-ipv4");
+      
+      // 🚀 OPTIMIZACIONES DE VELOCIDAD PARA YT-DLP
+      const fastMode = String(process.env.YT_DLP_FAST_MODE || "0") === "1";
+      const noDlpSleep = String(process.env.YT_DLP_NO_SLEEP || "0") === "1";
+      
+      if (fastMode) {
+        // Optimizaciones para máxima velocidad
+        yArgs.push("--no-check-certificates"); // Evitar verificación SSL lenta
+        yArgs.push("--no-cache-dir"); // No guardar cache en disco (más rápido para uso inmediato)
+        yArgs.push("--geo-bypass"); // Intentar bypass geográfico
+        if (DEBUG_AUDIO) console.log(`[yt-dlp] 🚀 Modo velocidad activado`);
+      }
+      
+      if (noDlpSleep) {
+        yArgs.push("--sleep-interval", "0"); // Sin delays entre requests
+        yArgs.push("--max-sleep-interval", "0"); // Sin delays máximos
+        if (DEBUG_AUDIO) console.log(`[yt-dlp] ⚡ Delays deshabilitados`);
+      }
+      
       // Agregar --no-sleep-requests solo si la versión de yt-dlp lo soporta
       if (String(process.env.YT_NO_SLEEP_REQUESTS || "0") === "1") {
         try {
@@ -1087,6 +2089,16 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
             ...(headers?.acceptLang ? { addHeader: [`Accept-Language: ${headers.acceptLang}`] } : {}),
             ...(cookieFile2 ? { cookies: cookieFile2 } : {}),
             ...(String(process.env.YT_FORCE_IPV4 || "0") === "1" ? { forceIpv4: true } : {}),
+            // 🚀 OPTIMIZACIONES DE VELOCIDAD
+            ...(fastMode ? { 
+              noCheckCertificates: true,
+              noCacheDir: true,
+              geoBypass: true 
+            } : {}),
+            ...(noDlpSleep ? { 
+              sleepInterval: 0,
+              maxSleepInterval: 0 
+            } : {}),
             // Opción no-sleep solo si está soportada
             ...(await (async () => {
               if (String(process.env.YT_NO_SLEEP_REQUESTS || "0") !== "1") return {};
@@ -1524,13 +2536,224 @@ function getUptime() {
 function buildProgressBar(totalSec, elapsedSec, size = 20) {
   totalSec = Math.max(1, Number(totalSec) || 1);
   elapsedSec = Math.max(0, Math.min(totalSec, Number(elapsedSec) || 0));
+  
   const ratio = elapsedSec / totalSec;
   const filled = Math.max(0, Math.min(size, Math.round(ratio * size)));
   const pos = Math.max(0, Math.min(size - 1, Math.round(ratio * (size - 1))));
-  const left = "█".repeat(pos);
-  const right = "─".repeat(Math.max(0, size - pos - 1));
-  const bar = `┃${left}🔘${right}┃`;
-  return `${formatDuration(elapsedSec)} ${bar} ${formatDuration(totalSec)}`;
+  
+  // Barras más atractivas con diferentes estilos
+  const styles = {
+    modern: {
+      filled: "━",
+      empty: "─", 
+      cursor: "🔘",
+      brackets: ["┃", "┃"]
+    },
+    elegant: {
+      filled: "▰",
+      empty: "▱",
+      cursor: "🎵", 
+      brackets: ["[", "]"]
+    },
+    retro: {
+      filled: "■",
+      empty: "□",
+      cursor: "►",
+      brackets: ["┤", "├"]
+    }
+  };
+  
+  const style = styles.modern; // Puedes cambiarlo por environment variable
+  
+  const left = style.filled.repeat(pos);
+  const right = style.empty.repeat(Math.max(0, size - pos - 1));
+  const bar = `${style.brackets[0]}${left}${style.cursor}${right}${style.brackets[1]}`;
+  
+  const elapsedStr = formatDuration(elapsedSec);
+  const totalStr = formatDuration(totalSec);
+  const percentage = Math.round(ratio * 100);
+  
+  return `\`${elapsedStr}\` ${bar} \`${totalStr}\` **${percentage}%**`;
+}
+
+// Función para obtener playlist manteniendo el orden original
+async function getPlaylistItemsOrdered(playlistUrl) {
+  const results = [];
+  let playlistInfo = null;
+  
+  try {
+    // Método 1: Usar play-dl con carga completa
+    if (DEBUG_AUDIO) console.log(`[playlist] Obteniendo playlist con play-dl...`);
+    playlistInfo = await playdl.playlist_info(playlistUrl, { incomplete: false });
+    await playlistInfo.fetch();
+    
+    // Obtener videos en orden con índice preservado
+    const videos = playlistInfo.videos || [];
+    if (DEBUG_AUDIO) console.log(`[playlist] Encontrados ${videos.length} videos en play-dl`);
+    
+    for (let i = 0; i < Math.min(videos.length, MAX_PLAYLIST_ITEMS); i++) {
+      const vid = videos[i];
+      if (!vid) continue;
+      
+      const url = vid.url || vid.video_url || (vid.id ? `https://www.youtube.com/watch?v=${vid.id}` : null);
+      if (!url) continue;
+      
+      const title = vid.title || vid.name || `Video ${i + 1}`;
+      const duration = Number(vid.durationInSec || vid.durationInMs / 1000 || 0) || 0;
+      
+      results.push({
+        url: canonicalizeYouTubeUrl(url),
+        title,
+        durationSec: duration ? Math.floor(duration) : 0,
+        thumbnailUrl: deriveYouTubeThumb(url),
+        originalIndex: i // Preservar índice original
+      });
+    }
+    
+    if (results.length > 0) {
+      if (DEBUG_AUDIO) console.log(`[playlist] ✅ Obtenidos ${results.length} videos con play-dl`);
+      return { items: results, title: playlistInfo.title || "Playlist" };
+    }
+  } catch (e) {
+    if (DEBUG_AUDIO) console.warn(`[playlist] Error con play-dl:`, e?.message);
+  }
+  
+  // Método 2: Fallback con yt-dlp si play-dl falla
+  try {
+    if (DEBUG_AUDIO) console.log(`[playlist] Intentando fallback con yt-dlp...`);
+    const ytdlpPath = getYtDlpBinaryPath();
+    if (ytdlpPath) {
+      const args = [
+        '--flat-playlist',
+        '--print-json',
+        '--no-warnings',
+        `--playlist-end=${MAX_PLAYLIST_ITEMS}`,
+        playlistUrl
+      ];
+      
+      return new Promise((resolve, reject) => {
+        const proc = spawn(ytdlpPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+        let stdout = '';
+        let stderr = '';
+        
+        proc.stdout.on('data', (data) => stdout += data.toString());
+        proc.stderr.on('data', (data) => stderr += data.toString());
+        
+        proc.on('close', (code) => {
+          if (code !== 0) {
+            return reject(new Error(`yt-dlp failed: ${stderr}`));
+          }
+          
+          try {
+            const lines = stdout.trim().split('\n').filter(line => line.trim());
+            const items = [];
+            let playlistTitle = "Playlist";
+            
+            for (let i = 0; i < lines.length && i < MAX_PLAYLIST_ITEMS; i++) {
+              const line = lines[i];
+              const json = JSON.parse(line);
+              
+              if (json._type === 'playlist') {
+                playlistTitle = json.title || playlistTitle;
+                continue;
+              }
+              
+              if (json.url && json.title) {
+                items.push({
+                  url: canonicalizeYouTubeUrl(json.url),
+                  title: json.title,
+                  durationSec: json.duration ? Math.floor(json.duration) : 0,
+                  thumbnailUrl: deriveYouTubeThumb(json.url),
+                  originalIndex: i
+                });
+              }
+            }
+            
+            if (DEBUG_AUDIO) console.log(`[playlist] ✅ Fallback yt-dlp obtuvo ${items.length} videos`);
+            resolve({ items, title: playlistTitle });
+          } catch (parseError) {
+            reject(parseError);
+          }
+        });
+        
+        setTimeout(() => {
+          proc.kill('SIGKILL');
+          reject(new Error('yt-dlp timeout'));
+        }, 30000);
+      });
+    }
+  } catch (e) {
+    if (DEBUG_AUDIO) console.warn(`[playlist] Error con yt-dlp:`, e?.message);
+  }
+  
+  // Si ambos métodos fallan, devolver lo que tengamos de play-dl
+  return { 
+    items: results, 
+    title: playlistInfo?.title || "Playlist" 
+  };
+}
+
+// Función para formatear información de calidad de audio
+function formatAudioQuality(sourceQuality, showDetailed = false) {
+  const opusTargetKbps = Math.max(64, Math.min(256, Number(process.env.OPUS_BITRATE || 160)));
+  
+  if (!sourceQuality || sourceQuality === "desconocida") {
+    return showDetailed 
+      ? `No detectada (original) → ${opusTargetKbps}kbps Opus (salida)`
+      : `${opusTargetKbps}kbps Opus`;
+  }
+  
+  return showDetailed
+    ? `${sourceQuality} (original) → ${opusTargetKbps}kbps Opus (salida)`
+    : `${sourceQuality} → ${opusTargetKbps}kbps Opus`;
+}
+
+// Función para calcular el tiempo real transcurrido incluyendo seeks
+function getActualElapsedTime(q) {
+  if (!q || !q.player?.state?.resource) return 0;
+  
+  const playbackDuration = Math.floor((q.player.state.resource.playbackDuration || 0) / 1000);
+  
+  // Si hay un seek reciente, ajustar el tiempo
+  if (q._lastSeekTime !== undefined && q._lastSeekTimestamp) {
+    const timeSinceSeek = Math.floor((Date.now() - q._lastSeekTimestamp) / 1000);
+    return q._lastSeekTime + timeSinceSeek;
+  }
+  
+  // Tiempo normal sin seeks
+  return playbackDuration;
+}
+
+// Función mejorada para mostrar información detallada de la canción
+function buildEnhancedSongInfo(song, elapsed = 0) {
+  const metadata = getCachedMetadata(song.url) || {};
+  
+  let info = `🎵 **${song.title}**\n`;
+  
+  // Información adicional si está disponible
+  if (metadata.views && metadata.views > 0) {
+    const views = metadata.views > 1000000 
+      ? `${(metadata.views / 1000000).toFixed(1)}M`
+      : metadata.views > 1000 
+        ? `${(metadata.views / 1000).toFixed(0)}K` 
+        : metadata.views.toString();
+    info += `👀 ${views} visualizaciones\n`;
+  }
+  
+  if (metadata.quality) {
+    info += `🎧 Calidad: ${formatAudioQuality(metadata.quality)}\n`;
+  } else {
+    info += `🎧 Salida: ${formatAudioQuality(null)}\n`;
+  }
+  
+  // Barra de progreso si hay duración
+  if (song.durationSec && song.durationSec > 0) {
+    info += `\n${buildProgressBar(song.durationSec, elapsed)}\n`;
+  } else {
+    info += `\n🔴 **TRANSMISIÓN EN VIVO**\n`;
+  }
+  
+  return info;
 }
 
 // Render de cola (queue) para reuso en respuestas
@@ -1561,11 +2784,11 @@ async function registerSlashCommands() {
   const commands = [
     {
       name: "play",
-      description: "Reproducir por URL o playlist (YouTube)",
+      description: "Reproducir por URL o playlist (YouTube o Spotify)",
       options: [
         {
           name: "query",
-          description: "URL a reproducir (o playlist de YouTube)",
+          description: "URL a reproducir (o playlist de YouTube o Spotify)",
           type: 3, // STRING
           required: true,
         },
@@ -1606,6 +2829,7 @@ async function registerSlashCommands() {
     },
     { name: "clear", description: "Limpiar la cola (mantiene la actual)" },
     { name: "nowplaying", description: "Mostrar lo que suena" },
+    { name: "info", description: "Información técnica detallada de la canción actual" },
     { name: "stop", description: "Detener y desconectar" },
     {
       name: "volume",
@@ -1656,6 +2880,14 @@ async function registerSlashCommands() {
         },
       ],
     },
+    {
+      name: "mystats",
+      description: "Ver tus estadísticas musicales personales",
+    },
+    {
+      name: "reload",
+      description: "Recargar metadatos de la canción actual",
+    },
   ];
 
   const scope = String(process.env.COMMANDS_SCOPE || "global").toLowerCase();
@@ -1703,6 +2935,9 @@ async function registerSlashCommands() {
 client.once("clientReady", async (c) => {
   console.log(`[bot] Conectado como ${c.user?.tag || c.user?.id}`);
   try { await registerSlashCommands(); } catch {}
+  
+  // Iniciar servidor web del dashboard
+  startWebServer();
 });
 
 function canonicalizeYouTubeUrl(input) {
@@ -1796,7 +3031,9 @@ function deriveYouTubeThumb(url) {
 
 function selectWebmOpusFormat(formats, preference = "highest") {
   if (!Array.isArray(formats)) return null;
-  const candidates = formats.filter((f) => {
+  
+  // Filtrar candidatos WebM/Opus
+  let candidates = formats.filter((f) => {
     const a = (f.audioCodec || f.codecs || f.codec || "").toString();
     const container = (f.container || "").toString();
     const mime = (f.mimeType || "").toString();
@@ -1805,11 +3042,29 @@ function selectWebmOpusFormat(formats, preference = "highest") {
     const hasAudio = f.hasAudio !== false || /audio\//i.test(mime);
     return hasAudio && isWebm && isOpus && f.url;
   });
+  
+  // Si FORCE_BEST_AUDIO está activado, incluir también otros formatos de alta calidad
+  if (FORCE_BEST_AUDIO && candidates.length === 0) {
+    candidates = formats.filter((f) => {
+      const hasAudio = f.hasAudio !== false || /audio\//i.test(f.mimeType || "");
+      const hasGoodBitrate = (f.audioBitrate || 0) >= 128;
+      return hasAudio && hasGoodBitrate && f.url;
+    });
+    if (DEBUG_AUDIO) console.log(`[selectFormat] FORCE_BEST_AUDIO: encontrados ${candidates.length} formatos alternativos`);
+  }
+  
   if (candidates.length === 0) return null;
+  
+  // Ordenar por bitrate de audio
   candidates.sort((a, b) => (a.audioBitrate || 0) - (b.audioBitrate || 0));
-  return preference === "lowest"
-    ? candidates[0]
-    : candidates[candidates.length - 1];
+  
+  const selected = preference === "lowest" ? candidates[0] : candidates[candidates.length - 1];
+  
+  if (DEBUG_AUDIO) {
+    console.log(`[selectFormat] Seleccionado: ${selected.audioCodec || 'unknown codec'}, ${selected.audioBitrate || 'unknown bitrate'}kbps`);
+  }
+  
+  return selected;
 }
 
 // Construye opciones (cookies y headers) para llamadas de ytdl/miniget
@@ -1923,6 +3178,74 @@ function createFastStartResourceFromYtdlInfo(info, volume = 1.0) {
   }
 }
 
+// 🚀 SISTEMA DE PRECARGA INTELIGENTE
+// Se activa cuando la descarga actual termine, no inmediatamente
+function setupSmartPreload(resource, guildId) {
+  if (!ENABLE_PRELOAD) return;
+  
+  const q = queues.get(guildId);
+  if (!q || q.songs.length < 2) return;
+  
+  try {
+    // Detectar cuando el stream readable termina de descargar
+    let downloadComplete = false;
+    let preloadStarted = false;
+    
+    const checkDownloadStatus = () => {
+      if (preloadStarted) return;
+      
+      // Si el stream está en estado "readable" y no hay más datos llegando,
+      // o si ha pasado suficiente tiempo, consideramos la descarga completa
+      const now = Date.now();
+      const startTime = resource.playbackDuration || now;
+      const elapsedMs = now - startTime;
+      
+      // Activar precarga después de 3-5 segundos de reproducción activa
+      if (elapsedMs > 3000 && !downloadComplete) {
+        downloadComplete = true;
+        preloadStarted = true;
+        
+        if (DEBUG_AUDIO) {
+          console.log(`[smart-preload] 🚀 Activando precarga para guild ${guildId} después de ${Math.floor(elapsedMs/1000)}s`);
+        }
+        
+        // Activar precarga con un pequeño delay para no competir
+        setTimeout(() => {
+          preloadNextSong(guildId);
+        }, 1000);
+      }
+    };
+    
+    // Verificar estado cada 2 segundos
+    const checkInterval = setInterval(checkDownloadStatus, 2000);
+    
+    // Limpiar interval cuando la canción termine o cambie
+    const cleanup = () => {
+      clearInterval(checkInterval);
+    };
+    
+    // Limpiar cuando el player cambie de estado
+    q.player.once('stateChange', cleanup);
+    
+    // Backup: activar precarga máximo después de 10 segundos
+    setTimeout(() => {
+      if (!preloadStarted) {
+        preloadStarted = true;
+        if (DEBUG_AUDIO) {
+          console.log(`[smart-preload] ⏰ Activando precarga por timeout para guild ${guildId}`);
+        }
+        preloadNextSong(guildId);
+      }
+      cleanup();
+    }, 10000);
+    
+  } catch (error) {
+    if (DEBUG_AUDIO) {
+      console.error('[smart-preload] Error configurando precarga:', error.message);
+    }
+  }
+}
+
 async function playNext(guildId) {
   const q = queues.get(guildId);
   if (!q || q.songs.length === 0) return;
@@ -1936,25 +3259,56 @@ async function playNext(guildId) {
       q.upgradeTimer = null;
     }
 
-  let resource = null;
+    let resource = null;
     const fastStartEnabled = String(process.env.FAST_START || "1") === "1";
+    const ultraFastStart = String(process.env.FAST_START_ULTRA || "0") === "1";
+    
+    // 🚀 CONFIGURACIÓN DE INICIO ULTRA RÁPIDO
+    const baseDelay = ultraFastStart ? 800 : 2000; // Ultra rápido: 800ms, normal: 2000ms
     const fastDelayMs = Math.max(
-      500,
-      Math.min(8000, Number(process.env.FAST_START_MS || 2000))
+      ultraFastStart ? 300 : 500, // Mínimo más bajo para ultra rápido
+      Math.min(8000, Number(process.env.FAST_START_MS || baseDelay))
     );
+    
     const longEnough = (current.durationSec || 0) >= 60;
-  const forceYtDlp = String(process.env.YT_FORCE_YTDLP || "0") === "1";
+    const forceYtDlp = String(process.env.YT_FORCE_YTDLP || "0") === "1";
+    const speedPriority = String(process.env.FIRST_SONG_SPEED_PRIORITY || "0") === "1";
 
-  const bassActive = (Number(q.bassGainDb) || 0) > 0;
-  if (!forceYtDlp && !bassActive && current.ytdlInfo && fastStartEnabled && longEnough) {
+    const bassActive = (Number(q.bassGainDb) || 0) > 0;
+
+    // 🚀 INTENTAR USAR RECURSO PRECARGADO PRIMERO (SIEMPRE LA OPCIÓN MÁS RÁPIDA)
+    const preloadedResource = getPreloadedResource(guildId, current.url);
+    if (preloadedResource && !bassActive) {
+      console.log(`[playNext] ⚡ Usando recurso precargado para: ${current.title}`);
+      resource = preloadedResource;
+    }
+    // 🚀 MODO VELOCIDAD: Priorizar inicio rápido sobre calidad perfecta
+    else if (speedPriority || ultraFastStart) {
+      // Si hay ytdlInfo, usar fast start siempre (incluso para canciones cortas)
+      if (!forceYtDlp && !bassActive && current.ytdlInfo && fastStartEnabled) {
+        resource = createFastStartResourceFromYtdlInfo(
+          current.ytdlInfo,
+          q.volume ?? 1.0
+        ) || createResourceFromYtdlInfo(current.ytdlInfo, q.volume ?? 1.0);
+        if (DEBUG_AUDIO && resource) console.log(`[playNext] ⚡ Fast start aplicado (prioridad velocidad)`);
+      }
+      // Fallback rápido con createResourceFromUrl optimizado
+      if (!resource) {
+        if (DEBUG_AUDIO) console.log(`[playNext] ⚡ Usando createResourceFromUrl con optimización de velocidad`);
+      }
+    }
+    // Fallback al sistema original si no está en modo velocidad
+    else if (!forceYtDlp && !bassActive && current.ytdlInfo && fastStartEnabled && longEnough) {
       resource =
         createFastStartResourceFromYtdlInfo(
           current.ytdlInfo,
           q.volume ?? 1.0
         ) || createResourceFromYtdlInfo(current.ytdlInfo, q.volume ?? 1.0);
-  } else if (!forceYtDlp && !bassActive && current.ytdlInfo) {
+    } else if (!forceYtDlp && !bassActive && current.ytdlInfo) {
       resource = createResourceFromYtdlInfo(current.ytdlInfo, q.volume ?? 1.0);
     }
+    
+    // Último recurso: createResourceFromUrl
     if (!resource) {
       resource = await createResourceFromUrl(current.url, q.volume ?? 1.0, {
         forceFfmpeg: bassActive,
@@ -1965,6 +3319,24 @@ async function playNext(guildId) {
     }
 
     q.player.play(resource);
+
+    // 🚀 PRECARGA INTELIGENTE: Se activará cuando la descarga actual termine
+    setupSmartPreload(resource, guildId);
+    
+    // 📊 ACTUALIZAR ESTADÍSTICAS DE USUARIO Y WEB
+    const requestedBy = current.requestedById;
+    if (requestedBy) {
+      updateUserStats(requestedBy, guildId, 'song_played');
+      updateUserStats(requestedBy, guildId, 'session_start');
+      
+      // Estadísticas web
+      updateWebStats('song_played', {
+        userId: requestedBy,
+        guildId: guildId,
+        title: current.title,
+        url: current.url
+      });
+    }
 
     // Programar upgrade a mayor calidad si aplica
     if (current.ytdlInfo && fastStartEnabled && longEnough) {
@@ -2092,29 +3464,31 @@ function buildControlsComponents(q) {
   const volUpDisabled = vol >= 1.99;
   const canShuffle = (q.songs?.length || 0) > 2;
   const hasSong = !!s;
-  // Fila 1: transporte y loop
+  const canSeek = hasSong && s?.durationSec && s.durationSec > 30; // Solo para canciones con duración > 30s
+  
+  // Fila 1: transporte básico
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId("music_replay")
-  .setEmoji("🔄")
+      .setEmoji("🔄")
       .setLabel("Reiniciar")
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(!hasSong),
     new ButtonBuilder()
       .setCustomId(isPaused ? "music_resume" : "music_pause")
-  .setEmoji(isPaused ? "▶️" : "⏸️")
+      .setEmoji(isPaused ? "▶️" : "⏸️")
       .setLabel(isPaused ? "Reanudar" : "Pausar")
       .setStyle(ButtonStyle.Primary)
       .setDisabled(!hasSong),
     new ButtonBuilder()
       .setCustomId("music_skip")
-  .setEmoji("⏭️")
+      .setEmoji("⏭️")
       .setLabel("Siguiente")
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(!hasSong),
     new ButtonBuilder()
       .setCustomId("music_stop")
-  .setEmoji("🛑")
+      .setEmoji("🛑")
       .setLabel("Detener")
       .setStyle(ButtonStyle.Danger),
     new ButtonBuilder()
@@ -2123,8 +3497,21 @@ function buildControlsComponents(q) {
       .setLabel("Bucle")
       .setStyle(q.loop ? ButtonStyle.Success : ButtonStyle.Secondary)
   );
-  // Fila 2: volumen, shuffle, guardar y enlace
+  
+  // Fila 2: controles de navegación y volumen
   const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("music_seek_back")
+      .setEmoji("⏪")
+      .setLabel("-10s")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(!canSeek),
+    new ButtonBuilder()
+      .setCustomId("music_seek_forward")
+      .setEmoji("⏩")
+      .setLabel("+10s")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(!canSeek),
     new ButtonBuilder()
       .setCustomId("music_vol_down")
       .setEmoji("🔉")
@@ -2140,25 +3527,27 @@ function buildControlsComponents(q) {
     new ButtonBuilder()
       .setCustomId("music_shuffle")
       .setEmoji("🔀")
-  .setLabel("Aleatorio")
+      .setLabel("Aleatorio")
       .setStyle(q.shuffleMode ? ButtonStyle.Success : ButtonStyle.Secondary)
-      .setDisabled(!canShuffle),
+      .setDisabled(!canShuffle)
+  );
+  
+  // Fila 3: utilidades y enlaces
+  const row3 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId("music_save")
       .setEmoji("⭐")
       .setLabel("Guardar")
       .setStyle(ButtonStyle.Secondary)
-      .setDisabled(!hasSong)
-  );
-  // Fila 3: mostrar cola y link al tema actual (si existe)
-  const row3 = new ActionRowBuilder().addComponents(
+      .setDisabled(!hasSong),
     new ButtonBuilder()
       .setCustomId("music_queue")
-      .setEmoji("🧾")
+      .setEmoji("📜")
       .setLabel("Cola")
       .setStyle(ButtonStyle.Secondary)
       .setDisabled(!(q.songs?.length > 0))
   );
+  
   if (s?.url) {
     row3.addComponents(
       new ButtonBuilder()
@@ -2168,6 +3557,7 @@ function buildControlsComponents(q) {
         .setLabel("Abrir")
     );
   }
+  
   return [row1, row2, row3];
 }
 
@@ -2177,6 +3567,11 @@ function buildNowPlayingEmbed(q, guild) {
     (q.player?.state?.resource?.playbackDuration || 0) / 1000
   );
   const total = s?.durationSec || 0;
+  
+  // Obtener metadatos mejorados del cache
+  const metadata = getCachedMetadata(s?.url) || {};
+  const thumbnail = metadata.thumbnail || s?.thumbnailUrl;
+  
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
     .setTitle(
@@ -2186,32 +3581,94 @@ function buildNowPlayingEmbed(q, guild) {
     )
     .addFields(
       {
-        name: "Canción:",
+        name: "🎵 Canción:",
         value: s ? `[${s.title}](${s.url})` : "—",
         inline: false,
       },
       {
-        name: "Agregado por:",
+        name: "👤 Agregado por:",
         value: s?.requestedById
           ? `<@${s.requestedById}>`
           : guild?.members?.me?.toString() || "—",
         inline: true,
       },
       {
-        name: "Duración:",
-        value: total ? formatDuration(total) : "—",
+        name: "⏱️ Duración:",
+        value: total ? formatDuration(total) : "🔴 EN VIVO",
         inline: true,
       }
-    )
-    .setFooter({
-  text: `Controles debajo · Volumen: ${Math.round(
-        (q.volume ?? 1) * 100
-  )}% · Repetir: ${q.loop ? "ON" : "OFF"} · Aleatorio: ${q.shuffleMode ? "ON" : "OFF"} · Bass: ${q.bassGainDb > 0 ? `+${q.bassGainDb}dB` : "OFF"}`,
+    );
+
+  // Agregar información adicional si está disponible
+  if (metadata.quality) {
+    embed.addFields({
+      name: "🎧 Calidad:",
+      value: formatAudioQuality(metadata.quality),
+      inline: true,
     });
+  } else {
+    embed.addFields({
+      name: "🎧 Salida:",
+      value: formatAudioQuality(null),
+      inline: true,
+    });
+  }
+
+  if (metadata.views && metadata.views > 0) {
+    const views = metadata.views > 1000000 
+      ? `${(metadata.views / 1000000).toFixed(1)}M`
+      : metadata.views > 1000 
+        ? `${(metadata.views / 1000).toFixed(0)}K` 
+        : metadata.views.toString();
+    embed.addFields({
+      name: "👀 Visualizaciones:",
+      value: views,
+      inline: true,
+    });
+  }
+
+  // Cola información si hay más canciones
+  if (q.songs.length > 1) {
+    const nextSongs = q.songs.slice(1, 4).map((song, i) => 
+      `${i + 1}. ${song.title.length > 30 ? song.title.substring(0, 30) + '...' : song.title}`
+    ).join('\n');
+    
+    const remaining = q.songs.length - 1;
+    const queueText = remaining > 3 
+      ? `${nextSongs}\n... y ${remaining - 3} más canciones`
+      : nextSongs;
+    
+    embed.addFields({
+      name: `📝 Próximas en cola (${remaining})`,
+      value: queueText || "—",
+      inline: false,
+    });
+  }
+
+  embed.setFooter({
+    text: `🎛️ Controles debajo · Vol: ${Math.round((q.volume ?? 1) * 100)}% · Repetir: ${q.loop ? "🔁" : "❌"} · Aleatorio: ${q.shuffleMode ? "🔀" : "❌"} · Bass: ${q.bassGainDb > 0 ? `+${q.bassGainDb}dB` : "❌"}`,
+  });
+
   if (total) {
     embed.setDescription(buildProgressBar(total, elapsed));
+  } else {
+    embed.setDescription("🔴 **TRANSMISIÓN EN VIVO** - Sin barra de progreso");
   }
-  if (s?.thumbnailUrl) embed.setThumbnail(s.thumbnailUrl);
+
+  // Usar thumbnail de alta calidad con fallbacks
+  if (thumbnail) {
+    // Intentar obtener la mejor calidad
+    let bestThumbnail = thumbnail;
+    if (thumbnail.includes('youtube.com') || thumbnail.includes('ytimg.com')) {
+      // Para YouTube, intentar obtener maxresdefault (1280x720)
+      const videoId = s?.url?.match(/(?:v=|\/)([\w-]{11})/)?.[1];
+      if (videoId) {
+        bestThumbnail = `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`;
+      }
+    }
+    embed.setThumbnail(bestThumbnail);
+  }
+
   return embed;
 }
 
@@ -2331,6 +3788,8 @@ client.on("interactionCreate", async (interaction) => {
       "music_loop",
       "music_shuffle",
       "music_replay",
+      "music_seek_back",
+      "music_seek_forward",
       "music_vol_down",
       "music_vol_up",
       "music_save",
@@ -2413,6 +3872,82 @@ client.on("interactionCreate", async (interaction) => {
       await renderNowPlaying(guild.id).catch(() => {});
       return;
     }
+    
+    // 🚀 OPTIMIZADO: HANDLERS PARA SALTO RÁPIDO CON CACHE Y MENOS RECREACIÓN
+    if (id === "music_seek_back" || id === "music_seek_forward") {
+      const current = q.songs?.[0];
+      if (!current || !current.durationSec) return;
+      
+      const elapsed = getActualElapsedTime(q);
+      const seekAmount = id === "music_seek_forward" ? SEEK_STEP_SECONDS : -SEEK_STEP_SECONDS;
+      const newTime = Math.max(0, Math.min(current.durationSec - 5, elapsed + seekAmount));
+      
+      // Optimización: usar cache de URL directa si está disponible
+      let cachedUrl = q._directUrlCache?.get(current.url);
+      const cacheAge = q._directUrlCache?.has(current.url) ? 
+        Date.now() - (q._directUrlTimestamp?.get(current.url) || 0) : Infinity;
+      
+      // Cache válido por 10 minutos
+      if (!cachedUrl || cacheAge > 600000) {
+        if (DEBUG_AUDIO) console.log(`[seek] Obteniendo nueva URL directa para seek optimizado`);
+        try {
+          cachedUrl = await getDirectUrlFromYtDlp(current.url, {
+            userAgent: process.env.YTDL_USER_AGENT || 
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            acceptLang: process.env.YTDL_ACCEPT_LANGUAGE || "es-ES,es;q=0.9,en;q=0.8"
+          }, {
+            formats: ["bestaudio[acodec=opus]/bestaudio/best", "251", "bestaudio/best"]
+          });
+          
+          // Inicializar cache si no existe
+          if (!q._directUrlCache) q._directUrlCache = new Map();
+          if (!q._directUrlTimestamp) q._directUrlTimestamp = new Map();
+          
+          q._directUrlCache.set(current.url, cachedUrl);
+          q._directUrlTimestamp.set(current.url, Date.now());
+        } catch (e) {
+          if (DEBUG_AUDIO) console.warn(`[seek] No se pudo obtener URL directa, usando método tradicional:`, e?.message);
+          cachedUrl = null;
+        }
+      }
+      
+      try {
+        q.replacingResource = true;
+        let res;
+        
+        if (cachedUrl) {
+          // Método optimizado: crear recurso directamente desde URL con seek
+          if (DEBUG_AUDIO) console.log(`[seek] ⚡ Usando URL directa cacheada para seek a ${newTime}s`);
+          res = await createOptimizedResourceFromDirectUrl(cachedUrl, newTime, q.volume ?? 1.0, {
+            bassGainDb: q.bassGainDb,
+            bassFreq: DEFAULT_BASS_FREQ,
+            bassWidth: DEFAULT_BASS_WIDTH,
+          });
+        } else {
+          // Método tradicional como fallback
+          res = await createResourceFromUrl(current.url, q.volume ?? 1.0, {
+            forceFfmpeg: true,
+            bassGainDb: q.bassGainDb,
+            bassFreq: DEFAULT_BASS_FREQ,
+            bassWidth: DEFAULT_BASS_WIDTH,
+            startAtSec: newTime,
+          });
+        }
+        
+        q.player.play(res);
+        
+        // Actualizar tiempo de seek para mostrar en la interfaz
+        q._lastSeekTime = newTime;
+        q._lastSeekTimestamp = Date.now();
+        
+        await renderNowPlaying(guild.id).catch(() => {});
+      } catch (e) {
+        console.warn(`[seek:error]`, e?.message || e);
+        q.replacingResource = false;
+      }
+      return;
+    }
+    
     if (id === "music_queue") {
       // Responder efímero con la cola formateada
       const text = formatQueueMessage(q, 20);
@@ -2460,25 +3995,48 @@ client.on("interactionCreate", async (interaction) => {
     if (id === "music_save") {
       const s = q.songs?.[0];
       if (s) {
+        // Agregar a estadísticas de favoritos
+        updateUserStats(user.id, guild.id, 'favorite', { url: s.url });
+        
         try {
           const dm = await user.createDM();
           await dm.send({
             embeds: [
               new EmbedBuilder()
                 .setColor(0x57f287)
-                .setTitle("Guardado")
+                .setTitle("⭐ Canción Guardada")
                 .setDescription(`[${s.title}](${s.url})`)
                 .addFields(
-                  { name: "Servidor", value: guild.name, inline: true },
+                  { name: "🏠 Servidor", value: guild.name, inline: true },
                   {
-                    name: "Duración",
-                    value: s.durationSec ? formatDuration(s.durationSec) : "—",
+                    name: "⏱️ Duración",
+                    value: s.durationSec ? formatDuration(s.durationSec) : "🔴 EN VIVO",
                     inline: true,
                   }
-                ),
+                )
+                .setFooter({ 
+                  text: "💡 Usa /mystats para ver todas tus estadísticas musicales" 
+                }),
             ],
           });
-        } catch {}
+          
+          // Respuesta ephemeral confirmando la acción
+          try {
+            await interaction.reply({ 
+              content: `⭐ ¡Guardado! Te envié "${s.title}" por mensaje privado.`, 
+              flags: 1 << 6 
+            });
+          } catch {}
+          
+        } catch (dmError) {
+          // Si falla el DM, mostrar respuesta ephemeral
+          try {
+            await interaction.reply({ 
+              content: `⭐ ¡Canción agregada a tus favoritos! (No pude enviar DM)\n🎵 **${s.title}**`, 
+              flags: 1 << 6 
+            });
+          } catch {}
+        }
       }
       return;
     }
@@ -2492,9 +4050,27 @@ client.on("interactionCreate", async (interaction) => {
   }
 
   try {
+    // 📊 TRACKING DE ESTADÍSTICAS WEB
+    updateWebStats('command_used', {
+      userId: member.id,
+      guildId: guild.id,
+      guildName: guild.name,
+      command: commandName
+    });
+    
     if (commandName === "play") {
-  const query = interaction.options.getString("query", true);
-  const normalizedQuery = canonicalizeYouTubeUrl(query);
+      const query = interaction.options.getString("query", true);
+      
+      // 🎵 DETECCIÓN DE SPOTIFY
+      if (isSpotifyUrl(query)) {
+        const spotifyResult = await searchYouTubeForSpotifyTrack(query);
+        return safeRespond(interaction, {
+          content: spotifyResult.message,
+          flags: 1 << 6 // ephemeral
+        }, { edit: true });
+      }
+      
+      const normalizedQuery = canonicalizeYouTubeUrl(query);
       const ok = await safeDefer(interaction);
       if (!ok) return;
       // Playlist en /play
@@ -2530,32 +4106,43 @@ client.on("interactionCreate", async (interaction) => {
               { edit: true }
             );
           }
-          const pl = await playdl.playlist_info(normalizedQuery, { incomplete: true });
-          await pl.fetch();
-          const items = (pl.videos || []).slice(0, MAX_PLAYLIST_ITEMS);
-          if (items.length === 0)
-            return safeRespond(interaction, "❌ No pude leer la playlist.", {
+          
+          // 🎵 PROCESAMIENTO MEJORADO DE PLAYLIST CON ORDEN PRESERVADO
+          if (DEBUG_AUDIO) console.log(`[playlist] Procesando playlist: ${normalizedQuery}`);
+          const playlistData = await getPlaylistItemsOrdered(normalizedQuery);
+          
+          if (!playlistData.items || playlistData.items.length === 0) {
+            return safeRespond(interaction, "❌ No pude leer la playlist o está vacía.", {
               edit: true,
             });
+          }
+          
+          // Ordenar por índice original para asegurar el orden correcto
+          const orderedItems = playlistData.items.sort((a, b) => 
+            (a.originalIndex || 0) - (b.originalIndex || 0)
+          );
+          
           let added = 0;
-          for (const vid of items) {
-            const url =
-              vid.url ||
-              vid.video_url ||
-              (vid.id ? `https://www.youtube.com/watch?v=${vid.id}` : null);
-            if (!url) continue;
-            const title = vid.title || vid.name || url;
-            const dur =
-              Number(vid.durationInSec || vid.durationInMs / 1000 || 0) || 0;
-            if ((q.songs?.length || 0) >= MAX_QUEUE_LENGTH) break;
+          let skipped = 0;
+          
+          for (const item of orderedItems) {
+            if ((q.songs?.length || 0) >= MAX_QUEUE_LENGTH) {
+              skipped = orderedItems.length - added;
+              break;
+            }
+            
             q.songs.push({
-              url: canonicalizeYouTubeUrl(url),
-              title,
-              durationSec: dur ? Math.floor(dur) : 0,
-              thumbnailUrl: deriveYouTubeThumb(url),
+              url: item.url,
+              title: item.title,
+              durationSec: item.durationSec,
+              thumbnailUrl: item.thumbnailUrl,
               requestedById: member?.user?.id,
             });
             added++;
+          }
+          
+          if (DEBUG_AUDIO) {
+            console.log(`[playlist] ✅ Añadidas ${added} canciones en orden original`);
           }
           if (
             q.songs.length > 0 &&
@@ -2564,13 +4151,17 @@ client.on("interactionCreate", async (interaction) => {
             await playNext(guild.id);
           }
           const queueText = formatQueueMessage(q);
-          const resp = await safeRespond(
-            interaction,
-            `📚 Añadidos ${added} temas de la playlist "${
-              pl.title || ""
-            }" (máx ${MAX_PLAYLIST_ITEMS}${added < items.length ? `, truncado por límite de cola (${MAX_QUEUE_LENGTH})` : ""}).\n\nCola actual:\n${queueText}`,
-            { edit: true }
-          );
+          let responseMsg = `📚 Añadidas **${added}** canciones de la playlist "${playlistData.title}"`;
+          
+          if (skipped > 0) {
+            responseMsg += ` (${skipped} omitidas por límite de cola: ${MAX_QUEUE_LENGTH})`;
+          } else if (added < orderedItems.length) {
+            responseMsg += ` (máx ${MAX_PLAYLIST_ITEMS})`;
+          }
+          
+          responseMsg += `\n✅ **Orden original preservado**\n\nCola actual:\n${queueText}`;
+          
+          const resp = await safeRespond(interaction, responseMsg, { edit: true });
           // Asegurar un único panel
           await ensurePanel(guild.id, interaction.channelId);
           await renderNowPlaying(guild.id).catch(() => {});
@@ -2728,6 +4319,85 @@ client.on("interactionCreate", async (interaction) => {
         `Node: ${process.version}`,
       ].join("\n");
       return safeRespond(interaction, txt, { edit: true });
+    }
+
+    if (commandName === "mystats") {
+      const ok = await safeDefer(interaction);
+      if (!ok) return;
+      
+      const stats = getUserStats(member.id, guild.id);
+      const embed = new EmbedBuilder()
+        .setColor(0x5865f2)
+        .setTitle("🎵 Tus Estadísticas Musicales")
+        .setThumbnail(member.displayAvatarURL())
+        .addFields(
+          {
+            name: "🎧 Canciones reproducidas",
+            value: stats.songsPlayed.toString(),
+            inline: true
+          },
+          {
+            name: "⏱️ Tiempo total de escucha",
+            value: `${Math.floor(stats.totalListenTime / 60)} minutos`,
+            inline: true
+          },
+          {
+            name: "⭐ Canciones guardadas",
+            value: stats.favorites.length.toString(),
+            inline: true
+          }
+        )
+        .setFooter({
+          text: `Estadísticas desde tu primera actividad • ${guild.name}`,
+        });
+      
+      return safeRespond(interaction, { embeds: [embed] }, { edit: true });
+    }
+
+    if (commandName === "reload") {
+      const ok = await safeDefer(interaction);
+      if (!ok) return;
+      const q = queues.get(guild.id);
+      if (!q || q.songs.length === 0)
+        return safeRespond(interaction, "No hay nada en reproducción.", { edit: true });
+      
+      const s = q.songs[0];
+      const url = s.url;
+      
+      // Limpiar cache existente para esta canción
+      METADATA_CACHE.delete(url);
+      PRELOAD_CACHE.delete(url);
+      
+      try {
+        // Recargar metadatos
+        await safeRespond(interaction, "🔄 Recargando metadatos...", { edit: true });
+        const newMetadata = await getEnhancedMetadata(url);
+        
+        // Actualizar título si cambió
+        s.title = newMetadata.title || s.title;
+        
+        let responseText = `✅ **Metadatos recargados**\n\n`;
+        responseText += `📀 **Título:** ${s.title}\n`;
+        
+        if (newMetadata.quality) {
+          responseText += `🎧 **Calidad:** ${formatAudioQuality(newMetadata.quality)}\n`;
+        } else {
+          responseText += `🎧 **Salida:** ${formatAudioQuality(null)}\n`;
+        }
+        if (newMetadata.views) {
+          const views = newMetadata.views > 1000000 
+            ? `${(newMetadata.views / 1000000).toFixed(1)}M`
+            : newMetadata.views > 1000 
+              ? `${(newMetadata.views / 1000).toFixed(0)}K` 
+              : newMetadata.views.toString();
+          responseText += `👀 **Visualizaciones:** ${views}\n`;
+        }
+        
+        return safeRespond(interaction, responseText, { edit: true });
+      } catch (error) {
+        console.error("[reload] Error:", error);
+        return safeRespond(interaction, "❌ Error al recargar metadatos: " + (error?.message || error), { edit: true });
+      }
     }
 
     if (commandName === "shuffle") {
@@ -2951,17 +4621,127 @@ client.on("interactionCreate", async (interaction) => {
           edit: true,
         });
       const s = q.songs[0];
+      const metadata = METADATA_CACHE.get(s.url) || {};
       const elapsed = Math.floor(
         (q.player.state?.resource?.playbackDuration || 0) / 1000
       );
       const total = s.durationSec || 0;
-      const header = total
-        ? `🎶 Ahora: ${s.title} [${formatDuration(elapsed)} / ${formatDuration(
-            total
-          )}] • Vol: ${Math.round((q.volume ?? 1) * 100)}%`
-        : `🎶 Ahora: ${s.title} • Vol: ${Math.round((q.volume ?? 1) * 100)}%`;
+      
+      let header = total
+        ? `🎶 **${s.title}**\n⏱️ ${formatDuration(elapsed)} / ${formatDuration(total)} • 🔊 ${Math.round((q.volume ?? 1) * 100)}%`
+        : `🎶 **${s.title}**\n🔴 TRANSMISIÓN EN VIVO • 🔊 ${Math.round((q.volume ?? 1) * 100)}%`;
+      
+      // Agregar calidad si está disponible
+      if (metadata.quality) {
+        header += ` • 🎧 ${metadata.quality}`;
+      } else {
+        // Si no hay calidad en cache, intentar obtenerla del estado del reproductor
+        const playerResource = q.player.state?.resource;
+        if (playerResource?.metadata?.quality) {
+          header += ` • 🎧 ${playerResource.metadata.quality}`;
+        } else {
+          // Mostrar calidad estimada basada en el tipo de stream o información de la canción
+          const qualityFallback = s.quality || 'Calidad no detectada';
+          header += ` • 🎧 ${qualityFallback}`;
+        }
+      }
+      
+      // Debug: mostrar información del cache para diagnosticar
+      if (DEBUG_AUDIO) {
+        console.log(`[nowplaying:debug] URL: ${s.url}`);
+        console.log(`[nowplaying:debug] Metadata en cache:`, metadata);
+        console.log(`[nowplaying:debug] Quality:`, metadata.quality);
+      }
+      
       const bar = total ? `\n${buildProgressBar(total, elapsed)}` : "";
       return safeRespond(interaction, header + bar, { edit: true });
+    }
+
+    if (commandName === "info") {
+      const ok = await safeDefer(interaction);
+      if (!ok) return;
+      const q = queues.get(guild.id);
+      if (!q || q.songs.length === 0)
+        return safeRespond(interaction, "No hay nada en reproducción.", { edit: true });
+      
+      const s = q.songs[0];
+      const metadata = METADATA_CACHE.get(s.url) || {};
+      const elapsed = Math.floor((q.player.state?.resource?.playbackDuration || 0) / 1000);
+      
+      // Información técnica detallada
+      let techInfo = `🔧 **INFORMACIÓN TÉCNICA**\n\n`;
+      techInfo += `📀 **Título:** ${s.title}\n`;
+      techInfo += `🔗 **URL:** ${s.url}\n`;
+      
+      // Mostrar calidad con más detalle
+      if (metadata.quality) {
+        techInfo += `🎧 **Calidad:** ${formatAudioQuality(metadata.quality, true)}\n`;
+      } else {
+        // Intentar obtener del estado del reproductor o mostrar estimada
+        const playerResource = q.player.state?.resource;
+        if (playerResource?.metadata?.quality) {
+          techInfo += `🎧 **Calidad:** ${formatAudioQuality(playerResource.metadata.quality, true)}\n`;
+        } else {
+          const qualityFallback = s.quality || null;
+          techInfo += `🎧 **Calidad:** ${formatAudioQuality(qualityFallback, true)}\n`;
+        }
+      }
+      
+      if (metadata.views) {
+        const views = metadata.views > 1000000 
+          ? `${(metadata.views / 1000000).toFixed(1)}M`
+          : metadata.views > 1000 
+            ? `${(metadata.views / 1000).toFixed(0)}K` 
+            : metadata.views.toString();
+        techInfo += `👀 **Visualizaciones:** ${views}\n`;
+      }
+      if (s.durationSec) techInfo += `⏱️ **Duración:** ${formatDuration(s.durationSec)}\n`;
+      techInfo += `🔊 **Volumen actual:** ${Math.round((q.volume ?? 1) * 100)}%\n`;
+      techInfo += `⏯️ **Tiempo reproducido:** ${formatDuration(elapsed)}\n`;
+      
+      // Estado del reproductor
+      const state = q.player.state;
+      techInfo += `📊 **Estado:** ${state?.status || 'Desconocido'}\n`;
+      
+      // Cache status y precarga
+      const inCache = METADATA_CACHE.has(s.url);
+      const preloaded = PRELOAD_CACHE.has(`${guild.id}_${s.url}`);
+      
+      // Contar precargas de este servidor
+      const guildPreloads = Array.from(PRELOAD_CACHE.keys())
+        .filter(k => k.startsWith(`${guild.id}_`)).length;
+      
+      techInfo += `💾 **En cache:** ${inCache ? '✅' : '❌'}\n`;
+      techInfo += `🚀 **Precargado:** ${preloaded ? '✅' : '❌'}\n`;
+      techInfo += `📚 **Precargas activas:** ${guildPreloads}/${MAX_PRELOAD_SIZE}\n`;
+      
+      // Estado de precarga para siguientes canciones
+      if (q.songs.length > 1) {
+        const nextSongs = q.songs.slice(1, 1 + PRELOAD_AHEAD);
+        let preloadStatus = "";
+        nextSongs.forEach((song, i) => {
+          const isPreloaded = PRELOAD_CACHE.has(`${guild.id}_${song.url}`);
+          preloadStatus += `${isPreloaded ? '✅' : '⏳'} ${i + 1}. ${song.title.substring(0, 30)}...\n`;
+        });
+        if (preloadStatus) {
+          techInfo += `\n🔮 **ESTADO DE PRECARGA**\n${preloadStatus}`;
+        }
+      }
+      
+      // Configuración de velocidad y calidad del bot
+      techInfo += `\n⚙️ **CONFIGURACIÓN DE RENDIMIENTO**\n`;
+      techInfo += `🎛️ **Bitrate Opus:** ${process.env.OPUS_BITRATE || 160}kbps\n`;
+      techInfo += `🔗 **WebM/Opus directo:** ${process.env.YT_DLP_DIRECT_OPUS === '1' ? '✅' : '❌'}\n`;
+      techInfo += `⚡ **Forzar mejor calidad:** ${FORCE_BEST_AUDIO ? '✅' : '❌'}\n`;
+      techInfo += `📦 **Buffer de audio:** ${AUDIO_BUFFER_SIZE}MB\n`;
+      techInfo += `🚀 **Precarga automática:** ${ENABLE_PRELOAD ? '✅' : '❌'}\n`;
+      if (ENABLE_PRELOAD) {
+        techInfo += `📈 **Precargar adelante:** ${PRELOAD_AHEAD} canciones\n`;
+        techInfo += `🌐 **Conexiones paralelas:** ${YT_PARALLEL_DOWNLOADS}\n`;
+        techInfo += `⏱️ **Timeout descarga:** ${YT_DOWNLOAD_TIMEOUT/1000}s\n`;
+      }
+      
+      return safeRespond(interaction, techInfo, { edit: true });
     }
 
     if (commandName === "stop") {
@@ -3069,6 +4849,100 @@ function startHealthServer() {
     console.log(`[http] health server escuchando en :${port}`)
   );
 }
+
+// =================== RUTAS API Y SERVIDOR WEB ===================
+// Middleware de autenticación simple
+function requireAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || authHeader !== `Bearer ${WEB_PASSWORD}`) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+  next();
+}
+
+// Rutas API
+app.post('/api/login', (req, res) => {
+  const { password } = req.body;
+  if (password === WEB_PASSWORD) {
+    res.json({ success: true, token: WEB_PASSWORD });
+  } else {
+    res.status(401).json({ success: false, error: 'Contraseña incorrecta' });
+  }
+});
+
+app.get('/api/stats', (req, res) => {
+  res.json(getStatsForWeb());
+});
+
+app.get('/api/guilds', (req, res) => {
+  const guildsData = [];
+  for (const [guildId, guild] of client.guilds.cache) {
+    const queue = queues.get(guildId);
+    guildsData.push({
+      id: guildId,
+      name: guild.name,
+      memberCount: guild.memberCount,
+      isConnected: !!queue?.connection,
+      currentSong: queue?.songs?.[0]?.title || null,
+      queueLength: queue?.songs?.length || 0
+    });
+  }
+  res.json(guildsData);
+});
+
+app.get('/api/queue/:guildId', (req, res) => {
+  const { guildId } = req.params;
+  const queue = queues.get(guildId);
+  if (!queue) {
+    return res.status(404).json({ error: 'Servidor no encontrado o sin cola' });
+  }
+  
+  res.json({
+    guildId,
+    songs: queue.songs.map((song, index) => ({
+      position: index,
+      title: song.title,
+      url: song.url,
+      duration: song.durationSec,
+      requestedBy: song.requestedById,
+      isCurrent: index === 0
+    })),
+    isPlaying: queue.player?.state?.status === AudioPlayerStatus.Playing,
+    volume: Math.round((queue.volume || 1) * 100),
+    loop: queue.loop,
+    shuffle: queue.shuffleMode
+  });
+});
+
+// Ruta principal
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'web', 'index.html'));
+});
+
+// WebSocket para tiempo real
+io.on('connection', (socket) => {
+  console.log('[web] Cliente conectado al dashboard');
+  
+  // Enviar estadísticas iniciales
+  socket.emit('stats_update', getStatsForWeb());
+  
+  socket.on('disconnect', () => {
+    console.log('[web] Cliente desconectado del dashboard');
+  });
+});
+
+// Iniciar servidor web
+function startWebServer() {
+  try {
+    server.listen(WEB_PORT, () => {
+      console.log(`[web] 🌐 Dashboard disponible en: http://localhost:${WEB_PORT}`);
+      console.log(`[web] 🔐 Contraseña: ${WEB_PASSWORD}`);
+    });
+  } catch (error) {
+    console.error('[web] Error al iniciar servidor:', error.message);
+  }
+}
+
 startHealthServer();
 
 // Apagado limpio en plataformas que envían señales (Render)
