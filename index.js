@@ -68,6 +68,8 @@ const REQUIRE_SAME_VC = String(process.env.REQUIRE_SAME_VC || "1") === "1";
 // UI: fijar panel y respuestas efímeras por defecto
 const PIN_PANEL = String(process.env.PIN_PANEL || "1") === "1"; // fija el mensaje del panel si es posible
 const EPHEMERAL_SLASH = String(process.env.EPHEMERAL_SLASH || "1") === "1"; // hace respuestas de slash efímeras
+// Timeout de inactividad: tiempo en minutos antes de desconectarse cuando no hay música (0 = nunca desconectar)
+const IDLE_TIMEOUT_MINUTES = Math.max(0, Number(process.env.IDLE_TIMEOUT_MINUTES || 10));
 // Streaming: usar URL directa en ffmpeg (true) o pipe estable (false). Por defecto: false en Windows, true en otros.
 const FFMPEG_DIRECT_URL = (() => {
   if (process.env.FFMPEG_DIRECT_URL != null) return String(process.env.FFMPEG_DIRECT_URL) === "1";
@@ -187,6 +189,50 @@ function saveState(obj) {
   } catch {}
 }
 const guildState = loadState();
+
+// =================== SISTEMA DE TIMEOUT PARA IDLE ===================
+const idleTimeouts = new Map(); // {guildId: timeoutId} - para manejar timeouts de desconexión
+
+// Función para limpiar timeout de idle
+function clearIdleTimeout(guildId) {
+  const timeoutId = idleTimeouts.get(guildId);
+  if (timeoutId) {
+    clearTimeout(timeoutId);
+    idleTimeouts.delete(guildId);
+  }
+}
+
+// Función para configurar timeout de idle
+function setIdleTimeout(guildId) {
+  // Limpiar timeout existente
+  clearIdleTimeout(guildId);
+  
+  // Solo configurar timeout si está habilitado
+  if (IDLE_TIMEOUT_MINUTES <= 0) return;
+  
+  const timeoutMs = IDLE_TIMEOUT_MINUTES * 60 * 1000;
+  console.log(`[idle] Configurando timeout de ${IDLE_TIMEOUT_MINUTES} minutos para servidor ${guildId}`);
+  
+  const timeoutId = setTimeout(() => {
+    console.log(`[idle] Timeout de inactividad alcanzado para servidor ${guildId}, desconectando...`);
+    try {
+      const connection = getVoiceConnection(guildId);
+      if (connection) {
+        connection.destroy();
+        queues.delete(guildId);
+        cleanupMemory(guildId);
+        clearNowPlaying(guildId).catch(() => {});
+        stopNowPlayingTicker(guildId).catch(() => {});
+      }
+    } catch (error) {
+      console.error(`[idle] Error al desconectar por timeout:`, error?.message);
+    }
+    // Limpiar el timeout del mapa
+    idleTimeouts.delete(guildId);
+  }, timeoutMs);
+  
+  idleTimeouts.set(guildId, timeoutId);
+}
 
 // =================== FUNCIONES DE CACHE Y OPTIMIZACIÓN ===================
 function cleanupExpiredCache() {
@@ -941,63 +987,93 @@ function getQueue(guildId) {
     player.on(AudioPlayerStatus.Idle, () => {
       const qq = queues.get(guildId);
       if (!qq) return;
+      
       if (qq.replacingResource) {
-        // Idle disparado por un swap rápido: ignorar y limpiar flag
+        // Idle disparado por un swap rápido (seek, cambio de volumen, etc.): ignorar y limpiar flag
         qq.replacingResource = false;
+        if (DEBUG_AUDIO) console.log(`[idle] Ignorando Idle por reemplazo de recurso en guild ${guildId}`);
         return;
       }
-      // Si está en loop, vuelve a reproducir sin avanzar
-      if (qq.loop && qq.songs.length > 0) {
-        playNext(guildId).catch((e) => console.error("[playNext:error]", e));
-        return;
-      }
-      // Avanzar cola (aleatorio si shuffleMode ON)
-      if (qq.songs.length > 1 && qq.shuffleMode) {
-        const rest = qq.songs.slice(1);
+      
+      // Verificar si realmente deberíamos avanzar - añadir un pequeño delay para evitar
+      // que seeks fallidos disparen inmediatamente el avance de canción
+      setTimeout(() => {
+        const currentQueue = queues.get(guildId);
+        if (!currentQueue) return;
         
-        // OPTIMIZACIÓN SHUFFLE + PRECARGA: Priorizar canciones precargadas
-        let next = null;
-        const preloadedSongs = [];
+        // Si todavía está marcado como reemplazando recurso, no avanzar
+        if (currentQueue.replacingResource) {
+          currentQueue.replacingResource = false;
+          if (DEBUG_AUDIO) console.log(`[idle] Cancelando avance por operación de reemplazo pendiente`);
+          return;
+        }
         
-        // Buscar canciones precargadas entre las restantes
-        for (const song of rest) {
-          const cacheKey = `${guildId}_${song.url}`;
-          if (PRELOAD_CACHE.has(cacheKey)) {
-            const cached = PRELOAD_CACHE.get(cacheKey);
-            if (cached && (Date.now() - cached.timestamp < 600000)) {
-              preloadedSongs.push(song);
+        // Si está en loop, vuelve a reproducir sin avanzar
+        if (currentQueue.loop && currentQueue.songs.length > 0) {
+          playNext(guildId).catch((e) => console.error("[playNext:error]", e));
+          return;
+        }
+        
+        // Avanzar cola (aleatorio si shuffleMode ON)
+        if (currentQueue.songs.length > 1 && currentQueue.shuffleMode) {
+          const rest = currentQueue.songs.slice(1);
+          
+          // OPTIMIZACIÓN SHUFFLE + PRECARGA: Priorizar canciones precargadas
+          let next = null;
+          const preloadedSongs = [];
+          
+          // Buscar canciones precargadas entre las restantes
+          for (const song of rest) {
+            const cacheKey = `${guildId}_${song.url}`;
+            if (PRELOAD_CACHE.has(cacheKey)) {
+              const cached = PRELOAD_CACHE.get(cacheKey);
+              if (cached && (Date.now() - cached.timestamp < 600000)) {
+                preloadedSongs.push(song);
+              }
             }
           }
-        }
-        
-        // Si hay canciones precargadas, usar una de ellas (aleatoria entre las precargadas)
-        if (preloadedSongs.length > 0) {
-          const pick = Math.floor(Math.random() * preloadedSongs.length);
-          next = preloadedSongs[pick];
-          if (DEBUG_AUDIO) console.log(`[shuffle] 🎯 Seleccionada canción precargada: ${next.title}`);
+          
+          // Si hay canciones precargadas, usar una de ellas (aleatoria entre las precargadas)
+          if (preloadedSongs.length > 0) {
+            const pick = Math.floor(Math.random() * preloadedSongs.length);
+            next = preloadedSongs[pick];
+            if (DEBUG_AUDIO) console.log(`[shuffle] 🎯 Seleccionada canción precargada: ${next.title}`);
+          } else {
+            // No hay precargadas, seleccionar aleatoriamente como antes
+            const pick = Math.floor(Math.random() * rest.length);
+            next = rest[pick];
+            if (DEBUG_AUDIO) console.log(`[shuffle] 🎲 Seleccionada canción aleatoria: ${next.title}`);
+          }
+          
+          const newRest = rest.filter(song => song !== next);
+          currentQueue.songs = [next, ...newRest];
         } else {
-          // No hay precargadas, seleccionar aleatoriamente como antes
-          const pick = Math.floor(Math.random() * rest.length);
-          next = rest[pick];
-          if (DEBUG_AUDIO) console.log(`[shuffle] 🎲 Seleccionada canción aleatoria: ${next.title}`);
+          currentQueue.songs.shift();
         }
         
-        const newRest = rest.filter(song => song !== next);
-        qq.songs = [next, ...newRest];
-      } else {
-        qq.songs.shift();
-      }
-      if (qq.songs.length > 0) {
-        playNext(guildId).catch((e) => console.error("[playNext:error]", e));
-      } else {
-        const conn = getVoiceConnection(guildId);
-        conn?.destroy();
-        queues.delete(guildId);
-        // Limpiar memoria y cache cuando se termine la cola
-        cleanupMemory(guildId);
-        clearNowPlaying(guildId).catch(() => {});
-        try { stopNowPlayingTicker(guildId); } catch {}
-      }
+        if (currentQueue.songs.length > 0) {
+          // Limpiar timeout de idle si hay más canciones para reproducir
+          clearIdleTimeout(guildId);
+          playNext(guildId).catch((e) => console.error("[playNext:error]", e));
+        } else {
+          // No hay más canciones en la cola
+          if (IDLE_TIMEOUT_MINUTES > 0) {
+            console.log(`[idle] Cola vacía en servidor ${guildId}, configurando timeout de ${IDLE_TIMEOUT_MINUTES} minutos antes de desconectar`);
+            setIdleTimeout(guildId);
+            // Actualizar el panel para mostrar que está en modo idle
+            renderNowPlaying(guildId).catch(() => {});
+          } else {
+            // Comportamiento original: desconectar inmediatamente
+            const conn = getVoiceConnection(guildId);
+            conn?.destroy();
+            queues.delete(guildId);
+            // Limpiar memoria y cache cuando se termine la cola
+            cleanupMemory(guildId);
+            clearNowPlaying(guildId).catch(() => {});
+            try { stopNowPlayingTicker(guildId); } catch {}
+          }
+        }
+      }, 100); // Delay de 100ms para evitar condiciones de carrera
     });
   const initialVol = Math.max(0, Math.min(2, Number(guildState[guildId]?.volume ?? 1.0)));
     q = {
@@ -1059,6 +1135,19 @@ async function safeDefer(interaction) {
 function tryEnqueue(q, song) {
   if (!q || !song) return false;
   if ((q.songs?.length || 0) >= MAX_QUEUE_LENGTH) return false;
+  
+  // Si esta es la primera canción que se agrega (o la cola estaba vacía), 
+  // limpiar cualquier timeout de idle que pudiera estar configurado
+  if (q.songs.length === 0) {
+    // Obtener el guildId de la cola - necesitamos encontrarlo en el mapa de queues
+    for (const [guildId, queue] of queues.entries()) {
+      if (queue === q) {
+        clearIdleTimeout(guildId);
+        break;
+      }
+    }
+  }
+  
   q.songs.push(song);
   
   // 🚀 PRECARGA AUTOMÁTICA: Ahora se activa cuando la descarga actual termine (no inmediatamente)
@@ -3249,6 +3338,10 @@ function setupSmartPreload(resource, guildId) {
 async function playNext(guildId) {
   const q = queues.get(guildId);
   if (!q || q.songs.length === 0) return;
+  
+  // Limpiar timeout de idle al empezar a reproducir una nueva canción
+  clearIdleTimeout(guildId);
+  
   const current = q.songs[0];
   try {
     // cancelar cualquier upgrade pendiente de pista anterior
@@ -3563,6 +3656,46 @@ function buildControlsComponents(q) {
 
 function buildNowPlayingEmbed(q, guild) {
   const s = q.songs?.[0];
+  
+  // Si no hay canciones, verificar si estamos en modo idle
+  if (!s) {
+    // Encontrar el guildId para verificar si hay timeout de idle activo
+    let guildId = null;
+    for (const [gId, queue] of queues.entries()) {
+      if (queue === q) {
+        guildId = gId;
+        break;
+      }
+    }
+    
+    const hasIdleTimeout = guildId && idleTimeouts.has(guildId);
+    
+    const embed = new EmbedBuilder()
+      .setColor(hasIdleTimeout ? 0xffa500 : 0x808080) // Naranja si en idle, gris si parado
+      .setTitle(hasIdleTimeout ? "⏳ En espera" : "⏹️ Sin reproducción")
+      .addFields({
+        name: "🎵 Estado:",
+        value: hasIdleTimeout 
+          ? `Esperando nuevas canciones...\n⏰ Se desconectará en ${IDLE_TIMEOUT_MINUTES} minutos si no se agrega música.`
+          : "No hay canciones en la cola",
+        inline: false,
+      });
+      
+    if (hasIdleTimeout) {
+      embed.addFields({
+        name: "💡 Consejo:",
+        value: "Usa `/play` para agregar música y cancelar la desconexión automática",
+        inline: false,
+      });
+    }
+    
+    embed.setFooter({
+      text: `🎛️ Controles debajo · Vol: ${Math.round((q.volume ?? 1) * 100)}% · Repetir: ${q.loop ? "🔁" : "❌"} · Aleatorio: ${q.shuffleMode ? "🔀" : "❌"} · Bass: ${q.bassGainDb > 0 ? `+${q.bassGainDb}dB` : "❌"}`,
+    });
+    
+    return embed;
+  }
+  
   const elapsed = Math.floor(
     (q.player?.state?.resource?.playbackDuration || 0) / 1000
   );
@@ -3686,7 +3819,14 @@ async function renderNowPlaying(guildId) {
   const components = buildControlsComponents(q);
   const contentFallback = (() => {
     const s = q.songs?.[0];
-    if (!s) return "—";
+    if (!s) {
+      // Verificar si estamos en modo idle
+      const hasIdleTimeout = idleTimeouts.has(guildId);
+      if (hasIdleTimeout) {
+        return `⏳ **En espera**\n\nEsperando nuevas canciones...\n⏰ Se desconectará en ${IDLE_TIMEOUT_MINUTES} minutos si no se agrega música.`;
+      }
+      return "⏹️ **Sin reproducción**\n\nNo hay canciones en la cola";
+    }
     const elapsed = Math.floor(
       (q.player?.state?.resource?.playbackDuration || 0) / 1000
     );
@@ -3841,6 +3981,7 @@ client.on("interactionCreate", async (interaction) => {
       if (q) q.songs = [];
       connection?.destroy();
       queues.delete(guild.id);
+      clearIdleTimeout(guild.id); // Limpiar timeout de idle
       clearNowPlaying(guild.id).catch(() => {});
       stopNowPlayingTicker(guild.id);
       return;
@@ -3934,16 +4075,25 @@ client.on("interactionCreate", async (interaction) => {
           });
         }
         
-        q.player.play(res);
-        
-        // Actualizar tiempo de seek para mostrar en la interfaz
-        q._lastSeekTime = newTime;
-        q._lastSeekTimestamp = Date.now();
-        
-        await renderNowPlaying(guild.id).catch(() => {});
+        // Solo reproducir si el recurso se creó exitosamente
+        if (res && res.readable) {
+          q.player.play(res);
+          
+          // Actualizar tiempo de seek para mostrar en la interfaz
+          q._lastSeekTime = newTime;
+          q._lastSeekTimestamp = Date.now();
+          
+          await renderNowPlaying(guild.id).catch(() => {});
+        } else {
+          console.warn(`[seek:error] Recurso no válido o no legible`);
+          q.replacingResource = false;
+          return;
+        }
       } catch (e) {
         console.warn(`[seek:error]`, e?.message || e);
         q.replacingResource = false;
+        // Si hay error en el seek, no avanzar a la siguiente canción
+        return;
       }
       return;
     }
@@ -4753,6 +4903,7 @@ client.on("interactionCreate", async (interaction) => {
       if (q) q.songs = [];
       connection?.destroy();
       queues.delete(guild.id);
+      clearIdleTimeout(guild.id); // Limpiar timeout de idle
       await clearNowPlaying(guild.id).catch(() => {});
       return safeRespond(
         interaction,
@@ -4936,7 +5087,6 @@ function startWebServer() {
   try {
     server.listen(WEB_PORT, () => {
       console.log(`[web] 🌐 Dashboard disponible en: http://localhost:${WEB_PORT}`);
-      console.log(`[web] 🔐 Contraseña: ${WEB_PASSWORD}`);
     });
   } catch (error) {
     console.error('[web] Error al iniciar servidor:', error.message);
@@ -4949,6 +5099,11 @@ startHealthServer();
 function gracefulShutdown(signal) {
   console.log(`[shutdown] señal recibida: ${signal}`);
   try {
+    // Limpiar todos los timeouts de idle
+    for (const [guildId] of idleTimeouts) {
+      clearIdleTimeout(guildId);
+    }
+    // Desconectar todas las conexiones de voz
     for (const [gid] of queues) {
       try {
         getVoiceConnection(gid)?.destroy();
