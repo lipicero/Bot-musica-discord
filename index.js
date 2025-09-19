@@ -4785,9 +4785,9 @@ client.on("interactionCreate", async (interaction) => {
       const preset = String(interaction.options.getString("preset", true)).toLowerCase();
       const q = getQueue(guild.id);
       let gainDb = 0;
-      if (preset === "low") gainDb = 4;
-      else if (preset === "med") gainDb = 8;
-      else if (preset === "high") gainDb = 12;
+      if (preset === "low") gainDb = 2;
+      else if (preset === "med") gainDb = 4;
+      else if (preset === "high") gainDb = 8;
       else if (preset === "extreme") gainDb = 16;
       else gainDb = 0; // off
       q.bassGainDb = gainDb;
