@@ -43,11 +43,18 @@ function Get-NodePidsForThisBot() {
 }
 
 if (-not (Test-Path $pidFile)) {
-  # No hay PID; intentar encontrar procesos node index.js de este proyecto
   $pids = Get-NodePidsForThisBot
   if ($pids.Count -gt 0) {
     Write-Host "No hay PID registrado, pero se encontraron $($pids.Count) proceso(s) del bot. Intentando detener..." -ForegroundColor Yellow
-    try { foreach ($pid in $pids) { Stop-ByPid $pid | Out-Null } } catch {}
+    foreach ($botPid in $pids) {
+      try {
+        Stop-Process -Id $botPid -Force -ErrorAction Stop
+        Write-Host "Detenido por Stop-Process: $botPid" -ForegroundColor Green
+      } catch {
+        Write-Host "Stop-Process falló, usando taskkill para $botPid..." -ForegroundColor Yellow
+        Start-Process -FilePath "taskkill" -ArgumentList "/PID $botPid /F" -NoNewWindow -Wait -PassThru -ErrorAction SilentlyContinue
+      }
+    }
     Write-Host 'Detenido(s). (limpieza de PID no requerida)' -ForegroundColor Green
   } else {
     Write-Host 'No hay PID registrado. No parece estar corriendo.' -ForegroundColor Yellow
@@ -70,14 +77,26 @@ if (-not $stopped) {
   $pids = (Get-NodePidsForThisBot | Where-Object { $_ -ne $pid })
   if ($pids.Count -gt 0) {
     Write-Host "El PID $pid no estaba activo. Deteniendo $($pids.Count) proceso(s) coincidentes..." -ForegroundColor Yellow
-    foreach ($p in $pids) { Stop-ByPid $p | Out-Null }
+  foreach ($botPid in $pids) { Stop-ByPid $botPid | Out-Null }
   } else {
     Write-Host 'El proceso ya no existe.' -ForegroundColor Yellow
   }
 }
 
+Write-Host 'Enviando señal SIGINT al proceso del bot...' -ForegroundColor Cyan
+try {
+  Stop-Process -Id $pid -Force -ErrorAction Stop
+  Write-Host 'Señal SIGINT enviada. Esperando cierre del bot...' -ForegroundColor Green
+  Start-Sleep -Seconds 2
+} catch {
+  Write-Host 'No se pudo enviar SIGINT, intentando detener con taskkill...' -ForegroundColor Yellow
+  try {
+    Start-Process -FilePath "taskkill" -ArgumentList "/PID $pid /F" -NoNewWindow -Wait -PassThru -ErrorAction SilentlyContinue
+  } catch {}
+}
+
 # Limpiar PID file siempre
 Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
 Write-Host 'Bot detenido.' -ForegroundColor Green
- $global:LASTEXITCODE = 0
- exit 0
+$global:LASTEXITCODE = 0
+exit 0

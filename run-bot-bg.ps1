@@ -45,16 +45,15 @@ $startInfo = @{
   RedirectStandardOutput = $outLog
   RedirectStandardError = $errLog
   PassThru = $true
+  # Quitar cualquier parámetro que haga el proceso completamente independiente
 }
 $ps = Start-Process @startInfo
 
-if ($null -eq $ps) {
-  Write-Host 'No se pudo iniciar el proceso.' -ForegroundColor Red
-  exit 1
-}
-
 # Guardar PID
 Set-Content -Path $pidFile -Value $ps.Id -Encoding ascii
+
+# Esperar a que el proceso termine si se requiere (para pruebas)
+# Wait-Process -Id $ps.Id
 
 Write-Host "Bot iniciado en segundo plano. PID $($ps.Id)" -ForegroundColor Green
 Write-Host "Logs: $outLog (stdout), $errLog (stderr)"

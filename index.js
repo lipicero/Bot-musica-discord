@@ -5115,5 +5115,13 @@ function gracefulShutdown(signal) {
   } catch {}
   process.exit(0);
 }
-process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
-process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => {
+  console.log("[shutdown] SIGTERM recibido");
+  gracefulShutdown("SIGTERM");
+  setTimeout(() => process.exit(0), 500);
+});
+process.on("SIGINT", () => {
+  console.log("[shutdown] SIGINT recibido");
+  gracefulShutdown("SIGINT");
+  setTimeout(() => process.exit(0), 500);
+});
