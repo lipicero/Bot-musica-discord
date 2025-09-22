@@ -1,8 +1,8 @@
 {
   "1411902674877546518": {
-    "volume": 0.4,
-    "bassGainDb": 0,
-    "shuffleMode": false,
+    "volume": 0.10000000000000003,
+    "bassGainDb": 4,
+    "shuffleMode": true,
     "loop": false
   },
   "1345896210879484010": {

@@ -1,3 +1,15 @@
+process.on('uncaughtException', (err) => {
+  const fs = require('fs');
+  const logPath = require('path').join(__dirname, 'logs', 'bot.err.log');
+  fs.appendFileSync(logPath, `\n[uncaughtException] ${err.stack || err}`);
+  console.error('[uncaughtException]', err);
+});
+process.on('unhandledRejection', (reason, promise) => {
+  const fs = require('fs');
+  const logPath = require('path').join(__dirname, 'logs', 'bot.err.log');
+  fs.appendFileSync(logPath, `\n[unhandledRejection] ${reason}`);
+  console.error('[unhandledRejection]', reason);
+});
 process.env.YTDL_NO_UPDATE = "1"; // desactiva chequeo de updates de ytdl-core
 require("dotenv").config({ quiet: true });
 
