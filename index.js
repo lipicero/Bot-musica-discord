@@ -791,7 +791,7 @@ const io = socketIo(server, {
   }
 });
 
-const WEB_PORT = Number(process.env.WEB_PORT || 3000);
+const WEB_PORT = Number(process.env.WEB_PORT || 3001);
 const WEB_PASSWORD = process.env.WEB_PASSWORD || "admin123";
 
 // Middleware de seguridad
