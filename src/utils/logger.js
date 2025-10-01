@@ -60,17 +60,31 @@ const logger = winston.createLogger({
   ],
   // Capturar uncaughtException y unhandledRejection
   exceptionHandlers: [
+    new winston.transports.Console({
+      format: consoleFormat,
+      level: 'error'
+    }),
     new winston.transports.File({
       filename: path.join(logsDir, 'exceptions.log'),
-      format: fileFormat
+      format: fileFormat,
+      maxsize: 5242880, // 5MB
+      maxFiles: 3
     })
   ],
   rejectionHandlers: [
+    new winston.transports.Console({
+      format: consoleFormat,
+      level: 'error'
+    }),
     new winston.transports.File({
       filename: path.join(logsDir, 'rejections.log'),
-      format: fileFormat
+      format: fileFormat,
+      maxsize: 5242880, // 5MB
+      maxFiles: 3
     })
-  ]
+  ],
+  // NO salir del proceso cuando ocurran errores no capturados
+  exitOnError: false
 });
 
 // Métodos de conveniencia con contexto

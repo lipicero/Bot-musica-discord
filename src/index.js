@@ -4,34 +4,55 @@
  */
 
 // =================== MANEJADORES DE ERRORES GLOBALES ===================
-const fs = require('fs');
-const path = require('path');
+// Importar el logger de Winston primero para manejar errores de forma segura
+const logger = require('./utils/logger');
 
-// Crear directorio de logs si no existe
-const logsDir = path.join(__dirname, '..', 'logs');
-if (!fs.existsSync(logsDir)) {
-  fs.mkdirSync(logsDir, { recursive: true });
-}
-
-const logPath = path.join(logsDir, 'bot.err.log');
-
-process.on('uncaughtException', (err) => {
-  fs.appendFileSync(logPath, `\n[uncaughtException] ${new Date().toISOString()} - ${err.stack || err}`);
-  console.error('[uncaughtException]', err);
-  // NO salir del proceso para mantener el bot activo
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  fs.appendFileSync(logPath, `\n[unhandledRejection] ${new Date().toISOString()} - ${reason}`);
-  console.error('[unhandledRejection]', reason);
-  // NO salir del proceso para mantener el bot activo
-});
-
+// Manejador de advertencias del proceso
 process.on('warning', (warning) => {
   if (warning.name === 'MaxListenersExceededWarning') {
-    console.warn('[process:warning:listeners]', warning.message);
+    logger.warn('[process:warning:listeners]', { message: warning.message });
   } else {
-    console.warn('[process:warning]', warning.name, warning.message);
+    logger.warn('[process:warning]', { name: warning.name, message: warning.message });
+  }
+});
+
+// Manejador adicional para errores no capturados que Winston pueda no manejar
+// especialmente errores de streams y eventos que pueden cerrar el proceso
+process.on('uncaughtException', (error, origin) => {
+  // Si es un error de Winston intentando escribir después de cerrar, solo logear en consola
+  if (error.message && error.message.includes('write after end')) {
+    console.error('[CRITICAL] Error de logging después de cerrar stream:', error.message);
+    // NO terminar el proceso, solo continuar
+    return;
+  }
+  
+  // Para otros errores críticos, intentar logear
+  try {
+    logger.error('[CRITICAL] uncaughtException', {
+      error: error.message,
+      stack: error.stack,
+      origin: origin
+    });
+  } catch (logError) {
+    // Si falla el logger, al menos imprimir en consola
+    console.error('[CRITICAL] uncaughtException:', error);
+    console.error('Logger error:', logError);
+  }
+  
+  // NO terminar el proceso para mantener el bot activo
+  // Intentar recuperarse del error
+});
+
+// Manejador para promesas rechazadas no manejadas
+process.on('unhandledRejection', (reason, promise) => {
+  try {
+    logger.error('[CRITICAL] unhandledRejection', {
+      reason: reason instanceof Error ? reason.message : String(reason),
+      stack: reason instanceof Error ? reason.stack : undefined
+    });
+  } catch (logError) {
+    console.error('[CRITICAL] unhandledRejection:', reason);
+    console.error('Logger error:', logError);
   }
 });
 
@@ -51,7 +72,6 @@ try {
 }
 
 // =================== IMPORTAR MÓDULOS ===================
-const logger = require('./utils/logger');
 const { 
   DEBUG_AUDIO, 
   REQUIRE_SAME_VC,
@@ -229,7 +249,6 @@ client.once("clientReady", async (c) => {
 // Error handlers
 client.on("error", (error) => {
   logger.error('[client:error]', { error: error.message, stack: error.stack });
-  fs.appendFileSync(logPath, `\n[client:error] ${new Date().toISOString()} - ${error.stack || error}`);
 });
 
 client.on("warn", (info) => {
@@ -237,8 +256,7 @@ client.on("warn", (info) => {
 });
 
 client.on("shardError", (error, shardId) => {
-  logger.error(`[shard:${shardId}:error]`, { error: error.message });
-  fs.appendFileSync(logPath, `\n[shard:${shardId}:error] ${new Date().toISOString()} - ${error.stack || error}`);
+  logger.error(`[shard:${shardId}:error]`, { error: error.message, stack: error.stack });
 });
 
 client.on("shardDisconnect", (event, shardId) => {

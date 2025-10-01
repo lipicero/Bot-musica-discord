@@ -79,11 +79,24 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
     player.on('error', async (error) => {
       logger.error('[player] Error en reproducción', {
         guildId,
-        error: error.message
+        error: error.message,
+        errorName: error.name,
+        errorCode: error.code,
+        stack: error.stack
       });
       
       const qq = queues.get(guildId);
       if (!qq || !qq.songs?.length) return;
+      
+      // Detectar errores críticos de OpusScript o streams
+      const isCriticalError = 
+        error.message?.includes('offset is out of bounds') ||
+        error.message?.includes('RangeError') ||
+        error.name === 'RangeError';
+      
+      if (isCriticalError) {
+        logger.warn('[player] Error crítico detectado, intentando recuperación', { guildId });
+      }
       
       // Si es un error durante reemplazo, no avanzar
       if (qq.replacingResource) {
@@ -92,16 +105,33 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
       }
       
       // Saltar la canción que falló
-      qq.songs.shift();
+      const failedSong = qq.songs.shift();
+      if (failedSong) {
+        logger.warn('[player] Saltando canción con error', { 
+          guildId, 
+          song: failedSong.title 
+        });
+      }
       
       if (qq.songs.length > 0 && playNextFn) {
         try {
+          // Pequeña pausa antes de intentar la siguiente canción
+          if (isCriticalError) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
           await playNextFn(guildId, queues, globalContext);
         } catch (err) {
           logger.error('[player] Error en cadena después de error:', {
             guildId,
             error: err.message
           });
+          // Si falla consecutivamente, desconectar
+          try {
+            const connection = getVoiceConnection(guildId);
+            connection?.destroy();
+            queues.delete(guildId);
+            logger.warn('[player] Desconectado tras errores consecutivos', { guildId });
+          } catch {}
         }
       } else {
         // No hay más canciones, desconectar
@@ -115,7 +145,14 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
       
       // Handler personalizado si está disponible
       if (eventHandlers.onError) {
-        eventHandlers.onError(guildId, error, queues);
+        try {
+          eventHandlers.onError(guildId, error, queues);
+        } catch (handlerErr) {
+          logger.error('[player] Error en handler personalizado', {
+            guildId,
+            error: handlerErr.message
+          });
+        }
       }
     });
     

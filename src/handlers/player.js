@@ -253,9 +253,25 @@ async function playNext(guildId, queues, context = {}) {
       throw new Error('No se pudo crear recurso de audio válido');
     }
     
-    // Verificar que el recurso es válido
-    if (!resource) {
-      throw new Error('No se pudo crear recurso de audio');
+    // Agregar manejo de errores al recurso de audio
+    if (resource && resource.playStream) {
+      resource.playStream.on('error', (streamError) => {
+        logger.error('[player] Error en stream de audio', {
+          guildId,
+          error: streamError.message,
+          stack: streamError.stack
+        });
+      });
+    }
+    
+    // Agregar manejo de errores al volumen si existe
+    if (resource && resource.volume) {
+      resource.volume.on('error', (volumeError) => {
+        logger.error('[player] Error en transformador de volumen', {
+          guildId,
+          error: volumeError.message
+        });
+      });
     }
     
     // Reproducir el recurso
