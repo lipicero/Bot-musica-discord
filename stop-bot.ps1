@@ -77,22 +77,12 @@ if (-not $stopped) {
   $pids = (Get-NodePidsForThisBot | Where-Object { $_ -ne $pid })
   if ($pids.Count -gt 0) {
     Write-Host "El PID $pid no estaba activo. Deteniendo $($pids.Count) proceso(s) coincidentes..." -ForegroundColor Yellow
-  foreach ($botPid in $pids) { Stop-ByPid $botPid | Out-Null }
+    foreach ($botPid in $pids) { Stop-ByPid $botPid | Out-Null }
   } else {
     Write-Host 'El proceso ya no existe.' -ForegroundColor Yellow
   }
-}
-
-Write-Host 'Enviando señal SIGINT al proceso del bot...' -ForegroundColor Cyan
-try {
-  Stop-Process -Id $pid -Force -ErrorAction Stop
-  Write-Host 'Señal SIGINT enviada. Esperando cierre del bot...' -ForegroundColor Green
-  Start-Sleep -Seconds 2
-} catch {
-  Write-Host 'No se pudo enviar SIGINT, intentando detener con taskkill...' -ForegroundColor Yellow
-  try {
-    Start-Process -FilePath "taskkill" -ArgumentList "/PID $pid /F" -NoNewWindow -Wait -PassThru -ErrorAction SilentlyContinue
-  } catch {}
+} else {
+  Write-Host 'Bot detenido exitosamente.' -ForegroundColor Green
 }
 
 # Limpiar PID file siempre

@@ -36,26 +36,62 @@ if (Test-Path $pidFile) {
   }
 }
 
-# Iniciar node en segundo plano, ventana oculta y con redirección de logs
-$startInfo = @{
-  FilePath = 'node'
-  ArgumentList = 'index.js'
-  WorkingDirectory = $scriptDir
-  WindowStyle = 'Hidden'
-  RedirectStandardOutput = $outLog
-  RedirectStandardError = $errLog
-  PassThru = $true
-  # Quitar cualquier parámetro que haga el proceso completamente independiente
+# Iniciar node en segundo plano como proceso independiente
+# Usar cmd.exe para crear un proceso completamente desacoplado
+$nodeCmd = "node"
+$nodeArgs = "src\index.js"
+$logRedirect = ">> `"$outLog`" 2>> `"$errLog`""
+
+# Crear un script temporal para ejecutar node de forma independiente
+$tempScript = Join-Path $env:TEMP "start-discord-bot-$([guid]::NewGuid().ToString('N').Substring(0,8)).cmd"
+@"
+@echo off
+cd /d "$scriptDir"
+start /b "" "$nodeCmd" $nodeArgs >> "$outLog" 2>> "$errLog"
+"@ | Out-File -FilePath $tempScript -Encoding ascii
+
+# Ejecutar el script temporal y obtener el PID del proceso node
+$startInfo = New-Object System.Diagnostics.ProcessStartInfo
+$startInfo.FileName = "cmd.exe"
+$startInfo.Arguments = "/c `"$tempScript`""
+$startInfo.WorkingDirectory = $scriptDir
+$startInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+$startInfo.CreateNoWindow = $true
+$startInfo.UseShellExecute = $false
+
+$process = New-Object System.Diagnostics.Process
+$process.StartInfo = $startInfo
+$process.Start() | Out-Null
+$process.WaitForExit()
+
+# Esperar a que node.exe inicie y obtener su PID
+Start-Sleep -Milliseconds 1500
+
+# Buscar el proceso node más reciente para este bot
+$indexPath = Join-Path $scriptDir 'src\index.js'
+$absEsc = [Regex]::Escape($indexPath)
+$nodeProc = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+  Where-Object { $_.Name -match '(?i)^node(\.exe)?$' -and $_.CommandLine -match $absEsc } |
+  Sort-Object CreationDate -Descending |
+  Select-Object -First 1
+
+if ($null -eq $nodeProc) {
+  Write-Host "Advertencia: No se pudo obtener el PID del proceso. El bot puede estar iniciando..." -ForegroundColor Yellow
+  Write-Host "Espera unos segundos y usa status-bot.ps1 para verificar." -ForegroundColor Yellow
+  # Limpiar script temporal
+  Remove-Item $tempScript -Force -ErrorAction SilentlyContinue
+  exit 0
 }
-$ps = Start-Process @startInfo
+
+$pid = [int]$nodeProc.ProcessId
 
 # Guardar PID
-Set-Content -Path $pidFile -Value $ps.Id -Encoding ascii
+Set-Content -Path $pidFile -Value $pid -Encoding ascii
 
-# Esperar a que el proceso termine si se requiere (para pruebas)
-# Wait-Process -Id $ps.Id
+# Limpiar script temporal
+Remove-Item $tempScript -Force -ErrorAction SilentlyContinue
 
-Write-Host "Bot iniciado en segundo plano. PID $($ps.Id)" -ForegroundColor Green
+Write-Host "Bot iniciado en segundo plano. PID $pid" -ForegroundColor Green
 Write-Host "Logs: $outLog (stdout), $errLog (stderr)"
 
 # Si se solicita, mostrar logs en vivo hasta que el usuario cierre
