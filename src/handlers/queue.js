@@ -9,6 +9,7 @@ const { getVoiceConnection } = require('@discordjs/voice');
 const { MAX_QUEUE_LENGTH, DEBUG_AUDIO } = require('../config/constants');
 const { getGuildState } = require('../services/state');
 const logger = require('../utils/logger');
+const { createAudioResourceWithYtDlp } = require('../utils/yt-dlp');
 
 // =================== MAPA GLOBAL DE COLAS ===================
 const queues = new Map();
@@ -61,6 +62,11 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
         qq.replacingResource = false;
       }
       
+      // Resetear contador de errores 403 cuando una canción se reproduce exitosamente
+      if (newState?.status === AudioPlayerStatus.Playing && qq.consecutive403Errors) {
+        qq.consecutive403Errors = 0;
+      }
+      
       // Logging en modo debug
       if (DEBUG_AUDIO) {
         const os = oldState?.status;
@@ -94,8 +100,74 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
         error.message?.includes('RangeError') ||
         error.name === 'RangeError';
       
+      // Detectar error 403 de YouTube
+      const isYouTube403 = 
+        error.message?.includes('Status code: 403') ||
+        error.message?.includes('403');
+      
       if (isCriticalError) {
         logger.warn('[player] Error crítico detectado, intentando recuperación', { guildId });
+      }
+      
+      if (isYouTube403) {
+        logger.warn('[player] Error 403 de YouTube en una canción', { guildId });
+        
+        // Contador de errores 403 consecutivos
+        if (!qq.consecutive403Errors) qq.consecutive403Errors = 0;
+        qq.consecutive403Errors++;
+
+        if (qq.songs?.length) {
+          const currentSong = qq.songs[0];
+          currentSong._ytDlpAttempts = currentSong._ytDlpAttempts || 0;
+
+          if (currentSong._ytDlpAttempts < 1) {
+            currentSong._ytDlpAttempts++;
+
+            try {
+              logger.warn('[player] Error 403 persistente, reintentando con yt-dlp', { guildId });
+              const fallbackResource = await createAudioResourceWithYtDlp(currentSong.url, qq.volume || 1.0);
+              qq.replacingResource = true;
+              qq.player.play(fallbackResource);
+              qq.consecutive403Errors = 0;
+              logger.audio('[player] ▶️ Reproducción retomada con yt-dlp', { guildId });
+              return;
+            } catch (fallbackError) {
+              logger.error('[player] Fallback yt-dlp falló', {
+                guildId,
+                error: fallbackError.message
+              });
+            }
+          }
+        }
+        
+        // Solo notificar después de 3 errores 403 consecutivos
+        // (Algunos videos pueden estar bloqueados individualmente, no es problema de cookies)
+        if (qq.consecutive403Errors >= 3) {
+          logger.error('[player] Múltiples errores 403 consecutivos - Posible problema de cookies', { guildId, count: qq.consecutive403Errors });
+          
+          try {
+            if (qq.textChannelId && globalContext?.client) {
+              const channel = await globalContext.client.channels.fetch(qq.textChannelId).catch(() => null);
+              if (channel?.isTextBased?.()) {
+                await channel.send({
+                  content: '⚠️ **YouTube está bloqueando múltiples solicitudes (Error 403)**\n' +
+                    'Esto puede deberse a cookies expiradas o límites de YouTube.\n' +
+                    'Saltando a la siguiente canción...\n\n' +
+                    '💡 **Solución**: El administrador debe actualizar las cookies de YouTube.\n' +
+                    'Ver documentación: `SOLUCION-DEFINITIVA-403.md`'
+                }).catch(() => {});
+              }
+            }
+          } catch (notifyError) {
+            logger.debug('[player] No se pudo notificar errores 403', { guildId });
+          }
+          
+          // Resetear contador después de notificar
+          qq.consecutive403Errors = 0;
+        }
+      } else {
+        // Si no es error 403, resetear contador
+        if (qq.consecutive403Errors) qq.consecutive403Errors = 0;
       }
       
       // Si es un error durante reemplazo, no avanzar

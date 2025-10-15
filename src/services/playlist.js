@@ -3,6 +3,7 @@
  * @description Servicio para obtener y procesar playlists de YouTube
  */
 
+const fs = require('fs');
 const playdl = require('play-dl');
 const { spawn } = require('child_process');
 const logger = require('../utils/logger');
@@ -15,6 +16,11 @@ const { MAX_PLAYLIST_ITEMS, DEBUG_AUDIO } = require('../config/constants');
  */
 function getYtDlpBinaryPath() {
   try {
+    const manualPath = resolveManualYtDlpPath();
+    if (manualPath) {
+      return manualPath;
+    }
+
     const { spawnSync } = require('child_process');
     
     // Intentar yt-dlp
@@ -35,6 +41,35 @@ function getYtDlpBinaryPath() {
   } catch {
     return null;
   }
+}
+
+function resolveManualYtDlpPath() {
+  const candidates = [
+    process.env.YT_DLP_PATH,
+    process.env.YTDLP_PATH,
+    process.env.YTDLP_EXECUTABLE,
+    process.env.YTDLP_BINARY
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    const trimmed = candidate.trim().replace(/^"|"$/g, '').replace(/^'|'$/g, '');
+    if (!trimmed) continue;
+
+    const resolved = fs.existsSync(trimmed) ? trimmed : null;
+    if (resolved) {
+      if (process.platform === 'win32') {
+        return resolved;
+      }
+      return resolved;
+    }
+
+    // Si no existe físicamente, devolver el valor para que el spawn intente resolverlo
+    if (trimmed) {
+      return trimmed;
+    }
+  }
+
+  return null;
 }
 
 /**

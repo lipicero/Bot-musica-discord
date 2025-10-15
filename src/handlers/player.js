@@ -16,6 +16,7 @@ const {
   selectWebmOpusFormat, 
   getStreamType 
 } = require('../utils/ytdl-helpers');
+const { createAudioResourceWithYtDlp } = require('../utils/yt-dlp');
 
 /**
  * Crea un recurso de audio desde ytdlInfo
@@ -68,6 +69,7 @@ async function playNext(guildId, queues, context = {}) {
   }
   
   const current = q.songs[0];
+  current._ytDlpAttempts = 0;
   logger.audio(`Iniciando reproducción: ${current.title}`, { guildId });
   
   try {
@@ -155,7 +157,7 @@ async function playNext(guildId, queues, context = {}) {
           });
           
           // Usar la misma lógica que el código antiguo que funciona
-          const requestOptions = buildYtdlRequestOptions(current.url);
+          const requestOptions = await buildYtdlRequestOptions(current.url);
           const info = await ytdl.getInfo(current.url, requestOptions);
           
           // Intentar primero con formato WebM/Opus (mejor calidad, sin re-encode)
@@ -167,6 +169,7 @@ async function playNext(guildId, queues, context = {}) {
             const stream = ytdl.downloadFromInfo(info, {
               format: webmFormat,
               highWaterMark: 1 << 25, // 32MB buffer
+              dlChunkSize: 0,
               ...requestOptions
             });
             
@@ -182,6 +185,7 @@ async function playNext(guildId, queues, context = {}) {
               quality: 'highestaudio',
               filter: 'audioonly',
               highWaterMark: 1 << 25,
+              dlChunkSize: 0,
               ...requestOptions
             });
             
@@ -231,18 +235,27 @@ async function playNext(guildId, queues, context = {}) {
               throw new Error(`play-dl validación falló: ${validateResult}`);
             }
           } catch (playdlError) {
-            logger.error('[player] Todos los métodos fallaron', {
-              guildId,
-              ytdlError: ytdlError.message,
-              playdlError: playdlError.message
-            });
-            
-            throw new Error(
-              `No se pudo obtener el stream. ` +
-              `Considera configurar cookies de YouTube. ` +
-              `ytdl-core: ${ytdlError.message}, ` +
-              `play-dl: ${playdlError.message}`
-            );
+            try {
+              logger.audio('[player] Intentando fallback final con yt-dlp', { guildId });
+              resource = await createAudioResourceWithYtDlp(current.url, q.volume || 1.0);
+              current.source = 'yt-dlp';
+              logger.audio('[player] ✓ Recurso creado con yt-dlp', { guildId });
+            } catch (ytdlpError) {
+              logger.error('[player] Todos los métodos fallaron', {
+                guildId,
+                ytdlError: ytdlError.message,
+                playdlError: playdlError.message,
+                ytdlpError: ytdlpError.message
+              });
+              
+              throw new Error(
+                `No se pudo obtener el stream. ` +
+                `Considera configurar cookies de YouTube. ` +
+                `ytdl-core: ${ytdlError.message}, ` +
+                `play-dl: ${playdlError.message}, ` +
+                `yt-dlp: ${ytdlpError.message}`
+              );
+            }
           }
         }
       }

@@ -5,22 +5,84 @@
 
 const { StreamType } = require('@discordjs/voice');
 
+// Cache de tokens Po para evitar regenerarlos constantemente
+let poTokenCache = null;
+let visitorDataCache = null;
+let tokenCacheTime = 0;
+const TOKEN_CACHE_DURATION = 30 * 60 * 1000; // 30 minutos
+
+/**
+ * Genera tokens Po y VISITOR_DATA para bypass de protección de YouTube
+ * @returns {Promise<{poToken: string, visitorData: string}>}
+ */
+async function generatePoToken() {
+  // Usar cache si es reciente
+  if (poTokenCache && visitorDataCache && (Date.now() - tokenCacheTime) < TOKEN_CACHE_DURATION) {
+    return { poToken: poTokenCache, visitorData: visitorDataCache };
+  }
+
+  try {
+    const { generate } = require('youtube-po-token-generator');
+    const result = await generate();
+    
+    poTokenCache = result.poToken;
+    visitorDataCache = result.visitorData;
+    tokenCacheTime = Date.now();
+    
+    const logger = require('./logger');
+    logger.debug('[ytdl] ✓ Tokens Po generados', { 
+      poToken: poTokenCache.substring(0, 20) + '...', 
+      visitorData: visitorDataCache 
+    });
+    
+    return { poToken: poTokenCache, visitorData: visitorDataCache };
+  } catch (error) {
+    const logger = require('./logger');
+    logger.warn('[ytdl] No se pudieron generar tokens Po', { error: error.message });
+    return { poToken: null, visitorData: null };
+  }
+}
+
 /**
  * Construye opciones de request para ytdl con cookies y headers
  * @param {string} videoIdOrUrl - ID o URL del video
- * @returns {object} - Opciones de request
+ * @returns {Promise<object>} - Opciones de request
  */
-function buildYtdlRequestOptions(videoIdOrUrl) {
+async function buildYtdlRequestOptions(videoIdOrUrl) {
+  const fs = require('fs');
+  const path = require('path');
+  
   // Intentar obtener cookies de múltiples fuentes
   let ytCookie = null;
   
   // 1. Variables de entorno directas (formato header)
   ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
   
-  // 2. Archivo de cookies (formato Netscape - cookies.txt)
+  // 2. Archivo cookies.json (formato preferido para ytdl-core)
+  if (!ytCookie) {
+    try {
+      const cookieJsonPath = path.join(process.cwd(), 'cookies.json');
+      if (fs.existsSync(cookieJsonPath)) {
+        const cookiesArray = JSON.parse(fs.readFileSync(cookieJsonPath, 'utf8'));
+        // Convertir array de cookies a formato header
+        ytCookie = cookiesArray
+          .map(cookie => `${cookie.name}=${cookie.value}`)
+          .join('; ');
+        
+        // Log para depuración (solo mostrar primeras cookies)
+        const logger = require('./logger');
+        const cookieNames = cookiesArray.map(c => c.name).join(', ');
+        logger.debug('[ytdl] Cookies cargadas desde JSON', { count: cookiesArray.length, names: cookieNames });
+      }
+    } catch (error) {
+      const logger = require('./logger');
+      logger.error('[ytdl] Error cargando cookies.json', { error: error.message });
+    }
+  }
+  
+  // 3. Archivo de cookies (formato Netscape - cookies.txt) como fallback
   if (!ytCookie && process.env.YOUTUBE_COOKIES) {
     try {
-      const fs = require('fs');
       const cookiePath = process.env.YOUTUBE_COOKIES;
       if (fs.existsSync(cookiePath)) {
         const cookieContent = fs.readFileSync(cookiePath, 'utf8');
@@ -88,7 +150,20 @@ function buildYtdlRequestOptions(videoIdOrUrl) {
     headers.referer = `https://www.youtube.com/watch?v=${videoIdOrUrl}`;
   }
 
-  return { requestOptions: { headers } };
+  // Generar tokens Po para bypass de protección
+  const { poToken, visitorData } = await generatePoToken();
+  
+  const options = { 
+    requestOptions: { headers } 
+  };
+  
+  // Agregar tokens Po si están disponibles
+  if (poToken && visitorData) {
+    options.poToken = poToken;
+    options.visitorData = visitorData;
+  }
+
+  return options;
 }
 
 /**
