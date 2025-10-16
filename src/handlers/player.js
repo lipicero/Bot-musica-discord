@@ -361,9 +361,23 @@ async function playNext(guildId, queues, context = {}) {
       });
     }
     
+    // IMPORTANTE: Establecer flag ANTES de reproducir para evitar saltos automáticos
+    // Este flag previene que el evento Idle avance la cola si el recurso termina prematuramente
+    q.replacingResource = true;
+    
     // Reproducir el recurso
     q.player.play(resource);
     logger.audio(`▶️ Reproduciendo: ${current.title}`, { guildId });
+    
+    // Limpiar el flag después de que el reproductor confirme que está reproduciendo
+    // Esperamos un poco más de tiempo para asegurar que el stream está estable
+    setTimeout(() => {
+      const currentQ = queues.get(guildId);
+      if (currentQ && currentQ.player?.state?.status === AudioPlayerStatus.Playing) {
+        currentQ.replacingResource = false;
+        logger.debug('[player] Flag replacingResource limpiado - reproducción confirmada', { guildId });
+      }
+    }, 2000); // 2 segundos para dar tiempo al stream de estabilizarse
     
     // Iniciar/actualizar panel Now Playing
     try {

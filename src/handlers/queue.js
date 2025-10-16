@@ -233,14 +233,15 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
       const qq = queues.get(guildId);
       if (!qq) return;
       
-      // Si está reemplazando recurso (seek, cambio de volumen), ignorar
+      // Si está reemplazando recurso (seek, cambio de volumen, o nueva canción iniciando), ignorar
       if (qq.replacingResource) {
         qq.replacingResource = false;
         logger.debug('[player] Ignorando Idle por reemplazo de recurso', { guildId });
         return;
       }
       
-      // Delay para evitar condiciones de carrera con seeks
+      // Delay más largo para evitar condiciones de carrera con seeks y cambios de recurso
+      // Algunas canciones pueden disparar Idle prematuramente si el stream es inestable
       setTimeout(() => {
         const currentQueue = queues.get(guildId);
         if (!currentQueue) return;
@@ -251,6 +252,55 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
           logger.debug('[player] Cancelando avance por operación pendiente', { guildId });
           return;
         }
+        
+        // Verificar si el reproductor realmente está en Idle
+        // A veces puede haber falsos positivos
+        if (currentQueue.player?.state?.status !== AudioPlayerStatus.Idle) {
+          logger.debug('[player] Cancelando avance - el reproductor ya no está en Idle', { 
+            guildId, 
+            status: currentQueue.player?.state?.status 
+          });
+          return;
+        }
+        
+        // Verificar duración de reproducción para evitar saltos prematuros
+        const playbackDuration = currentQueue.player?.state?.resource?.playbackDuration || 0;
+        const playedSeconds = Math.floor(playbackDuration / 1000);
+        const currentSong = currentQueue.songs[0];
+        
+        // Si la canción tiene duración conocida y solo se reprodujo una pequeña parte, es sospechoso
+        if (currentSong && currentSong.durationSec && playedSeconds < 5 && currentSong.durationSec > 30) {
+          logger.warn('[player] ⚠️ Idle detectado muy pronto - posible error en el stream', {
+            guildId,
+            playedSeconds,
+            expectedDuration: currentSong.durationSec,
+            title: currentSong.title
+          });
+          
+          // No avanzar automáticamente si parece un error
+          // En su lugar, intentar reproducir la misma canción nuevamente
+          if (playNextFn && currentQueue.songs.length > 0) {
+            logger.audio('[player] Reintentando reproducción de la canción actual', { guildId });
+            playNextFn(guildId, queues, globalContext).catch(err => {
+              logger.error('[player] Error en reintento de reproducción:', {
+                guildId,
+                error: err.message
+              });
+              // Si el reintento falla, entonces sí avanzar
+              currentQueue.songs.shift();
+              if (currentQueue.songs.length > 0 && playNextFn) {
+                playNextFn(guildId, queues, globalContext).catch(() => {});
+              }
+            });
+          }
+          return;
+        }
+        
+        logger.audio('[player] ✓ Canción completada', { 
+          guildId, 
+          title: currentSong?.title,
+          playedSeconds 
+        });
         
         // Si está en loop, reproducir de nuevo sin avanzar
         if (currentQueue.loop && currentQueue.songs.length > 0) {
@@ -327,7 +377,7 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
             });
           }
         }
-      }, 100); // Delay de 100ms
+      }, 500); // Delay de 500ms (aumentado desde 100ms)
       
       // Handler personalizado si está disponible
       if (eventHandlers.onIdle) {
