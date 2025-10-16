@@ -234,10 +234,48 @@ async function createAudioResourceWithYtDlp(url, volume = 1.0) {
     source: 'yt-dlp',
     abr: normalized.abr || null
   };
+  
+  // Agregar información del video para metadata
+  resource.videoInfo = info;
 
   return resource;
 }
 
+/**
+ * Obtiene metadatos de un video usando yt-dlp
+ * @param {string} url - URL del video
+ * @returns {Promise<object|null>} - Información del video o null
+ */
+async function getVideoInfoWithYtDlp(url) {
+  try {
+    const info = await execYtDlpJson(url);
+    if (!info) return null;
+    
+    // Extraer información relevante
+    return {
+      title: info.title || 'Video sin título',
+      author: info.uploader || info.channel || 'Canal desconocido',
+      duration: info.duration || 0,
+      thumbnail: info.thumbnail || info.thumbnails?.[0]?.url || null,
+      url: url,
+      videoId: info.id || null,
+      isLive: info.is_live || false,
+      viewCount: info.view_count || 0,
+      uploadDate: info.upload_date || null,
+      description: info.description || null,
+      // Información de audio
+      abr: info.abr || null,
+      acodec: info.acodec || null,
+      ext: info.ext || null
+    };
+  } catch (error) {
+    logger.warn('[yt-dlp] Error obteniendo info del video', { error: error.message });
+    return null;
+  }
+}
+
 module.exports = {
-  createAudioResourceWithYtDlp
+  createAudioResourceWithYtDlp,
+  getVideoInfoWithYtDlp,
+  execYtDlpJson
 };

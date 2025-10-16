@@ -90,62 +90,115 @@ async function playNext(guildId, queues, context = {}) {
     
     // Si no hay precargado, crear recurso nuevo
     if (!resource) {
-      // ESTRATEGIA: Usar play-dl primero (más confiable sin cookies), luego ytdl-core
-      try {
-        logger.audio('[player] Usando play-dl', { guildId });
-        
-        const playdl = require('play-dl');
-        
-        // Canonicalizar URL para play-dl (convertir music.youtube.com, youtu.be, shorts a formato estándar)
-        let playableUrl = current.url;
+      // ESTRATEGIA MEJORADA: 
+      // 1. Verificar si YT_FORCE_YTDLP está activo
+      // 2. Si está activo, usar yt-dlp primero (más confiable para restricciones de edad)
+      // 3. Si falla, usar play-dl, luego ytdl-core como fallbacks
+      
+      const forceYtDlp = process.env.YT_FORCE_YTDLP === '1' || process.env.YT_FORCE_YTDLP === 'true';
+      
+      if (forceYtDlp) {
+        // MÉTODO PRINCIPAL: yt-dlp (más robusto, funciona con restricciones de edad)
         try {
-          const u = new URL(current.url);
-          // YouTube Music -> YouTube estándar
-          if (/(^|\.)music\.youtube\.com$/i.test(u.hostname)) {
-            const v = u.searchParams.get('v');
-            if (v) playableUrl = `https://www.youtube.com/watch?v=${v}`;
+          logger.audio('[player] Usando yt-dlp (método principal)', { guildId });
+          resource = await createAudioResourceWithYtDlp(current.url, q.volume || 1.0);
+          current.source = 'yt-dlp';
+          
+          // Si el recurso tiene videoInfo, actualizar la metadata de la canción
+          if (resource.videoInfo) {
+            const info = resource.videoInfo;
+            if (!current.title || current.title.includes('Video ')) {
+              current.title = info.title || current.title;
+            }
+            if (!current.author || current.author === 'Canal desconocido') {
+              current.author = info.uploader || info.channel || current.author;
+            }
+            if (!current.durationSec && info.duration) {
+              current.durationSec = info.duration;
+              current.duration = Math.floor(info.duration);
+            }
+            if (!current.thumbnail && info.thumbnail) {
+              current.thumbnail = info.thumbnail;
+              current.thumbnailUrl = info.thumbnail; // Para compatibilidad con el panel
+            }
+            current.isLive = info.is_live || false;
+            
+            logger.debug('[player] Metadata actualizada desde yt-dlp', {
+              guildId,
+              title: current.title,
+              duration: current.durationSec,
+              thumbnail: current.thumbnailUrl ? 'Sí' : 'No'
+            });
           }
-          // youtu.be -> youtube.com/watch
-          if (/^youtu\.be$/i.test(u.hostname)) {
-            const id = u.pathname.replace(/^\//, '').split(/[/?&]/)[0];
-            if (id) playableUrl = `https://www.youtube.com/watch?v=${id}`;
-          }
-          // YouTube shorts -> watch
-          if (/youtube\.com$/i.test(u.hostname) && u.pathname.startsWith('/shorts/')) {
-            const id = u.pathname.split('/')[2];
-            if (id) playableUrl = `https://www.youtube.com/watch?v=${id}`;
-          }
-        } catch (urlError) {
-          // Si falla el parsing, usar URL original
+          
+          logger.audio('[player] ✓ Recurso creado con yt-dlp', { guildId });
+        } catch (ytdlpError) {
+          logger.warn('[player] yt-dlp falló, intentando play-dl', {
+            guildId,
+            error: ytdlpError.message
+          });
+          // Continuar a play-dl como fallback
         }
-        
-        logger.debug('[player] URL canonicalizada', { guildId, original: current.url, playable: playableUrl });
-        
-        const info = await playdl.video_info(playableUrl);
-        const stream = await playdl.stream_from_info(info, {
-          discordPlayerCompatibility: true
-        });
-        
-        const inputType = typeof stream.type === 'number' ? stream.type : StreamType.WebmOpus;
-        
-        resource = createAudioResource(stream.stream, {
-          inputType,
-          inlineVolume: true
-        });
-        
-        if (resource.volume) {
-          resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, q.volume || 1.0)));
+      }
+      
+      // Si yt-dlp no está forzado o falló, intentar play-dl
+      if (!resource) {
+        try {
+          logger.audio('[player] Usando play-dl', { guildId });
+          
+          const playdl = require('play-dl');
+          
+          // Canonicalizar URL para play-dl (convertir music.youtube.com, youtu.be, shorts a formato estándar)
+          let playableUrl = current.url;
+          try {
+            const u = new URL(current.url);
+            // YouTube Music -> YouTube estándar
+            if (/(^|\.)music\.youtube\.com$/i.test(u.hostname)) {
+              const v = u.searchParams.get('v');
+              if (v) playableUrl = `https://www.youtube.com/watch?v=${v}`;
+            }
+            // youtu.be -> youtube.com/watch
+            if (/^youtu\.be$/i.test(u.hostname)) {
+              const id = u.pathname.replace(/^\//, '').split(/[/?&]/)[0];
+              if (id) playableUrl = `https://www.youtube.com/watch?v=${id}`;
+            }
+            // YouTube shorts -> watch
+            if (/youtube\.com$/i.test(u.hostname) && u.pathname.startsWith('/shorts/')) {
+              const id = u.pathname.split('/')[2];
+              if (id) playableUrl = `https://www.youtube.com/watch?v=${id}`;
+            }
+          } catch (urlError) {
+            // Si falla el parsing, usar URL original
+          }
+          
+          logger.debug('[player] URL canonicalizada', { guildId, original: current.url, playable: playableUrl });
+          
+          const info = await playdl.video_info(playableUrl);
+          const stream = await playdl.stream_from_info(info, {
+            discordPlayerCompatibility: true
+          });
+          
+          const inputType = typeof stream.type === 'number' ? stream.type : StreamType.WebmOpus;
+          
+          resource = createAudioResource(stream.stream, {
+            inputType,
+            inlineVolume: true
+          });
+          
+          if (resource.volume) {
+            resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, q.volume || 1.0)));
+          }
+          
+          logger.audio('[player] ✓ Recurso creado con play-dl', { guildId });
+          
+        } catch (playdlError) {
+          logger.error('[player] Error con play-dl, intentando ytdl-core', {
+            guildId,
+            error: playdlError.message
+          });
+          
+          // Fallback a ytdl-core
         }
-        
-        logger.audio('[player] ✓ Recurso creado con play-dl', { guildId });
-        
-      } catch (playdlError) {
-        logger.error('[player] Error con play-dl, intentando ytdl-core', {
-          guildId,
-          error: playdlError.message
-        });
-        
-        // Fallback a ytdl-core
       }
       
       // Si no se usó yt-dlp o falló, usar ytdl-core
@@ -239,6 +292,27 @@ async function playNext(guildId, queues, context = {}) {
               logger.audio('[player] Intentando fallback final con yt-dlp', { guildId });
               resource = await createAudioResourceWithYtDlp(current.url, q.volume || 1.0);
               current.source = 'yt-dlp';
+              
+              // Actualizar metadata si está disponible
+              if (resource.videoInfo) {
+                const info = resource.videoInfo;
+                if (!current.title || current.title.includes('Video ')) {
+                  current.title = info.title || current.title;
+                }
+                if (!current.author || current.author === 'Canal desconocido') {
+                  current.author = info.uploader || info.channel || current.author;
+                }
+                if (!current.durationSec && info.duration) {
+                  current.durationSec = info.duration;
+                  current.duration = Math.floor(info.duration);
+                }
+                if (!current.thumbnail && info.thumbnail) {
+                  current.thumbnail = info.thumbnail;
+                  current.thumbnailUrl = info.thumbnail; // Para compatibilidad con el panel
+                }
+                current.isLive = info.is_live || false;
+              }
+              
               logger.audio('[player] ✓ Recurso creado con yt-dlp', { guildId });
             } catch (ytdlpError) {
               logger.error('[player] Todos los métodos fallaron', {

@@ -1,26 +1,56 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
 
 $pidFile = Join-Path $scriptDir 'bot.pid'
 
-function Stop-ByPid([int]$Pid) {
+# Colores para mensajes
+$COLOR_SUCCESS = @{ ForegroundColor = 'Green' }
+$COLOR_WARNING = @{ ForegroundColor = 'Yellow' }
+$COLOR_ERROR = @{ ForegroundColor = 'Red' }
+$COLOR_INFO = @{ ForegroundColor = 'Cyan' }
+
+function Write-Status {
+  param([string]$Message, [string]$Type = 'INFO')
+  $symbol = switch ($Type) {
+    'SUCCESS' { '[OK]'; $color = $COLOR_SUCCESS }
+    'ERROR' { '[ERROR]'; $color = $COLOR_ERROR }
+    'WARNING' { '[WARN]'; $color = $COLOR_WARNING }
+    default { '[INFO]'; $color = $COLOR_INFO }
+  }
+  Write-Host "$symbol $Message" @color
+}
+
+function Stop-ByPid([int]$ProcessId) {
   try {
-    $p = Get-Process -Id $Pid -ErrorAction SilentlyContinue
+    $p = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
     if ($null -eq $p) {
       return $false
     }
-    Write-Host "Deteniendo PID $Pid..."
+    Write-Status "Deteniendo proceso PID $ProcessId..." "INFO"
     try {
-      Stop-Process -Id $Pid -Force -ErrorAction Stop
+      Stop-Process -Id $ProcessId -Force -ErrorAction Stop
+      Start-Sleep -Milliseconds 300
+      # Verificar que realmente se detuvo
+      $p = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+      if ($null -eq $p) {
+        Write-Status "Proceso $ProcessId detenido correctamente" "SUCCESS"
+        return $true
+      }
     } catch {
-      # Intento alternativo con taskkill sin propagar código de salida
+      # Intento alternativo con taskkill
+      Write-Status "Usando taskkill como alternativa..." "WARNING"
       try {
-        $tk = Start-Process -FilePath "taskkill" -ArgumentList "/PID $Pid /F" -NoNewWindow -Wait -PassThru -ErrorAction SilentlyContinue
-        # ignorar $tk.ExitCode
+        $result = Start-Process -FilePath "taskkill" -ArgumentList "/PID $ProcessId /F /T" -NoNewWindow -Wait -PassThru -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 300
+        $p = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if ($null -eq $p) {
+          Write-Status "Proceso $ProcessId detenido con taskkill" "SUCCESS"
+          return $true
+        }
       } catch {}
     }
-    return $true
+    return $false
   } catch {
     return $false
   }
@@ -28,65 +58,98 @@ function Stop-ByPid([int]$Pid) {
 
 function Get-NodePidsForThisBot() {
   try {
-    $indexPath = Join-Path $scriptDir 'index.js'
+    $indexPath = Join-Path $scriptDir 'src\index.js'
     $absEsc = [Regex]::Escape($indexPath)
-    # También detectar inicio manual con ruta relativa: "node index.js"
-    $relPattern = '(?i)(^|[ \t' + '"' + "'" + '])index\.js([ \t' + '"' + "'" + ']|$)'
+    # Detectar inicio con ruta absoluta, relativa con src\, o solo index.js
     $procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
       Where-Object {
         $_.Name -match '(?i)^node(\.exe)?$' -and (
-          ($_.CommandLine -match $absEsc) -or ($_.CommandLine -match $relPattern)
+          ($_.CommandLine -match $absEsc) -or
+          ($_.CommandLine -match 'src\\index\.js') -or
+          ($_.CommandLine -match 'src/index\.js')
         )
       }
     return @($procs | ForEach-Object { [int]$_.ProcessId })
-  } catch { @() }
+  } catch { 
+    return @() 
+  }
 }
 
+Write-Host ""
+Write-Host "=======================================" -ForegroundColor Cyan
+Write-Host "    DETENIENDO BOT DE DISCORD" -ForegroundColor Cyan
+Write-Host "=======================================" -ForegroundColor Cyan
+Write-Host ""
+
 if (-not (Test-Path $pidFile)) {
+  Write-Status "No hay archivo PID registrado" "WARNING"
   $pids = Get-NodePidsForThisBot
   if ($pids.Count -gt 0) {
-    Write-Host "No hay PID registrado, pero se encontraron $($pids.Count) proceso(s) del bot. Intentando detener..." -ForegroundColor Yellow
+    Write-Status "Se encontraron $($pids.Count) proceso(s) del bot ejecutandose" "INFO"
+    $stopped = 0
     foreach ($botPid in $pids) {
-      try {
-        Stop-Process -Id $botPid -Force -ErrorAction Stop
-        Write-Host "Detenido por Stop-Process: $botPid" -ForegroundColor Green
-      } catch {
-        Write-Host "Stop-Process falló, usando taskkill para $botPid..." -ForegroundColor Yellow
-        Start-Process -FilePath "taskkill" -ArgumentList "/PID $botPid /F" -NoNewWindow -Wait -PassThru -ErrorAction SilentlyContinue
+      if (Stop-ByPid $botPid) {
+        $stopped++
       }
     }
-    Write-Host 'Detenido(s). (limpieza de PID no requerida)' -ForegroundColor Green
+    Write-Host ""
+    if ($stopped -gt 0) {
+      Write-Status "Se detuvieron $stopped proceso(s)" "SUCCESS"
+    } else {
+      Write-Status "No se pudo detener ningun proceso" "ERROR"
+    }
   } else {
-    Write-Host 'No hay PID registrado. No parece estar corriendo.' -ForegroundColor Yellow
+    Write-Status "El bot no parece estar ejecutandose" "INFO"
   }
   $global:LASTEXITCODE = 0
+  Write-Host ""
   exit 0
 }
 
 try {
   $pid = [int](Get-Content $pidFile -ErrorAction Stop)
+  Write-Status "PID registrado: $pid" "INFO"
 } catch {
-  Write-Host 'PID inválido en bot.pid. Limpiando archivo.' -ForegroundColor Yellow
+  Write-Status "PID invalido en bot.pid. Limpiando archivo." "WARNING"
   Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+  Write-Host ""
   exit 0
 }
 
 $stopped = Stop-ByPid $pid
+
 if (-not $stopped) {
+  Write-Status "El proceso registrado (PID $pid) no esta activo" "WARNING"
   # Fallback: buscar por command line index.js en este proyecto
   $pids = (Get-NodePidsForThisBot | Where-Object { $_ -ne $pid })
   if ($pids.Count -gt 0) {
-    Write-Host "El PID $pid no estaba activo. Deteniendo $($pids.Count) proceso(s) coincidentes..." -ForegroundColor Yellow
-    foreach ($botPid in $pids) { Stop-ByPid $botPid | Out-Null }
+    Write-Status "Buscando otros procesos del bot..." "INFO"
+    $altStopped = 0
+    foreach ($botPid in $pids) { 
+      if (Stop-ByPid $botPid) {
+        $altStopped++
+      }
+    }
+    if ($altStopped -gt 0) {
+      Write-Status "Se detuvieron $altStopped proceso(s) adicionales" "SUCCESS"
+    }
   } else {
-    Write-Host 'El proceso ya no existe.' -ForegroundColor Yellow
+    Write-Status "No se encontraron otros procesos del bot" "INFO"
   }
-} else {
-  Write-Host 'Bot detenido exitosamente.' -ForegroundColor Green
 }
 
 # Limpiar PID file siempre
-Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
-Write-Host 'Bot detenido.' -ForegroundColor Green
+if (Test-Path $pidFile) {
+  Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+  Write-Status "Archivo PID limpiado" "SUCCESS"
+}
+
+Write-Host ""
+Write-Host "=======================================" -ForegroundColor Green
+Write-Host "    BOT DETENIDO" -ForegroundColor Green
+Write-Host "=======================================" -ForegroundColor Green
+Write-Host ""
+
 $global:LASTEXITCODE = 0
 exit 0
+
