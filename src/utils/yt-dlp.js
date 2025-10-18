@@ -180,6 +180,11 @@ function requestStream(streamUrl, headers) {
       const isHttps = urlObj.protocol === 'https:';
       const lib = isHttps ? https : http;
 
+      logger.debug('[yt-dlp] Solicitando stream', {
+        hostname: urlObj.hostname,
+        protocol: urlObj.protocol
+      });
+
       const request = lib.request({
         protocol: urlObj.protocol,
         hostname: urlObj.hostname,
@@ -189,7 +194,26 @@ function requestStream(streamUrl, headers) {
         method: 'GET'
       }, (response) => {
         const status = response.statusCode || 0;
+        logger.debug('[yt-dlp] Respuesta HTTP recibida', {
+          status,
+          contentLength: response.headers['content-length'],
+          contentType: response.headers['content-type']
+        });
+
         if (status >= 200 && status < 300 && response.readable) {
+          // Agregar listeners para detectar cierre prematuro
+          response.on('error', (err) => {
+            logger.error('[yt-dlp] Error en stream de respuesta', { error: err.message });
+          });
+          
+          response.on('end', () => {
+            logger.debug('[yt-dlp] Stream finalizado normalmente');
+          });
+          
+          response.on('close', () => {
+            logger.debug('[yt-dlp] Stream cerrado');
+          });
+
           resolve(response);
         } else {
           const error = new Error(`yt-dlp stream HTTP ${status}`);
@@ -199,18 +223,26 @@ function requestStream(streamUrl, headers) {
       });
 
       request.setTimeout(STREAM_TIMEOUT_MS, () => {
+        logger.warn('[yt-dlp] Timeout al solicitar stream', { timeout: STREAM_TIMEOUT_MS });
         request.destroy(new Error('yt-dlp stream timeout'));
       });
 
-      request.on('error', reject);
+      request.on('error', (err) => {
+        logger.error('[yt-dlp] Error en request', { error: err.message });
+        reject(err);
+      });
+      
       request.end();
     } catch (error) {
+      logger.error('[yt-dlp] Error creando request', { error: error.message });
       reject(error);
     }
   });
 }
 
 async function createAudioResourceWithYtDlp(url, volume = 1.0) {
+  logger.debug('[yt-dlp] Creando recurso de audio', { url });
+  
   const info = await execYtDlpJson(url);
   const normalized = normalizeInfo(info);
 
@@ -218,8 +250,21 @@ async function createAudioResourceWithYtDlp(url, volume = 1.0) {
     throw new Error('yt-dlp no devolvió una URL válida');
   }
 
+  logger.debug('[yt-dlp] Info normalizada', {
+    ext: normalized.ext,
+    acodec: normalized.acodec,
+    abr: normalized.abr,
+    urlLength: normalized.url.length
+  });
+
   const stream = await requestStream(normalized.url, normalized.headers);
   const inputType = inferStreamType(normalized);
+
+  logger.debug('[yt-dlp] Stream obtenido, creando recurso', {
+    inputType: StreamType[inputType] || inputType,
+    readable: stream.readable,
+    destroyed: stream.destroyed
+  });
 
   const resource = createAudioResource(stream, {
     inputType,
@@ -237,6 +282,19 @@ async function createAudioResourceWithYtDlp(url, volume = 1.0) {
   
   // Agregar información del video para metadata
   resource.videoInfo = info;
+
+  // Agregar listener para errores en el playStream
+  if (resource.playStream) {
+    resource.playStream.on('error', (err) => {
+      logger.error('[yt-dlp] Error en playStream del recurso', { error: err.message });
+    });
+    
+    resource.playStream.on('close', () => {
+      logger.debug('[yt-dlp] playStream cerrado');
+    });
+  }
+
+  logger.debug('[yt-dlp] Recurso de audio creado exitosamente');
 
   return resource;
 }

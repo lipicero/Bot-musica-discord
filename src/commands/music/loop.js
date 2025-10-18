@@ -35,7 +35,7 @@ module.exports = {
       
       // Persistir estado
       guildState[guild.id] = guildState[guild.id] || {};
-      guildState[guild.id].loop = q.loop;
+      guildState[guild.id].loopMode = q.loop;
       saveState(guildState);
       
       await renderNowPlaying(guild.id).catch(() => {});

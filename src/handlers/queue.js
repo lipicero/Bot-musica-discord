@@ -47,8 +47,13 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
       behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
     });
     
+    // Si no se proporciona globalState, intentar obtenerlo del contexto global
+    const effectiveGlobalState = (Object.keys(globalState).length === 0 && globalContext?.guildState) 
+      ? globalContext.guildState 
+      : globalState;
+    
     // Obtener estado guardado del servidor
-    const state = getGuildState(globalState, guildId);
+    const state = getGuildState(effectiveGlobalState, guildId);
     
     // =================== CONFIGURAR EVENT HANDLERS DEL PLAYER ===================
     
@@ -125,7 +130,7 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
 
             try {
               logger.warn('[player] Error 403 persistente, reintentando con yt-dlp', { guildId });
-              const fallbackResource = await createAudioResourceWithYtDlp(currentSong.url, qq.volume || 1.0);
+              const fallbackResource = await createAudioResourceWithYtDlp(currentSong.url, qq.volume ?? 1.0);
               qq.replacingResource = true;
               qq.player.play(fallbackResource);
               qq.consecutive403Errors = 0;
@@ -263,37 +268,23 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
           return;
         }
         
-        // Verificar duración de reproducción para evitar saltos prematuros
+        // Verificar duración de reproducción
         const playbackDuration = currentQueue.player?.state?.resource?.playbackDuration || 0;
         const playedSeconds = Math.floor(playbackDuration / 1000);
         const currentSong = currentQueue.songs[0];
         
-        // Si la canción tiene duración conocida y solo se reprodujo una pequeña parte, es sospechoso
-        if (currentSong && currentSong.durationSec && playedSeconds < 5 && currentSong.durationSec > 30) {
-          logger.warn('[player] ⚠️ Idle detectado muy pronto - posible error en el stream', {
+        // NOTA: El sistema de reintentos se ha DESACTIVADO porque causaba falsos positivos
+        // @discordjs/voice reporta playbackDuration=0 incluso cuando el audio se reproduce correctamente
+        // Esto sucede especialmente con yt-dlp streams que se descargan más rápido de lo que se reproducen
+        
+        // Log para diagnóstico
+        if (playedSeconds < 5 && currentSong && currentSong.durationSec > 30) {
+          logger.debug('[player] Duración reportada como baja, pero continuando normalmente', {
             guildId,
             playedSeconds,
             expectedDuration: currentSong.durationSec,
             title: currentSong.title
           });
-          
-          // No avanzar automáticamente si parece un error
-          // En su lugar, intentar reproducir la misma canción nuevamente
-          if (playNextFn && currentQueue.songs.length > 0) {
-            logger.audio('[player] Reintentando reproducción de la canción actual', { guildId });
-            playNextFn(guildId, queues, globalContext).catch(err => {
-              logger.error('[player] Error en reintento de reproducción:', {
-                guildId,
-                error: err.message
-              });
-              // Si el reintento falla, entonces sí avanzar
-              currentQueue.songs.shift();
-              if (currentQueue.songs.length > 0 && playNextFn) {
-                playNextFn(guildId, queues, globalContext).catch(() => {});
-              }
-            });
-          }
-          return;
         }
         
         logger.audio('[player] ✓ Canción completada', { 
@@ -302,35 +293,84 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
           playedSeconds 
         });
         
-        // Si está en loop, reproducir de nuevo sin avanzar
-        if (currentQueue.loop && currentQueue.songs.length > 0) {
-          if (playNextFn) {
-            playNextFn(guildId, queues, globalContext).catch(err => {
-              logger.error('[player] Error en reproducción loop:', {
-                guildId,
-                error: err.message
-              });
-            });
-          }
-          return;
+        // Resetear contador de reintentos si la canción se completó exitosamente
+        if (currentSong && currentSong._retryCount) {
+          delete currentSong._retryCount;
         }
         
-        // Avanzar cola
-        if (currentQueue.songs.length > 1 && currentQueue.shuffleMode) {
-          // Modo shuffle: seleccionar canción aleatoria
-          const rest = currentQueue.songs.slice(1);
-          const pick = Math.floor(Math.random() * rest.length);
-          const next = rest[pick];
-          const newRest = rest.filter(song => song !== next);
+        // Log de debug para verificar estado
+        logger.debug('[player] Estado al terminar canción', {
+          guildId,
+          loopActive: currentQueue.loop,
+          currentPlayCount: currentSong?._playCount || 0,
+          songTitle: currentSong?.title,
+          songsInQueue: currentQueue.songs.length
+        });
+        
+        // Verificar si la canción debe repetirse
+        let shouldRepeat = false;
+        
+        // SOLO si el loop está ACTIVO, verificar si debe repetirse
+        if (currentQueue.loop && currentSong) {
+          // Inicializar contador si no existe (primera vez que termina)
+          if (!currentSong._playCount) {
+            currentSong._playCount = 1;
+          }
           
-          currentQueue.songs = [next, ...newRest];
-          logger.debug('[player] 🎲 Shuffle: siguiente canción seleccionada', { 
-            guildId,
-            title: next.title 
-          });
+          // Verificar si debe repetirse (solo si se ha reproducido 1 vez)
+          if (currentSong._playCount === 1) {
+            shouldRepeat = true;
+            currentSong._playCount = 2; // Marcar como segunda reproducción
+            logger.audio('[player] 🔁 Loop ACTIVO: repitiendo canción (reproducción 2/2)', {
+              guildId,
+              title: currentSong.title
+            });
+          } else {
+            // Ya se reprodujo 2 veces, avanzar
+            logger.audio('[player] 🔁 Loop: canción completó 2 reproducciones, avanzando', {
+              guildId,
+              title: currentSong.title
+            });
+          }
         } else {
-          // Modo normal: avanzar secuencialmente
+          // Loop DESACTIVADO - nunca repetir
+          logger.debug('[player] Loop DESACTIVADO, avanzando a siguiente canción', {
+            guildId
+          });
+        }
+        
+        // Si NO debe repetirse, eliminar la canción y avanzar
+        if (!shouldRepeat) {
+          // Resetear contador antes de eliminar/mover
+          if (currentSong._playCount) {
+            delete currentSong._playCount;
+          }
+          if (currentSong._retryCount) {
+            delete currentSong._retryCount;
+          }
+          
+          // Eliminar la canción actual
           currentQueue.songs.shift();
+          logger.debug('[player] Canción eliminada de la cola', {
+            guildId,
+            title: currentSong?.title,
+            remainingSongs: currentQueue.songs.length
+          });
+          
+          // Avanzar cola según el modo shuffle
+          if (currentQueue.shuffleMode && currentQueue.songs.length > 1) {
+            // Modo shuffle: seleccionar siguiente aleatoria de las restantes
+            const pick = Math.floor(Math.random() * currentQueue.songs.length);
+            const next = currentQueue.songs[pick];
+            const newRest = currentQueue.songs.filter(song => song !== next);
+            
+            currentQueue.songs = [next, ...newRest];
+            logger.debug('[player] 🎲 Shuffle: siguiente canción seleccionada', { 
+              guildId,
+              title: next.title
+            });
+          }
+          // Si no hay shuffle, la siguiente canción ya está en posición 0 después del shift()
         }
         
         // Reproducir siguiente o desconectar
@@ -394,8 +434,8 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
       nowPlayingMessageId: null,
       loop: state.loopMode || false,
       shuffleMode: state.shuffleMode || false,
-      volume: state.volume || 1.0,
-      bassGainDb: state.bassGainDb || 0,
+      volume: state.volume ?? 1.0,
+      bassGainDb: state.bassGainDb ?? 0,
       bassFreq: 100,
       bassWidth: 100,
       uiInterval: null,
@@ -517,43 +557,70 @@ function advanceQueue(queue, guildId, preloadCheck = null) {
     return null;
   }
   
-  // Si está en loop, mantener canción actual
-  if (queue.loop) {
-    logger.debug('[queue] Loop activo, manteniendo canción actual');
-    return queue.songs[0];
+  const currentSong = queue.songs[0];
+  
+  // Verificar si la canción debe repetirse (solo una vez con loop activo)
+  let shouldRepeat = false;
+  
+  // SOLO si el loop está ACTIVO, verificar si debe repetirse
+  if (queue.loop && currentSong) {
+    // Inicializar contador si no existe (primera vez que termina)
+    if (!currentSong._playCount) {
+      currentSong._playCount = 1;
+    }
+    
+    // Verificar si debe repetirse (solo si se ha reproducido 1 vez)
+    if (currentSong._playCount === 1) {
+      shouldRepeat = true;
+      currentSong._playCount = 2; // Marcar como segunda reproducción
+      logger.audio('[queue] 🔁 Loop ACTIVO: repitiendo canción (reproducción 2/2)', {
+        guildId,
+        title: currentSong.title
+      });
+    }
+  } else {
+    // Loop DESACTIVADO - nunca repetir
+    logger.debug('[queue] Loop DESACTIVADO, avanzando normalmente', {
+      guildId
+    });
   }
   
-  // Si shuffle está activo y hay más de 2 canciones
-  if (queue.shuffleMode && queue.songs.length > 1) {
-    const rest = queue.songs.slice(1);
-    let next = null;
+  // Si NO debe repetirse, eliminar y avanzar
+  if (!shouldRepeat) {
+    // Resetear contadores
+    if (currentSong._playCount) delete currentSong._playCount;
+    if (currentSong._retryCount) delete currentSong._retryCount;
     
-    // OPTIMIZACIÓN: Priorizar canciones precargadas
-    if (preloadCheck && typeof preloadCheck === 'function') {
-      const preloadedSongs = rest.filter(song => preloadCheck(guildId, song.url));
-      
-      if (preloadedSongs.length > 0) {
-        const pick = Math.floor(Math.random() * preloadedSongs.length);
-        next = preloadedSongs[pick];
-        logger.audio(`🎯 Seleccionada canción precargada (shuffle): ${next.title}`);
-      }
-    }
-    
-    // Si no hay precargadas, seleccionar aleatoriamente
-    if (!next) {
-      const pick = Math.floor(Math.random() * rest.length);
-      next = rest[pick];
-      logger.audio(`🎲 Seleccionada canción aleatoria (shuffle): ${next.title}`);
-    }
-    
-    // Reorganizar cola
-    const newRest = rest.filter(song => song !== next);
-    queue.songs = [next, ...newRest];
-  } else {
-    // Modo normal: avanzar a la siguiente
+    // Eliminar la canción actual
     queue.songs.shift();
     
-    if (queue.songs.length > 0) {
+    // Si shuffle está activo y hay más de 1 canción restante
+    if (queue.shuffleMode && queue.songs.length > 1) {
+      let next = null;
+      
+      // OPTIMIZACIÓN: Priorizar canciones precargadas
+      if (preloadCheck && typeof preloadCheck === 'function') {
+        const preloadedSongs = queue.songs.filter(song => preloadCheck(guildId, song.url));
+        
+        if (preloadedSongs.length > 0) {
+          const pick = Math.floor(Math.random() * preloadedSongs.length);
+          next = preloadedSongs[pick];
+          logger.audio(`🎯 Seleccionada canción precargada (shuffle): ${next.title}`);
+        }
+      }
+      
+      // Si no hay precargadas, seleccionar aleatoriamente
+      if (!next) {
+        const pick = Math.floor(Math.random() * queue.songs.length);
+        next = queue.songs[pick];
+        logger.audio(`🎲 Seleccionada canción aleatoria (shuffle): ${next.title}`);
+      }
+      
+      // Reorganizar cola con la siguiente canción al frente
+      const newRest = queue.songs.filter(song => song !== next);
+      queue.songs = [next, ...newRest];
+    } else if (queue.songs.length > 0) {
+      // Modo normal: la siguiente canción ya está en posición 0 después del shift
       logger.audio(`Avanzando a siguiente canción: ${queue.songs[0].title}`);
     }
   }

@@ -40,7 +40,7 @@ module.exports = {
       if (idx === 1) {
         q.loop = false;
         guildState[guild.id] = guildState[guild.id] || {};
-        guildState[guild.id].loop = q.loop;
+        guildState[guild.id].loopMode = q.loop;
         saveState(guildState);
         
         if (q.songs.length > 0) {

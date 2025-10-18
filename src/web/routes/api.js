@@ -94,7 +94,7 @@ function registerApiRoutes(app, { client, queues, getStatsForWeb, WEB_PASSWORD }
           isCurrent: index === 0
         })),
         isPlaying: queue.player?.state?.status === AudioPlayerStatus.Playing,
-        volume: Math.round((queue.volume || 1) * 100),
+        volume: Math.round((queue.volume ?? 1) * 100),
         loop: queue.loop,
         shuffle: queue.shuffleMode
       });

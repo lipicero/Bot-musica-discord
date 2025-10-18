@@ -358,7 +358,7 @@ function clearGuildState(globalState, guildId) {
 function getStateStats(globalState) {
   const servers = Object.keys(globalState).length;
   const avgVolume = Object.values(globalState)
-    .map(s => s.volume || 1)
+    .map(s => s.volume ?? 1)
     .reduce((a, b) => a + b, 0) / (servers || 1);
   
   const withBass = Object.values(globalState)

@@ -101,7 +101,7 @@ async function playNext(guildId, queues, context = {}) {
         // MÉTODO PRINCIPAL: yt-dlp (más robusto, funciona con restricciones de edad)
         try {
           logger.audio('[player] Usando yt-dlp (método principal)', { guildId });
-          resource = await createAudioResourceWithYtDlp(current.url, q.volume || 1.0);
+          resource = await createAudioResourceWithYtDlp(current.url, q.volume ?? 1.0);
           current.source = 'yt-dlp';
           
           // Si el recurso tiene videoInfo, actualizar la metadata de la canción
@@ -186,7 +186,7 @@ async function playNext(guildId, queues, context = {}) {
           });
           
           if (resource.volume) {
-            resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, q.volume || 1.0)));
+            resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, q.volume ?? 1.0)));
           }
           
           logger.audio('[player] ✓ Recurso creado con play-dl', { guildId });
@@ -249,7 +249,7 @@ async function playNext(guildId, queues, context = {}) {
           }
           
           if (resource.volume) {
-            resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, q.volume || 1.0)));
+            resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, q.volume ?? 1.0)));
           }
           
           // Guardar ytdlInfo para futuras reproducciones
@@ -280,7 +280,7 @@ async function playNext(guildId, queues, context = {}) {
               });
               
               if (resource.volume) {
-                resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, q.volume || 1.0)));
+                resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, q.volume ?? 1.0)));
               }
               
               logger.audio('[player] ✓ Recurso creado con play-dl (fallback)', { guildId });
@@ -290,7 +290,7 @@ async function playNext(guildId, queues, context = {}) {
           } catch (playdlError) {
             try {
               logger.audio('[player] Intentando fallback final con yt-dlp', { guildId });
-              resource = await createAudioResourceWithYtDlp(current.url, q.volume || 1.0);
+              resource = await createAudioResourceWithYtDlp(current.url, q.volume ?? 1.0);
               current.source = 'yt-dlp';
               
               // Actualizar metadata si está disponible
@@ -519,7 +519,7 @@ async function preloadNextInQueue(guildId, queue, context) {
       });
       
       if (resource.volume) {
-        resource.volume.setVolumeLogarithmic(queue.volume || 1.0);
+        resource.volume.setVolumeLogarithmic(queue.volume ?? 1.0);
       }
       
       // Guardar en cache
