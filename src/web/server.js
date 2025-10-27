@@ -78,7 +78,7 @@ function createWebServer(dependencies) {
   function startWebServer() {
     try {
       server.listen(WEB_PORT, () => {
-        logger.bot(`🌐 Dashboard disponible en: http://localhost:${WEB_PORT}`);
+        logger.bot(`[WEB] Dashboard disponible en: http://localhost:${WEB_PORT}`);
       });
     } catch (error) {
       logger.error('[web] Error al iniciar servidor:', {

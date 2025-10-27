@@ -200,7 +200,7 @@ if ($errInfo.Exists) {
   
   # Verificar si hay errores recientes
   if ($errInfo.Lines -gt 0) {
-    $recentErrors = Get-Content $errLog -Tail 5 -ErrorAction SilentlyContinue | Where-Object { $_.Trim() -ne "" }
+    $recentErrors = Get-Content $errLog -Tail 5 -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { $_.Trim() -ne "" }
     if ($recentErrors) {
       Write-Host ""
       Write-Status "Hay errores en el log" "WARNING"

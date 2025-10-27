@@ -112,7 +112,7 @@ function Show-RecentLogs {
     
     $logPath = Join-Path $scriptDir 'logs\bot.out.log'
     if (Test-Path $logPath) {
-        Get-Content $logPath -Tail 15 -ErrorAction SilentlyContinue | ForEach-Object {
+        Get-Content $logPath -Tail 15 -Encoding UTF8 -ErrorAction SilentlyContinue | ForEach-Object {
             $line = $_
             # Colorear segun el contenido
             if ($line -match "\[healthcheck\]|\[health\]") {
@@ -148,7 +148,7 @@ function Show-RecentErrors {
     
     $errPath = Join-Path $scriptDir 'logs\bot.err.log'
     if (Test-Path $errPath) {
-        $errors = Get-Content $errPath -Tail 5 -ErrorAction SilentlyContinue | Where-Object { $_.Trim() -ne "" }
+        $errors = Get-Content $errPath -Tail 5 -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { $_.Trim() -ne "" }
         if ($errors) {
             $errors | ForEach-Object {
                 Write-Host "  $_" -ForegroundColor Red
@@ -230,7 +230,7 @@ while ($continue) {
             Write-Host ""
             $logPath = Join-Path $scriptDir 'logs\bot.out.log'
             if (Test-Path $logPath) {
-                Get-Content $logPath | ForEach-Object {
+                Get-Content $logPath -Encoding UTF8 | ForEach-Object {
                     $line = $_
                     if ($line -match "error|Error|ERROR") {
                         Write-Host $line -ForegroundColor Red
@@ -255,7 +255,7 @@ while ($continue) {
             Write-Host ""
             $errPath = Join-Path $scriptDir 'logs\bot.err.log'
             if (Test-Path $errPath) {
-                Get-Content $errPath | ForEach-Object {
+                Get-Content $errPath -Encoding UTF8 | ForEach-Object {
                     Write-Host $_ -ForegroundColor Red
                 }
             } else {

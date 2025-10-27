@@ -143,7 +143,7 @@ if ($hasLogs) {
   # Verificar errores recientes en stderr
   $hasErrors = Test-Path $errLog
   if ($hasErrors) {
-    $errContent = Get-Content $errLog -Tail 10 -ErrorAction SilentlyContinue | Where-Object { $_.Trim() -ne "" }
+    $errContent = Get-Content $errLog -Tail 10 -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { $_.Trim() -ne "" }
     if ($errContent) {
       Write-Check "Sin errores recientes" $false "$($errContent.Count) lineas de error en las ultimas 10 entradas"
     } else {
@@ -156,7 +156,7 @@ if ($hasLogs) {
   }
   
   # Verificar ultima actividad en logs
-  $lastLog = Get-Content $outLog -Tail 1 -ErrorAction SilentlyContinue
+  $lastLog = Get-Content $outLog -Tail 1 -Encoding UTF8 -ErrorAction SilentlyContinue
   if ($lastLog) {
     $file = Get-Item $outLog
     $minutesSinceModified = [math]::Round(((Get-Date) - $file.LastWriteTime).TotalMinutes, 1)

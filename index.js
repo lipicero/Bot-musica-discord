@@ -12,16 +12,17 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 process.env.YTDL_NO_UPDATE = "1"; // desactiva chequeo de updates de ytdl-core
 require("dotenv").config({ quiet: true });
+const logger = require('./src/utils/logger');
 
 // Intentar configurar ffmpeg estático para demux/transcode cuando sea necesario
 try {
   const ffmpegPath = require("ffmpeg-static");
   if (ffmpegPath) {
     process.env.FFMPEG_PATH = ffmpegPath;
-    console.log("[ffmpeg] ffmpeg-static configurado");
+    logger.info("[ffmpeg] ffmpeg-static configurado");
   }
 } catch (_) {
-  console.warn("[ffmpeg] ffmpeg-static no instalado; se intentará sin FFmpeg");
+  logger.warn("[ffmpeg] ffmpeg-static no instalado; se intentará sin FFmpeg");
 }
 const DEBUG_AUDIO = process.env.DEBUG_AUDIO === "1";
 
@@ -40,16 +41,16 @@ const YT_DOWNLOAD_TIMEOUT = Math.max(30, Math.min(120, Number(process.env.YT_DOW
 const YT_AGGRESSIVE_CACHE = process.env.YT_AGGRESSIVE_CACHE === "1";
 
 if (DEBUG_AUDIO) {
-  console.log(`[config] PREFER_WEBM_OPUS: ${PREFER_WEBM_OPUS}`);
-  console.log(`[config] FORCE_BEST_AUDIO: ${FORCE_BEST_AUDIO}`);
-  console.log(`[config] AUDIO_BUFFER_SIZE: ${AUDIO_BUFFER_SIZE}MB`);
-  console.log(`[config] HIGH_WATER_MARK: ${HIGH_WATER_MARK}`);
-  console.log(`[config] FFMPEG_OPTIMIZE_AUDIO: ${FFMPEG_OPTIMIZE_AUDIO}`);
-  console.log(`[config] OPUS_BITRATE: ${process.env.OPUS_BITRATE || 160}kbps`);
-  console.log(`[config] ENABLE_PRELOAD: ${ENABLE_PRELOAD}`);
-  console.log(`[config] PRELOAD_AHEAD: ${PRELOAD_AHEAD} canciones`);
-  console.log(`[config] YT_PARALLEL_DOWNLOADS: ${YT_PARALLEL_DOWNLOADS} conexiones`);
-  console.log(`[config] YT_DOWNLOAD_TIMEOUT: ${YT_DOWNLOAD_TIMEOUT/1000}s`);
+  logger.info(`[config] PREFER_WEBM_OPUS: ${PREFER_WEBM_OPUS}`);
+  logger.info(`[config] FORCE_BEST_AUDIO: ${FORCE_BEST_AUDIO}`);
+  logger.info(`[config] AUDIO_BUFFER_SIZE: ${AUDIO_BUFFER_SIZE}MB`);
+  logger.info(`[config] HIGH_WATER_MARK: ${HIGH_WATER_MARK}`);
+  logger.info(`[config] FFMPEG_OPTIMIZE_AUDIO: ${FFMPEG_OPTIMIZE_AUDIO}`);
+  logger.info(`[config] OPUS_BITRATE: ${process.env.OPUS_BITRATE || 160}kbps`);
+  logger.info(`[config] ENABLE_PRELOAD: ${ENABLE_PRELOAD}`);
+  logger.info(`[config] PRELOAD_AHEAD: ${PRELOAD_AHEAD} canciones`);
+  logger.info(`[config] YT_PARALLEL_DOWNLOADS: ${YT_PARALLEL_DOWNLOADS} conexiones`);
+  logger.info(`[config] YT_DOWNLOAD_TIMEOUT: ${YT_DOWNLOAD_TIMEOUT/1000}s`);
 }
 
 // Cache global para optimizaciones
@@ -117,6 +118,84 @@ try {
   ytdlp = require("yt-dlp-exec");
 } catch {}
 const { spawn, spawnSync } = require("child_process");
+
+function getYtDlpBinaryPath() {
+  try {
+    const manualPath = resolveManualYtDlpPath();
+    if (manualPath) {
+      return manualPath;
+    }
+
+    // Intentar yt-dlp
+    const testYtDlp = spawnSync(process.platform === 'win32' ? 'where' : 'which', ['yt-dlp']);
+    if (testYtDlp.status === 0) {
+      const ytdlpPath = testYtDlp.stdout.toString().trim().split('\n')[0];
+      return ytdlpPath || 'yt-dlp';
+    }
+    
+    // Fallback a youtube-dl
+    const testYtDl = spawnSync(process.platform === 'win32' ? 'where' : 'which', ['youtube-dl']);
+    if (testYtDl.status === 0) {
+      const ytdlPath = testYtDl.stdout.toString().trim().split('\n')[0];
+      return ytdlPath || 'youtube-dl';
+    }
+    
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveManualYtDlpPath() {
+  const candidates = [
+    process.env.YT_DLP_PATH,
+    process.env.YTDLP_PATH,
+    process.env.YTDLP_EXECUTABLE,
+    process.env.YTDLP_BINARY
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    const trimmed = candidate.trim().replace(/^"|"$/g, '').replace(/^'|'$/g, '');
+    if (!trimmed) continue;
+    const resolved = fs.existsSync(trimmed) ? trimmed : null;
+    if (resolved) {
+      return resolved;
+    }
+    // Si no existe físicamente, devolver el valor para que el spawn intente resolverlo
+    if (trimmed) {
+      return trimmed;
+    }
+  }
+  return null;
+}
+
+function cleanupOldLogs() {
+  const logsDir = path.join(__dirname, 'logs');
+  if (!fs.existsSync(logsDir)) return;
+
+  const now = Date.now();
+  const maxAge = 24 * 60 * 60 * 1000; // 24 horas
+
+  fs.readdir(logsDir, (err, files) => {
+    if (err) {
+      console.error('[cleanup] Error leyendo logs:', err);
+      return;
+    }
+
+    files.forEach(file => {
+      const filePath = path.join(logsDir, file);
+      fs.stat(filePath, (err, stats) => {
+        if (err) return;
+        if (now - stats.mtime.getTime() > maxAge) {
+          fs.unlink(filePath, err => {
+            if (err) console.error('[cleanup] Error borrando log:', file, err);
+            else console.log('[cleanup] Log borrado:', file);
+          });
+        }
+      });
+    });
+  });
+}
 
 // =================== SERVIDOR WEB PARA DASHBOARD ===================
 const express = require("express");
@@ -3880,6 +3959,8 @@ async function renderNowPlaying(guildId) {
   return sent;
 }
 
+globalContext.renderNowPlaying = renderNowPlaying;
+
 // Garantiza que exista un único panel por servidor; si no existe, lo crea en el canal dado
 async function ensurePanel(guildId, channelId) {
   const q = getQueue(guildId);
@@ -4995,6 +5076,35 @@ client.on("interactionCreate", async (interaction) => {
     }
   }
 });
+
+// Verificar actualización de yt-dlp
+logger.info("[yt-dlp] Verificando actualizaciones...");
+const ytdlpPath = getYtDlpBinaryPath();
+if (ytdlpPath) {
+  try {
+    const result = spawnSync(ytdlpPath, ["--update"], { encoding: "utf8" });
+    if (result.status === 0) {
+      const output = (result.stdout || "") + (result.stderr || "");
+      if (output.includes("up to date")) {
+        logger.info("[yt-dlp] Ya está actualizado.");
+      } else if (output.includes("Updated")) {
+        logger.info("[yt-dlp] Actualizado exitosamente.");
+      } else {
+        logger.info("[yt-dlp] Verificación completada.");
+      }
+    } else {
+      logger.warn("[yt-dlp] Error al actualizar yt-dlp.");
+    }
+  } catch (error) {
+    logger.warn("[yt-dlp] No se pudo ejecutar yt-dlp --update:", error.message);
+  }
+} else {
+  logger.warn("[yt-dlp] No se encontró el binario de yt-dlp.");
+}
+
+// Limpiar logs antiguos
+cleanupOldLogs();
+setInterval(cleanupOldLogs, 24 * 60 * 60 * 1000);
 
 // Iniciar el bot
 client.login(process.env.DISCORD_TOKEN);

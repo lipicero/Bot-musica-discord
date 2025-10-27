@@ -65,10 +65,10 @@ try {
   const ffmpegPath = require("ffmpeg-static");
   if (ffmpegPath) {
     process.env.FFMPEG_PATH = ffmpegPath;
-    console.log("[ffmpeg] ffmpeg-static configurado");
+    logger.info("[ffmpeg] ffmpeg-static configurado");
   }
 } catch (_) {
-  console.warn("[ffmpeg] ffmpeg-static no instalado; se intentará sin FFmpeg");
+  logger.warn("[ffmpeg] ffmpeg-static no instalado; se intentará sin FFmpeg");
 }
 
 // =================== IMPORTAR MÓDULOS ===================
@@ -86,14 +86,65 @@ const webStats = require('./web/stats');
 // Importar handlers
 const { setPlayNextFunction, getQueuesMap } = require('./handlers/queue');
 const { playNext } = require('./handlers/player');
+const { spawnSync } = require('child_process');
+
+function getYtDlpBinaryPath() {
+  try {
+    const manualPath = resolveManualYtDlpPath();
+    if (manualPath) {
+      return manualPath;
+    }
+
+    // Intentar yt-dlp
+    const testYtDlp = spawnSync(process.platform === 'win32' ? 'where' : 'which', ['yt-dlp']);
+    if (testYtDlp.status === 0) {
+      const ytdlpPath = testYtDlp.stdout.toString().trim().split('\n')[0];
+      return ytdlpPath || 'yt-dlp';
+    }
+    
+    // Fallback a youtube-dl
+    const testYtDl = spawnSync(process.platform === 'win32' ? 'where' : 'which', ['youtube-dl']);
+    if (testYtDl.status === 0) {
+      const ytdlPath = testYtDl.stdout.toString().trim().split('\n')[0];
+      return ytdlPath || 'youtube-dl';
+    }
+    
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveManualYtDlpPath() {
+  const candidates = [
+    process.env.YT_DLP_PATH,
+    process.env.YTDLP_PATH,
+    process.env.YTDLP_EXECUTABLE,
+    process.env.YTDLP_BINARY
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    const trimmed = candidate.trim().replace(/^"|"$/g, '').replace(/^'|'$/g, '');
+    if (!trimmed) continue;
+    const resolved = require('fs').existsSync(trimmed) ? trimmed : null;
+    if (resolved) {
+      return resolved;
+    }
+    // Si no existe físicamente, devolver el valor para que el spawn intente resolverlo
+    if (trimmed) {
+      return trimmed;
+    }
+  }
+  return null;
+}
 
 // =================== INICIALIZACIÓN ===================
-logger.bot('🤖 Iniciando bot de música...');
+logger.bot('[BOT] Iniciando bot de música...');
 
 // Cargar comandos
 logger.bot('Cargando comandos...');
 const commands = loadCommands();
-logger.bot(`✓ ${commands.size} comandos cargados`);
+logger.bot(`[OK] ${commands.size} comandos cargados`);
 
 // =================== CLIENTE DISCORD ===================
 const client = new Client({
@@ -142,7 +193,7 @@ const USER_STATS = new Map();
 const stateService = require('./services/state');
 const guildState = stateService.loadState();
 
-logger.bot('✓ Estado inicializado');
+logger.bot('[OK] Estado inicializado');
 
 // =================== CONTEXTO GLOBAL PARA COMANDOS ===================
 // Este objeto contiene todo lo que los comandos necesitan acceder
@@ -201,7 +252,7 @@ const globalContext = {
 // =================== CONFIGURAR PLAYBACK HANDLER ===================
 // Vincular la función playNext con el handler de cola
 setPlayNextFunction((guildId) => playNext(guildId, queues, globalContext), globalContext);
-logger.bot('✓ Handler de reproducción configurado');
+logger.bot('[OK] Handler de reproducción configurado');
 
 // =================== SERVIDOR WEB ===================
 const { app, server, io, startWebServer, startHealthServer } = createWebServer({
@@ -212,18 +263,18 @@ const { app, server, io, startWebServer, startHealthServer } = createWebServer({
   USER_STATS
 });
 
-logger.bot('✓ Servidor web configurado');
+logger.bot('[OK] Servidor web configurado');
 
 // =================== EVENT HANDLERS DEL BOT ===================
 
 // Ready event
 client.once("clientReady", async (c) => {
-  logger.bot(`✅ Conectado como ${c.user?.tag || c.user?.id}`);
+  logger.bot(`[CONNECTED] Conectado como ${c.user?.tag || c.user?.id}`);
   
   // Registrar comandos slash (pasar el cliente ready)
   try {
     await registerSlashCommands(c);
-    logger.bot('✓ Comandos slash registrados');
+    logger.bot('[OK] Comandos slash registrados');
   } catch (error) {
     logger.error('Error registrando comandos slash:', { error: error.message });
   }
@@ -482,7 +533,7 @@ async function registerSlashCommands(readyClient) {
       { body: commandsData }
     );
     
-    logger.bot(`✓ ${commandsData.length} comandos registrados globalmente`);
+    logger.bot(`[OK] ${commandsData.length} comandos registrados globalmente`);
   } catch (error) {
     logger.error('Error registrando comandos:', { error: error.message });
     throw error;
@@ -525,7 +576,7 @@ function startHealthCheckSystem() {
               try {
                 conn.destroy();
                 queues.delete(guildId);
-                logger.bot(`[healthcheck] ✓ Limpiada conexión destruida en guild ${guildId}`);
+                logger.bot(`[healthcheck] [OK] Limpiada conexión destruida en guild ${guildId}`);
               } catch (e) {
                 logger.error(`[healthcheck] Error limpiando guild ${guildId}:`, { error: e.message });
               }
@@ -538,7 +589,7 @@ function startHealthCheckSystem() {
       const memMB = Math.round(mem.heapUsed / 1024 / 1024);
       
       if (activeConnections > 0 || problematicConnections > 0) {
-        logger.bot(`[healthcheck] ✓ Bot activo | Guilds: ${client.guilds.cache.size} | ` +
+        logger.bot(`[healthcheck] [OK] Bot activo | Guilds: ${client.guilds.cache.size} | ` +
                    `Voz: ${activeConnections} activas, ${problematicConnections} problemáticas | ` +
                    `Memoria: ${memMB}MB`);
       }
@@ -548,7 +599,7 @@ function startHealthCheckSystem() {
         if (global.gc) {
           try {
             global.gc();
-            logger.bot('[healthcheck] ✓ Garbage collection ejecutado');
+            logger.bot('[healthcheck] [OK] Garbage collection ejecutado');
           } catch (e) {
             logger.warn('[healthcheck] No se pudo ejecutar GC');
           }
@@ -560,7 +611,7 @@ function startHealthCheckSystem() {
     }
   }, 60000); // Cada 60 segundos
   
-  logger.bot('[healthcheck] ✓ Sistema de monitoreo iniciado (cada 60s)');
+  logger.bot('[healthcheck] [OK] Sistema de monitoreo iniciado (cada 60s)');
 }
 
 // =================== GRACEFUL SHUTDOWN ===================
@@ -603,12 +654,37 @@ process.on("SIGINT", () => {
   setTimeout(() => process.exit(0), 500);
 });
 
+// =================== VERIFICAR ACTUALIZACIÓN DE YT-DLP ===================
+logger.info("[yt-dlp] Verificando actualizaciones...");
+const ytdlpPath = getYtDlpBinaryPath();
+if (ytdlpPath) {
+  try {
+    const result = spawnSync(ytdlpPath, ["--update"], { encoding: "utf8" });
+    if (result.status === 0) {
+      const output = (result.stdout || "") + (result.stderr || "");
+      if (output.includes("up to date")) {
+        logger.info("[yt-dlp] Ya está actualizado.");
+      } else if (output.includes("Updated")) {
+        logger.info("[yt-dlp] Actualizado exitosamente.");
+      } else {
+        logger.info("[yt-dlp] Verificación completada.");
+      }
+    } else {
+      logger.warn("[yt-dlp] Error al actualizar yt-dlp.");
+    }
+  } catch (error) {
+    logger.warn("[yt-dlp] No se pudo ejecutar yt-dlp --update:", error.message);
+  }
+} else {
+  logger.warn("[yt-dlp] No se encontró el binario de yt-dlp.");
+}
+
 // =================== INICIAR BOT ===================
-logger.bot('🚀 Conectando a Discord...');
+logger.bot('[CONNECT] Conectando a Discord...');
 
 client.login(process.env.DISCORD_TOKEN)
   .then(() => {
-    logger.bot('✓ Login exitoso');
+    logger.bot('[OK] Login exitoso');
   })
   .catch((error) => {
     logger.error('❌ Error al iniciar sesión:', { error: error.message });

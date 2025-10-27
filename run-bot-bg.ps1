@@ -69,6 +69,10 @@ $outLog = Join-Path $logs 'bot.out.log'
 $errLog = Join-Path $logs 'bot.err.log'
 $pidFile = Join-Path $scriptDir 'bot.pid'
 
+# Limpiar logs anteriores para evitar problemas de encoding
+if (Test-Path $outLog) { Clear-Content $outLog -ErrorAction SilentlyContinue }
+if (Test-Path $errLog) { Clear-Content $errLog -ErrorAction SilentlyContinue }
+
 # Evitar instancias duplicadas si ya hay un PID valido
 if (Test-Path $pidFile) {
   try {
@@ -104,6 +108,7 @@ $nodeArgs = "src\index.js"
 $tempScript = Join-Path $env:TEMP "start-discord-bot-$([guid]::NewGuid().ToString('N').Substring(0,8)).cmd"
 @"
 @echo off
+chcp 65001 >nul
 cd /d "$scriptDir"
 start /b "" "$nodeCmd" $nodeArgs >> "$outLog" 2>> "$errLog"
 "@ | Out-File -FilePath $tempScript -Encoding ascii
@@ -195,12 +200,12 @@ if ($Log) {
   Write-Host ""
   try {
     $jobOut = Start-Job -ScriptBlock {
-      Get-Content -Path $using:outLog -Wait -Tail 20 | ForEach-Object { 
+      Get-Content -Path $using:outLog -Wait -Tail 20 -Encoding UTF8 | ForEach-Object { 
         Write-Host "[OUT] $_" -ForegroundColor White
       }
     }
     $jobErr = Start-Job -ScriptBlock {
-      Get-Content -Path $using:errLog -Wait -Tail 20 | ForEach-Object { 
+      Get-Content -Path $using:errLog -Wait -Tail 20 -Encoding UTF8 | ForEach-Object { 
         Write-Host "[ERR] $_" -ForegroundColor Red
       }
     }

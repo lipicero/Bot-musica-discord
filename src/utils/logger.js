@@ -12,7 +12,7 @@ if (!fs.existsSync(logsDir)) {
 // Formato personalizado para console
 const consoleFormat = winston.format.combine(
   winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
-  winston.format.colorize(),
+  ...(process.stdout.isTTY ? [winston.format.colorize()] : []),
   winston.format.printf(({ level, message, timestamp, ...meta }) => {
     let msg = `${timestamp} [${level}] ${message}`;
     if (Object.keys(meta).length > 0) {

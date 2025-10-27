@@ -34,27 +34,30 @@ module.exports = {
         cleaned = true;
       }
       
-      const queueText = formatQueueMessage(q);
-      await renderNowPlaying(guild.id).catch(() => {});
+      if (typeof renderNowPlaying === 'function') {
+        await renderNowPlaying(guild.id).catch(() => {});
+      }
       
-      await interaction.editReply(
-        `🧹 Cola limpiada (se mantiene la canción actual).\n\nCola actual:\n${queueText}`
-      );
+      await interaction.editReply('🧹 Cola limpiada (se mantiene la canción actual).');
       
     } catch (error) {
       logger.error('[clear] Error ejecutando comando', {
         error: error.message,
-        user: interaction.user.tag
+        stack: error.stack,
+        user: interaction.user.tag,
+        cleaned
       });
       
-      const errorMsg = cleaned ? 'Cola limpiada, pero error al mostrar la información.' : '❌ Error al limpiar la cola';
+      const errorMsg = cleaned ? `Cola limpiada, pero error: ${error.message}` : '❌ Error al limpiar la cola';
       try {
         if (interaction.deferred || interaction.replied) {
           await interaction.editReply(errorMsg);
         } else {
           await interaction.reply({ content: errorMsg, flags: 1 << 6 });
         }
-      } catch {}
+      } catch (replyError) {
+        logger.error('[clear] Error en reply de error', { error: replyError.message });
+      }
     }
 
     if (cleaned) {
