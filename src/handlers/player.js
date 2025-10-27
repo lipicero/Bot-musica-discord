@@ -372,8 +372,8 @@ async function playNext(guildId, queues, context = {}) {
     
     // Reproducir el recurso
     q.player.play(resource);
-    q.lastPlaybackStart = Date.now(); // Registrar cuando empezó la reproducción
-    logger.audio(`▶️ Reproduciendo: ${current.title}`, { guildId });
+    // No establecer lastPlaybackStart aquí, esperar a que el player confirme que está reproduciendo
+    logger.audio(`▶️ Iniciando reproducción: ${current.title}`, { guildId });
     
     // Limpiar el flag después de que el reproductor confirme que está reproduciendo
     // Esperamos un poco más de tiempo para asegurar que el stream está estable
@@ -381,6 +381,11 @@ async function playNext(guildId, queues, context = {}) {
       const currentQ = queues.get(guildId);
       if (currentQ && currentQ.player?.state?.status === AudioPlayerStatus.Playing) {
         currentQ.replacingResource = false;
+        // Solo ahora registrar el tiempo de inicio cuando realmente está reproduciendo
+        if (!currentQ.lastPlaybackStart) {
+          currentQ.lastPlaybackStart = Date.now();
+          logger.audio(`▶️ Reproducción confirmada: ${current.title}`, { guildId });
+        }
         logger.debug('[player] Flag replacingResource limpiado - reproducción confirmada', { guildId });
       }
     }, 500); // 0.5 segundos para dar tiempo al stream de estabilizarse

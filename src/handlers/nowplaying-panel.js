@@ -135,11 +135,34 @@ function buildNowPlayingEmbed(q) {
   const embedColor = 0x5865f2;
   const totalSeconds = s.durationSec || 0; // Definir totalSeconds aquí
   
-  // Calcular tiempo de reproducción
+  logger.debug(`[nowplaying] Estado del player: ${q.player.state.status}, isPaused: ${isPaused}, pausedAtTime: ${q.pausedAtTime}, lastPlaybackStart: ${q.lastPlaybackStart}`, { guildId: q.guildId });
+  
+  // Calcular tiempo de reproducción de manera más confiable
   let currentSeconds = 0;
   
-  if (q.player.state.resource?.playbackDuration) {
-    currentSeconds = Math.floor(q.player.state.resource.playbackDuration / 1000);
+  if (isPaused) {
+    // Si está pausado, usar el tiempo guardado al pausar
+    if (q.pausedAtTime !== undefined) {
+      currentSeconds = q.pausedAtTime;
+      logger.debug(`[nowplaying] Usando pausedAtTime: ${currentSeconds}s`, { guildId: q.guildId });
+    } else if (q.lastPlaybackStart) {
+      // Fallback: calcular tiempo hasta el momento de pausa (no debería pasar normalmente)
+      currentSeconds = Math.floor((Date.now() - q.lastPlaybackStart) / 1000);
+      logger.warn(`[nowplaying] pausedAtTime no definido durante pausa, calculando tiempo: ${currentSeconds}s`, { guildId: q.guildId });
+    } else if (q.player.state.resource?.playbackDuration) {
+      currentSeconds = Math.floor(q.player.state.resource.playbackDuration / 1000);
+      logger.debug(`[nowplaying] Usando playbackDuration en pausa: ${currentSeconds}s`, { guildId: q.guildId });
+    }
+  } else {
+    // Si no está pausado, calcular tiempo transcurrido desde el inicio
+    if (q.lastPlaybackStart) {
+      currentSeconds = Math.floor((Date.now() - q.lastPlaybackStart) / 1000);
+      logger.debug(`[nowplaying] Calculando tiempo transcurrido: ${currentSeconds}s desde ${new Date(q.lastPlaybackStart).toISOString()}`, { guildId: q.guildId });
+    } else if (q.player.state.resource?.playbackDuration) {
+      // Fallback al método anterior
+      currentSeconds = Math.floor(q.player.state.resource.playbackDuration / 1000);
+      logger.debug(`[nowplaying] Usando playbackDuration: ${currentSeconds}s`, { guildId: q.guildId });
+    }
   }
   
   // Asegurar que no exceda la duración total
@@ -265,9 +288,19 @@ async function startNowPlayingPanel(q, textChannel) {
     logger.debug('[nowplaying] Panel iniciado');
     
     if (q.nowPlayingInterval) clearInterval(q.nowPlayingInterval);
-    q.nowPlayingInterval = setInterval(async () => { 
-      await updateNowPlayingPanel(q); 
-    }, 1000);
+    
+    // Función recursiva para actualización constante
+    const scheduleUpdate = () => {
+      q.nowPlayingInterval = setTimeout(async () => {
+        await updateNowPlayingPanel(q);
+        // Programar la siguiente actualización solo después de completar esta
+        if (q.nowPlayingMessage && q.nowPlayingInterval) {
+          scheduleUpdate();
+        }
+      }, 2000);
+    };
+    
+    scheduleUpdate();
   } catch (error) {
     logger.error('[nowplaying] Error al iniciar panel:', {
       message: error.message,
@@ -280,16 +313,27 @@ async function startNowPlayingPanel(q, textChannel) {
 async function updateNowPlayingPanel(q) {
   if (!q.nowPlayingMessage) return;
   
+  const startTime = Date.now();
+  
   try {
     const embed = buildNowPlayingEmbed(q);
     const components = buildControlsComponents(q);
     await q.nowPlayingMessage.edit({ embeds: [embed], components: components });
+    
+    const duration = Date.now() - startTime;
+    if (duration > 500) { // Log si toma más de 500ms
+      logger.warn(`[nowplaying] Actualización lenta: ${duration}ms`);
+    }
   } catch (error) {
+    const duration = Date.now() - startTime;
+    logger.error(`[nowplaying] Error al actualizar panel (${duration}ms):`, error.message);
+    
     if (error.code === 10008 || error.code === 50001) {
       logger.debug('[nowplaying] Mensaje eliminado, deteniendo panel');
       await stopNowPlayingPanel(q);
     } else {
-      logger.error('[nowplaying] Error al actualizar panel:', error.message);
+      // Para otros errores, no detener el intervalo, solo loguear
+      logger.error('[nowplaying] Continuando intervalo a pesar del error');
     }
   }
 }
@@ -297,7 +341,7 @@ async function updateNowPlayingPanel(q) {
 async function stopNowPlayingPanel(q) {
   try {
     if (q.nowPlayingInterval) {
-      clearInterval(q.nowPlayingInterval);
+      clearTimeout(q.nowPlayingInterval);
       q.nowPlayingInterval = null;
     }
     
