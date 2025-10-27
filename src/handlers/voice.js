@@ -112,7 +112,7 @@ async function ensureConnection(guildId, guild, voiceChannel, queue) {
         
         // Esperar antes de reintentar (excepto en el último intento)
         if (attempt < 4) {
-          await new Promise(resolve => setTimeout(resolve, 3000));
+          await new Promise(resolve => setTimeout(resolve, 2000));
         }
       }
     }

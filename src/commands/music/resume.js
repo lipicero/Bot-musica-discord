@@ -28,6 +28,10 @@ module.exports = {
       }
       
       q.player.unpause();
+      q.isPausedByUser = false; // Limpiar el flag al reanudar
+      
+      // Limpiar el tiempo pausado ya que se reanuda
+      delete q.pausedAtTime;
       
       try {
         startNowPlayingTicker(guild.id);

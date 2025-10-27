@@ -156,6 +156,7 @@ async function handlePause(interaction, q) {
   }
   
   q.player.pause();
+  q.isPausedByUser = true; // Marcar que el usuario pausó manualmente
   await interaction.deferUpdate();
 }
 
@@ -172,6 +173,7 @@ async function handleResume(interaction, q) {
   }
   
   q.player.unpause();
+  q.isPausedByUser = false; // Limpiar el flag al reanudar
   await interaction.deferUpdate();
 }
 
@@ -197,6 +199,9 @@ async function handleSkip(interaction, q, playNext, guildId) {
   // Remover la canción actual
   q.songs.shift();
   
+  // Limpiar el flag de pausa al saltar
+  q.isPausedByUser = false;
+  
   // Si hay más canciones, reproducir la siguiente
   if (q.songs.length > 0) {
     await playNext(guildId);
@@ -221,6 +226,9 @@ async function handleStop(interaction, q, queues, guildId) {
   try {
     // Responder primero
     await interaction.deferUpdate();
+    
+    // Limpiar el flag de pausa al detener
+    q.isPausedByUser = false;
     
     q.player.stop();
     const conn = getVoiceConnection(guildId);

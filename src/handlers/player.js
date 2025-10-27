@@ -70,6 +70,11 @@ async function playNext(guildId, queues, context = {}) {
   
   const current = q.songs[0];
   current._ytDlpAttempts = 0;
+  
+  // Limpiar el flag de pausa al iniciar una nueva canción
+  q.isPausedByUser = false;
+  delete q.pausedAtTime; // Limpiar tiempo pausado para nueva canción
+  
   logger.audio(`Iniciando reproducción: ${current.title}`, { guildId });
   
   try {
@@ -90,15 +95,15 @@ async function playNext(guildId, queues, context = {}) {
     
     // Si no hay precargado, crear recurso nuevo
     if (!resource) {
-      // ESTRATEGIA MEJORADA: 
-      // 1. Verificar si YT_FORCE_YTDLP está activo
-      // 2. Si está activo, usar yt-dlp primero (más confiable para restricciones de edad)
-      // 3. Si falla, usar play-dl, luego ytdl-core como fallbacks
+      // ESTRATEGIA OPTIMIZADA PARA VELOCIDAD:
+      // 1. Usar play-dl primero (más rápido para iniciar)
+      // 2. Si falla, usar yt-dlp (más robusto para restricciones de edad)
+      // 3. Si ambos fallan, usar ytdl-core como último fallback
       
       const forceYtDlp = process.env.YT_FORCE_YTDLP === '1' || process.env.YT_FORCE_YTDLP === 'true';
       
-      if (forceYtDlp) {
-        // MÉTODO PRINCIPAL: yt-dlp (más robusto, funciona con restricciones de edad)
+      if (!forceYtDlp) {
+        // MÉTODO PRINCIPAL: play-dl (más rápido para iniciar reproducción)
         try {
           logger.audio('[player] Usando yt-dlp (método principal)', { guildId });
           resource = await createAudioResourceWithYtDlp(current.url, q.volume ?? 1.0);
@@ -221,7 +226,7 @@ async function playNext(guildId, queues, context = {}) {
             
             const stream = ytdl.downloadFromInfo(info, {
               format: webmFormat,
-              highWaterMark: 1 << 25, // 32MB buffer
+              highWaterMark: 1 << 22, // 4MB buffer (reducido de 32MB)
               dlChunkSize: 0,
               ...requestOptions
             });
@@ -237,7 +242,7 @@ async function playNext(guildId, queues, context = {}) {
             const stream = ytdl.downloadFromInfo(info, {
               quality: 'highestaudio',
               filter: 'audioonly',
-              highWaterMark: 1 << 25,
+              highWaterMark: 1 << 22, // 4MB buffer (reducido de 32MB)
               dlChunkSize: 0,
               ...requestOptions
             });
@@ -367,6 +372,7 @@ async function playNext(guildId, queues, context = {}) {
     
     // Reproducir el recurso
     q.player.play(resource);
+    q.lastPlaybackStart = Date.now(); // Registrar cuando empezó la reproducción
     logger.audio(`▶️ Reproduciendo: ${current.title}`, { guildId });
     
     // Limpiar el flag después de que el reproductor confirme que está reproduciendo
@@ -377,7 +383,7 @@ async function playNext(guildId, queues, context = {}) {
         currentQ.replacingResource = false;
         logger.debug('[player] Flag replacingResource limpiado - reproducción confirmada', { guildId });
       }
-    }, 2000); // 2 segundos para dar tiempo al stream de estabilizarse
+    }, 500); // 0.5 segundos para dar tiempo al stream de estabilizarse
     
     // Iniciar/actualizar panel Now Playing
     try {
@@ -407,7 +413,7 @@ async function playNext(guildId, queues, context = {}) {
             error: err.message 
           });
         });
-      }, 5000); // Esperar 5 segundos antes de precargar
+      }, 3000); // Esperar 3 segundos antes de precargar
     }
     
     // Actualizar estadísticas si están disponibles
@@ -457,7 +463,7 @@ async function playNext(guildId, queues, context = {}) {
             error: err.message
           });
         });
-      }, 1000);
+      }, 500);
     } else {
       // No hay más canciones, desconectar
       try {
@@ -510,7 +516,7 @@ async function preloadNextInQueue(guildId, queue, context) {
       const stream = ytdl.downloadFromInfo(ytdlInfo, {
         filter: 'audioonly',
         quality: 'highestaudio',
-        highWaterMark: 1 << 25
+        highWaterMark: 1 << 22 // 4MB buffer (reducido de 32MB)
       });
       
       const resource = createAudioResource(stream, {

@@ -28,48 +28,28 @@ module.exports = {
         return interaction.editReply('❌ No hay nada en reproducción.');
       }
       
-      const s = q.songs[0];
-      const metadata = METADATA_CACHE.get(s.url) || {};
-      const elapsed = Math.floor(
-        (q.player.state?.resource?.playbackDuration || 0) / 1000
-      );
-      const total = s.durationSec || 0;
+      // Configurar el canal de texto para el panel
+      q.textChannelId = interaction.channel.id;
       
-      // Construir header con información
-      let header = total
-        ? `🎶 **${s.title}**\n⏱️ ${formatDuration(elapsed)} / ${formatDuration(total)} • 🔊 ${Math.round((q.volume ?? 1) * 100)}%`
-        : `🎶 **${s.title}**\n🔴 TRANSMISIÓN EN VIVO • 🔊 ${Math.round((q.volume ?? 1) * 100)}%`;
-      
-      // Agregar calidad si está disponible
-      if (metadata.quality) {
-        header += ` • 🎧 ${metadata.quality}`;
-      } else {
-        // Intentar obtener del estado del reproductor
-        const playerResource = q.player.state?.resource;
-        if (playerResource?.metadata?.quality) {
-          header += ` • 🎧 ${playerResource.metadata.quality}`;
-        } else {
-          // Mostrar calidad estimada
-          const qualityFallback = s.quality || 'Calidad no detectada';
-          header += ` • 🎧 ${qualityFallback}`;
-        }
+      // Iniciar el panel Now Playing persistente
+      try {
+        const { startNowPlayingPanel } = require('../../handlers/nowplaying-panel');
+        await startNowPlayingPanel(q, interaction.channel);
+        logger.debug('[nowplaying] Panel iniciado desde comando', { guildId: guild.id });
+      } catch (panelError) {
+        logger.error('[nowplaying] Error iniciando panel:', {
+          guildId: guild.id,
+          error: panelError.message
+        });
+        // Continuar mostrando información básica si falla el panel
       }
       
-      // Debug: información del cache
-      if (DEBUG_AUDIO) {
-        console.log(`[nowplaying:debug] URL: ${s.url}`);
-        console.log(`[nowplaying:debug] Metadata en cache:`, metadata);
-        console.log(`[nowplaying:debug] Quality:`, metadata.quality);
-      }
-      
-      // Agregar barra de progreso si no es livestream
-      const bar = total ? `\n${buildProgressBar(total, elapsed)}` : "";
-      
-      await interaction.editReply(header + bar);
+      // Confirmar que el panel se mostró
+      await interaction.editReply('✅ Panel de reproducción actualizado en este canal.');
       
       logger.command(`Now playing solicitado por ${interaction.user.tag}`, {
         guildId: guild.id,
-        song: s.title
+        song: q.songs[0].title
       });
     } catch (error) {
       logger.error('[nowplaying] Error ejecutando comando', {

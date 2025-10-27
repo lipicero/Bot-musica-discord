@@ -15,7 +15,7 @@ const logger = require('./logger');
 const { getYtDlpBinaryPath } = require('../services/playlist');
 
 const YT_DLP_TIMEOUT_MS = Number(process.env.YT_DLP_TIMEOUT_MS || 90000);
-const STREAM_TIMEOUT_MS = Number(process.env.YT_DLP_STREAM_TIMEOUT_MS || 45000);
+const STREAM_TIMEOUT_MS = Number(process.env.YT_DLP_STREAM_TIMEOUT_MS || 30000);
 let ytDlpInstance = null;
 let cachedCookiePath = null;
 let cachedCookieMtime = 0;

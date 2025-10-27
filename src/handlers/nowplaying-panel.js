@@ -18,14 +18,8 @@ function buildControlsComponents(q) {
   const volDownDisabled = volPercent <= 0;
   const volUpDisabled = volPercent >= 200;
   
-  // Fila 1: transporte básico
+  // Fila 1: transporte básico y modos
   const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('music_replay')
-      .setEmoji('🔄')
-      .setLabel('Reiniciar')
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(!hasSong),
     new ButtonBuilder()
       .setCustomId(isPaused ? 'music_resume' : 'music_pause')
       .setEmoji(isPaused ? '▶️' : '⏸️')
@@ -47,11 +41,23 @@ function buildControlsComponents(q) {
       .setCustomId('music_loop')
       .setEmoji('🔁')
       .setLabel('Bucle')
-      .setStyle(q.loop ? ButtonStyle.Success : ButtonStyle.Secondary)
+      .setStyle(q.loop ? ButtonStyle.Success : ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId('music_shuffle')
+      .setEmoji('🔀')
+      .setLabel('Aleatorio')
+      .setStyle(q.shuffleMode ? ButtonStyle.Success : ButtonStyle.Secondary)
+      .setDisabled(!canShuffle)
   );
   
   // Fila 2: controles de navegación y volumen
   const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('music_replay')
+      .setEmoji('🔄')
+      .setLabel('Reiniciar')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(!hasSong),
     new ButtonBuilder()
       .setCustomId('music_rewind')
       .setEmoji('⏪')
@@ -75,13 +81,7 @@ function buildControlsComponents(q) {
       .setEmoji('🔊')
       .setLabel('Vol +')
       .setStyle(ButtonStyle.Secondary)
-      .setDisabled(volUpDisabled),
-    new ButtonBuilder()
-      .setCustomId('music_shuffle')
-      .setEmoji('🔀')
-      .setLabel('Aleatorio')
-      .setStyle(q.shuffleMode ? ButtonStyle.Success : ButtonStyle.Secondary)
-      .setDisabled(!canShuffle)
+      .setDisabled(volUpDisabled)
   );
   
   // Fila 3: utilidades y enlaces
@@ -122,11 +122,30 @@ function buildNowPlayingEmbed(q) {
       .setDescription('No hay canciones en la cola');
   }
 
+  // Validar que el player existe
+  if (!q.player?.state) {
+    logger.warn('[nowplaying] Player state no disponible');
+    return new EmbedBuilder()
+      .setColor('#FF0000')
+      .setTitle('⏹️ Error de reproducción')
+      .setDescription('Estado del reproductor no disponible');
+  }
+
   const isPaused = q.player.state.status === AudioPlayerStatus.Paused;
   const embedColor = 0x5865f2;
-  const currentTime = q.player.state.resource?.playbackDuration || 0;
-  const currentSeconds = Math.floor(currentTime / 1000);
-  const totalSeconds = s.durationSec || 0;
+  const totalSeconds = s.durationSec || 0; // Definir totalSeconds aquí
+  
+  // Calcular tiempo de reproducción
+  let currentSeconds = 0;
+  
+  if (q.player.state.resource?.playbackDuration) {
+    currentSeconds = Math.floor(q.player.state.resource.playbackDuration / 1000);
+  }
+  
+  // Asegurar que no exceda la duración total
+  if (totalSeconds > 0 && currentSeconds > totalSeconds) {
+    currentSeconds = totalSeconds;
+  }
   
   // Construir el embed con campos
   const embed = new EmbedBuilder()
@@ -174,9 +193,14 @@ function buildNowPlayingEmbed(q) {
   }
 
   // Agregar barra de progreso en la descripción
-  if (totalSeconds) {
-    const progressBar = buildProgressBar(totalSeconds, currentSeconds, 24, 'spotify');
-    embed.setDescription(`${progressBar}\n${formatDuration(currentSeconds)} / ${formatDuration(totalSeconds)}`);
+  if (totalSeconds > 0) {
+    try {
+      const progressBar = buildProgressBar(totalSeconds, currentSeconds, 24, 'spotify');
+      embed.setDescription(`${progressBar}\n${formatDuration(currentSeconds)} / ${formatDuration(totalSeconds)}`);
+    } catch (progressError) {
+      logger.warn('[nowplaying] Error creando barra de progreso:', progressError.message);
+      embed.setDescription(`${formatDuration(currentSeconds)} / ${formatDuration(totalSeconds)}`);
+    }
   } else {
     embed.setDescription('🔴 **TRANSMISIÓN EN VIVO** - Sin barra de progreso');
   }
@@ -205,12 +229,20 @@ function buildNowPlayingEmbed(q) {
 }
 
 async function startNowPlayingPanel(q, textChannel) {
+  logger.debug('[nowplaying] Iniciando panel - songs:', q.songs?.length || 0, 'player status:', q.player?.state?.status);
+  
   try {
+    const embed = buildNowPlayingEmbed(q);
+    if (!embed) {
+      logger.error('[nowplaying] buildNowPlayingEmbed retornó null/undefined');
+      return;
+    }
+    
+    const components = buildControlsComponents(q);
+    
     // Si ya existe un panel válido, solo actualizar en lugar de crear uno nuevo
     if (q.nowPlayingMessage) {
       try {
-        const embed = buildNowPlayingEmbed(q);
-        const components = buildControlsComponents(q);
         await q.nowPlayingMessage.edit({ embeds: [embed], components: components });
         logger.debug('[nowplaying] Panel actualizado (reutilizado)');
         return;
@@ -226,8 +258,6 @@ async function startNowPlayingPanel(q, textChannel) {
     }
     
     // Crear nuevo panel
-    const embed = buildNowPlayingEmbed(q);
-    const components = buildControlsComponents(q);
     const message = await textChannel.send({ embeds: [embed], components: components });
     
     q.nowPlayingMessage = message;
@@ -235,9 +265,15 @@ async function startNowPlayingPanel(q, textChannel) {
     logger.debug('[nowplaying] Panel iniciado');
     
     if (q.nowPlayingInterval) clearInterval(q.nowPlayingInterval);
-    q.nowPlayingInterval = setInterval(async () => { await updateNowPlayingPanel(q); }, 2000);
+    q.nowPlayingInterval = setInterval(async () => { 
+      await updateNowPlayingPanel(q); 
+    }, 1000);
   } catch (error) {
-    logger.error('[nowplaying] Error al iniciar panel:', error.message);
+    logger.error('[nowplaying] Error al iniciar panel:', {
+      message: error.message,
+      stack: error.stack,
+      code: error.code
+    });
   }
 }
 

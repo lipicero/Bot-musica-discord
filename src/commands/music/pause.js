@@ -28,6 +28,14 @@ module.exports = {
       }
       
       q.player.pause();
+      q.isPausedByUser = true; // Marcar que el usuario pausó manualmente
+      
+      // Guardar el tiempo actual de reproducción para mostrarlo correctamente en el panel
+      if (q.player.state.resource?.playbackDuration) {
+        q.pausedAtTime = Math.floor(q.player.state.resource.playbackDuration / 1000);
+      } else if (q.lastPlaybackStart) {
+        q.pausedAtTime = Math.floor((Date.now() - q.lastPlaybackStart) / 1000);
+      }
       
       try {
         stopNowPlayingTicker(guild.id);

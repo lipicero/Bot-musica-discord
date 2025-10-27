@@ -44,7 +44,11 @@ module.exports = {
       
       const queueText = formatQueueMessage(q);
       await interaction.editReply(`⏭️ Saltado.\n\nCola actual:\n${queueText}`);
-      await renderNowPlaying(guild.id).catch(() => {});
+      
+      // Esperar un momento antes de actualizar el panel para que coincida con la reproducción
+      setTimeout(() => {
+        renderNowPlaying(guild.id).catch(() => {});
+      }, 2000);
       
       logger.command(`Skip ejecutado por ${interaction.user.tag}`, {
         guildId: guild.id,

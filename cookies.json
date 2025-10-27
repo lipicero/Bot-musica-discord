@@ -300,19 +300,6 @@
   },
   {
     "domain": ".youtube.com",
-    "expirationDate": 1760588668,
-    "hostOnly": false,
-    "httpOnly": false,
-    "name": "CONSISTENCY",
-    "path": "/",
-    "sameSite": "unspecified",
-    "secure": true,
-    "session": false,
-    "storeId": "0",
-    "value": "AKreu9vCdKel21gvM1rizWSkSax98MrS-rBkZ0aKsN0eMXekGH4j1vanMyc3t629WyWc3nYZFtabzZZ9tpNEfwLmT1DVFjBVvEHnfWdvPt0X-W_pFWRayjgoJE16UC-h4OjmthIUQqunz5g0RwUoWDboVgKHkfLdLNjDK7DhHgHLouTQwWWBaHjpGXJJwgjRvTIM_pxHRXU32BEy3t6M9qFKZBJGUjrUY7cTDf9Np_VhgL0rKupX90a_boy5ROZ4i63rVurZ1g4CIcjxj-bWgZv3QLMVupXvltp3MFewkje3XWo"
-  },
-  {
-    "domain": ".youtube.com",
     "expirationDate": 1767489215,
     "hostOnly": false,
     "httpOnly": true,
@@ -557,18 +544,5 @@
     "session": false,
     "storeId": "0",
     "value": "f6=40000080&repeat=NONE&autoplay=true&tz=America.Buenos_Aires&f7=100&volume=100&f5=30000"
-  },
-  {
-    "domain": "www.google.com",
-    "expirationDate": 1760609861,
-    "hostOnly": true,
-    "httpOnly": false,
-    "name": "UULE",
-    "path": "/",
-    "sameSite": "unspecified",
-    "secure": true,
-    "session": false,
-    "storeId": "0",
-    "value": "j+WzEsMTIsIjE3NjA1ODgyNjE5MDQwMDAiLG51bGwsWy0zNDYwODIwMDAsLTU4NDE5MzAwMF0sbnVsbCwzNjM3NDc4MCxudWxsLDZd"
   }
 ]

@@ -14,6 +14,10 @@ const { createAudioResourceWithYtDlp } = require('../utils/yt-dlp');
 // =================== MAPA GLOBAL DE COLAS ===================
 const queues = new Map();
 
+// Timeout para desconexión cuando la cola está vacía
+const emptyQueueTimeouts = new Map();
+const EMPTY_QUEUE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutos
+
 // Referencia a playNext (se configurará desde index.js)
 let playNextFn = null;
 let globalContext = null;
@@ -260,11 +264,20 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
         
         // Verificar si el reproductor realmente está en Idle
         // A veces puede haber falsos positivos
-        if (currentQueue.player?.state?.status !== AudioPlayerStatus.Idle) {
+        const currentStatus = currentQueue.player?.state?.status;
+        if (currentStatus !== AudioPlayerStatus.Idle) {
           logger.debug('[player] Cancelando avance - el reproductor ya no está en Idle', { 
             guildId, 
-            status: currentQueue.player?.state?.status 
+            status: currentStatus 
           });
+          return;
+        }
+        
+        // Verificar si el usuario pausó manualmente
+        // Cuando está pausado, después de ~45 segundos el stream se cierra y el estado cambia a Idle
+        // No queremos avanzar a la siguiente canción en este caso
+        if (currentQueue.isPausedByUser) {
+          logger.debug('[player] Cancelando avance - reproducción pausada por el usuario', { guildId });
           return;
         }
         
@@ -382,42 +395,56 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
             });
           });
         } else {
-          // No hay más canciones, desconectar
-          logger.audio('Cola vacía, desconectando...', { guildId });
+          // No hay más canciones, programar desconexión después de 10 minutos
+          logger.audio('Cola vacía, esperando 10 minutos antes de desconectar...', { guildId });
           
-          // Detener ticker de Now Playing
-          try {
-            const { stopNowPlayingTicker, deleteNowPlayingPanel } = require('./nowplaying-panel');
-            if (globalContext?.nowPlayingTickers) {
-              stopNowPlayingTicker(guildId, globalContext.nowPlayingTickers);
+          // Limpiar timeout anterior si existe
+          if (emptyQueueTimeouts.has(guildId)) {
+            clearTimeout(emptyQueueTimeouts.get(guildId));
+            emptyQueueTimeouts.delete(guildId);
+          }
+          
+          // Programar desconexión
+          const timeoutId = setTimeout(() => {
+            logger.audio('Timeout de cola vacía alcanzado, desconectando...', { guildId });
+            
+            // Detener ticker de Now Playing
+            try {
+              const { stopNowPlayingTicker, deleteNowPlayingPanel } = require('./nowplaying-panel');
+              if (globalContext?.nowPlayingTickers) {
+                stopNowPlayingTicker(guildId, globalContext.nowPlayingTickers);
+              }
+              
+              // Eliminar mensaje de Now Playing (async, sin await)
+              if (globalContext?.nowPlayingMessages && currentQueue.textChannelId && globalContext.client) {
+                globalContext.client.channels.fetch(currentQueue.textChannelId)
+                  .then(channel => {
+                    if (channel) {
+                      deleteNowPlayingPanel(guildId, channel, globalContext.nowPlayingMessages).catch(() => {});
+                    }
+                  })
+                  .catch(() => {});
+              }
+            } catch (panelError) {
+              logger.debug('[queue] Error limpiando panel:', { error: panelError.message });
             }
             
-            // Eliminar mensaje de Now Playing (async, sin await)
-            if (globalContext?.nowPlayingMessages && currentQueue.textChannelId && globalContext.client) {
-              globalContext.client.channels.fetch(currentQueue.textChannelId)
-                .then(channel => {
-                  if (channel) {
-                    deleteNowPlayingPanel(guildId, channel, globalContext.nowPlayingMessages).catch(() => {});
-                  }
-                })
-                .catch(() => {});
+            try {
+              const connection = getVoiceConnection(guildId);
+              connection?.destroy();
+              queues.delete(guildId);
+              emptyQueueTimeouts.delete(guildId);
+            } catch (err) {
+              logger.error('[player] Error al desconectar:', {
+                guildId,
+                error: err.message
+              });
             }
-          } catch (panelError) {
-            logger.debug('[queue] Error limpiando panel:', { error: panelError.message });
-          }
+          }, EMPTY_QUEUE_TIMEOUT_MS);
           
-          try {
-            const connection = getVoiceConnection(guildId);
-            connection?.destroy();
-            queues.delete(guildId);
-          } catch (err) {
-            logger.error('[player] Error al desconectar:', {
-              guildId,
-              error: err.message
-            });
-          }
+          emptyQueueTimeouts.set(guildId, timeoutId);
         }
-      }, 500); // Delay de 500ms (aumentado desde 100ms)
+      }, 200); // Delay de 200ms (reducido desde 500ms)
       
       // Handler personalizado si está disponible
       if (eventHandlers.onIdle) {
@@ -427,6 +454,7 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
     
     // Crear objeto de cola
     q = {
+      guildId: guildId, // Agregar guildId para referencia
       songs: [],
       player,
       connection: null,
@@ -444,6 +472,7 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
       upgradeTimer: null,
       currentTrackToken: null,
       replacingResource: false,
+      isPausedByUser: false, // Flag para indicar si el usuario pausó manualmente
       _directUrlCache: new Map(),
       _directUrlTimestamp: new Map(),
       _lastSeekTime: null,
@@ -480,6 +509,14 @@ function tryEnqueue(queue, song) {
       max: MAX_QUEUE_LENGTH
     });
     return false;
+  }
+  
+  // Cancelar timeout de cola vacía si existe
+  const guildId = queue.guildId;
+  if (guildId && emptyQueueTimeouts.has(guildId)) {
+    clearTimeout(emptyQueueTimeouts.get(guildId));
+    emptyQueueTimeouts.delete(guildId);
+    logger.debug('[queue] Timeout de cola vacía cancelado - nueva canción agregada', { guildId });
   }
   
   queue.songs.push(song);
@@ -738,6 +775,12 @@ function deleteQueue(guildId) {
       clearInterval(queue.uiInterval);
     }
     
+    // Limpiar timeout de cola vacía
+    if (emptyQueueTimeouts.has(guildId)) {
+      clearTimeout(emptyQueueTimeouts.get(guildId));
+      emptyQueueTimeouts.delete(guildId);
+    }
+    
     // Limpiar cache
     queue._directUrlCache?.clear();
     queue._directUrlTimestamp?.clear();
@@ -830,6 +873,18 @@ function getGlobalStats() {
   };
 }
 
+/**
+ * Limpia el timeout de cola vacía para un servidor
+ * @param {string} guildId - ID del servidor
+ */
+function clearEmptyQueueTimeout(guildId) {
+  if (emptyQueueTimeouts.has(guildId)) {
+    clearTimeout(emptyQueueTimeouts.get(guildId));
+    emptyQueueTimeouts.delete(guildId);
+    logger.debug('[queue] Timeout de cola vacía limpiado manualmente', { guildId });
+  }
+}
+
 // =================== EXPORTS ===================
 module.exports = {
   // Funciones principales
@@ -860,5 +915,8 @@ module.exports = {
   
   // Estadísticas
   getQueueStats,
-  getGlobalStats
+  getGlobalStats,
+  
+  // Utilidades
+  clearEmptyQueueTimeout
 };

@@ -17,6 +17,7 @@ module.exports = {
    * @param {object} context - Contexto con queues, renderNowPlaying, formatQueueMessage
    */
   async execute(interaction, client, { queues, renderNowPlaying, formatQueueMessage }) {
+    let cleaned = false;
     try {
       await interaction.deferReply();
       
@@ -30,6 +31,7 @@ module.exports = {
       // Mantener solo la canción actual
       if (q.songs.length > 1) {
         q.songs = [q.songs[0]];
+        cleaned = true;
       }
       
       const queueText = formatQueueMessage(q);
@@ -39,16 +41,13 @@ module.exports = {
         `🧹 Cola limpiada (se mantiene la canción actual).\n\nCola actual:\n${queueText}`
       );
       
-      logger.command(`Clear ejecutado por ${interaction.user.tag}`, {
-        guildId: guild.id
-      });
     } catch (error) {
       logger.error('[clear] Error ejecutando comando', {
         error: error.message,
         user: interaction.user.tag
       });
       
-      const errorMsg = '❌ Error al limpiar la cola';
+      const errorMsg = cleaned ? 'Cola limpiada, pero error al mostrar la información.' : '❌ Error al limpiar la cola';
       try {
         if (interaction.deferred || interaction.replied) {
           await interaction.editReply(errorMsg);
@@ -56,6 +55,12 @@ module.exports = {
           await interaction.reply({ content: errorMsg, flags: 1 << 6 });
         }
       } catch {}
+    }
+
+    if (cleaned) {
+      logger.command(`Clear ejecutado por ${interaction.user.tag}`, {
+        guildId: interaction.guild.id
+      });
     }
   }
 };
