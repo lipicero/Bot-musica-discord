@@ -9,7 +9,7 @@ const { formatDuration, buildProgressBar } = require('../utils/formatters');
 const logger = require('../utils/logger');
 
 function buildControlsComponents(q) {
-  const isPaused = q.player.state.status === AudioPlayerStatus.Paused;
+  const isPaused = q.player.state.status === AudioPlayerStatus.Paused || q.isPausedByUser;
   const s = q.songs?.[0];
   const canShuffle = (q.songs?.length || 0) > 2;
   const hasSong = !!s;
@@ -131,11 +131,11 @@ function buildNowPlayingEmbed(q) {
       .setDescription('Estado del reproductor no disponible');
   }
 
-  const isPaused = q.player.state.status === AudioPlayerStatus.Paused;
+  const isPaused = q.player.state.status === AudioPlayerStatus.Paused || q.isPausedByUser;
   const embedColor = 0x5865f2;
   const totalSeconds = s.durationSec || 0; // Definir totalSeconds aquí
   
-  logger.debug(`[nowplaying] Estado del player: ${q.player.state.status}, isPaused: ${isPaused}, pausedAtTime: ${q.pausedAtTime}, lastPlaybackStart: ${q.lastPlaybackStart}`, { guildId: q.guildId });
+  logger.debug(`[nowplaying] Estado del player: ${q.player.state.status}, isPaused: ${isPaused}, isPausedByUser: ${q.isPausedByUser}, pausedAtTime: ${q.pausedAtTime}, lastPlaybackStart: ${q.lastPlaybackStart}`, { guildId: q.guildId });
   
   // Calcular tiempo de reproducción de manera más confiable
   let currentSeconds = 0;

@@ -157,6 +157,13 @@ async function handlePause(interaction, q) {
   
   q.player.pause();
   q.isPausedByUser = true; // Marcar que el usuario pausó manualmente
+  
+  logger.warn('[button-pause] Pausa desde botón - isPausedByUser configurado', {
+    guildId: interaction.guildId,
+    status: q.player.state.status,
+    isPausedByUser: q.isPausedByUser
+  });
+  
   await interaction.deferUpdate();
 }
 
@@ -168,12 +175,87 @@ async function handleResume(interaction, q) {
     return interaction.reply({ content: '❌ No hay nada reproduciendo.', ephemeral: true });
   }
   
-  if (q.player.state.status !== AudioPlayerStatus.Paused) {
+  // Si el player está pausado normalmente
+  if (q.player.state.status === AudioPlayerStatus.Paused) {
+    q.player.unpause();
+    q.isPausedByUser = false; // Limpiar el flag al reanudar
+    
+    logger.warn('[button-resume] Reanudar desde botón - player estaba paused', {
+      guildId: interaction.guildId,
+      status: q.player.state.status,
+      isPausedByUser: q.isPausedByUser
+    });
+  }
+  // Si el player está idle pero el usuario lo considera pausado (hubo un error)
+  else if (q.player.state.status === AudioPlayerStatus.Idle && q.isPausedByUser) {
+    logger.warn('[button-resume] Intentando reanudar desde Idle con isPausedByUser=true', {
+      guildId: interaction.guildId,
+      status: q.player.state.status,
+      isPausedByUser: q.isPausedByUser
+    });
+    
+    // Intentar reproducir la canción actual nuevamente
+    const { playNext } = require('./player');
+    try {
+      await playNext(q.guildId, new Map([[q.guildId, q]]), {});
+      
+      // Configurar un listener para limpiar el flag cuando la reproducción realmente empiece
+      let hasStartedPlaying = false;
+      const onStateChange = (oldState, newState) => {
+        logger.debug('[button-resume] State change detectado', {
+          guildId: interaction.guildId,
+          oldStatus: oldState.status,
+          newStatus: newState.status,
+          isPausedByUser: q.isPausedByUser
+        });
+        
+        if (newState.status === AudioPlayerStatus.Playing && !hasStartedPlaying) {
+          hasStartedPlaying = true;
+          q.isPausedByUser = false; // Limpiar el flag solo cuando realmente esté reproduciendo
+          q.player.removeListener('stateChange', onStateChange);
+          logger.debug('[button-resume] Flag isPausedByUser limpiado - reproducción iniciada', {
+            guildId: interaction.guildId
+          });
+        } else if (newState.status === AudioPlayerStatus.Idle && hasStartedPlaying) {
+          // Si vuelve a Idle después de haber empezado a reproducir, no limpiar el flag
+          logger.debug('[button-resume] Player volvió a Idle después de Playing, manteniendo flag', {
+            guildId: interaction.guildId
+          });
+        }
+      };
+      
+      q.player.on('stateChange', onStateChange);
+      
+      // Timeout de seguridad más corto - si no hay cambios de estado en 5 segundos, asumir que falló
+      setTimeout(() => {
+        q.player.removeListener('stateChange', onStateChange);
+        if (!hasStartedPlaying && q.isPausedByUser) {
+          logger.warn('[button-resume] Timeout sin reproducción - manteniendo isPausedByUser=true', {
+            guildId: interaction.guildId,
+            status: q.player.state.status
+          });
+          // No limpiar el flag si no empezó a reproducir
+        } else if (hasStartedPlaying) {
+          logger.debug('[button-resume] Timeout después de reproducción iniciada', {
+            guildId: interaction.guildId
+          });
+        }
+      }, 5000); // 5 segundos de timeout
+      
+      logger.warn('[button-resume] Reanudar desde botón - reiniciando canción después de error', {
+        guildId: interaction.guildId,
+        status: q.player.state.status,
+        isPausedByUser: q.isPausedByUser
+      });
+    } catch (error) {
+      logger.error('[button-resume] Error al reanudar canción', { error: error.message });
+      return interaction.reply({ content: '❌ Error al reanudar la reproducción.', ephemeral: true });
+    }
+  }
+  else {
     return interaction.reply({ content: '▶️ Ya está reproduciendo.', ephemeral: true });
   }
   
-  q.player.unpause();
-  q.isPausedByUser = false; // Limpiar el flag al reanudar
   await interaction.deferUpdate();
 }
 

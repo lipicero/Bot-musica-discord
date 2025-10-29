@@ -3641,7 +3641,7 @@ function stopNowPlayingTicker(guildId) {
 
 // ===== UI: Now Playing Embed + Botones =====
 function buildControlsComponents(q) {
-  const isPaused = q.player.state.status === AudioPlayerStatus.Paused;
+  const isPaused = q.player.state.status === AudioPlayerStatus.Paused || q.isPausedByUser;
   const s = q.songs?.[0];
   const vol = Math.max(0, Math.min(2, q.volume ?? 1));
   const volDownDisabled = vol <= 0.01;
@@ -3799,7 +3799,7 @@ function buildNowPlayingEmbed(q, guild) {
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
     .setTitle(
-      q.player?.state?.status === AudioPlayerStatus.Paused
+      (q.player?.state?.status === AudioPlayerStatus.Paused || q.isPausedByUser)
         ? "⏸️ Pausado"
         : "🎶 Reproduciendo ahora"
     )

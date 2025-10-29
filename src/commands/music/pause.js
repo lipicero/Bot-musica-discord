@@ -37,6 +37,13 @@ module.exports = {
         q.pausedAtTime = Math.floor((Date.now() - q.lastPlaybackStart) / 1000);
       }
       
+      logger.warn('[pause] Canción pausada - isPausedByUser configurado', {
+        guildId: guild.id,
+        status: q.player.state.status,
+        isPausedByUser: q.isPausedByUser,
+        pausedAtTime: q.pausedAtTime
+      });
+      
       try {
         stopNowPlayingTicker(guild.id);
       } catch {}

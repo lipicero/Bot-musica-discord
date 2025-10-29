@@ -84,6 +84,21 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
         logger.debug(`[player] Estado: ${os} -> ${ns} (${Math.floor(ms / 1000)}s)`, { guildId });
       }
       
+      // Log especial cuando cambia de Paused a Idle
+      if (oldState?.status === AudioPlayerStatus.Paused && newState?.status === AudioPlayerStatus.Idle) {
+        logger.warn('[player] ⚠️ Cambió de Paused a Idle', {
+          guildId,
+          isPausedByUser: qq.isPausedByUser,
+          playbackDuration: qq.player?.state?.resource?.playbackDuration || 0
+        });
+        
+        // Si el usuario pausó manualmente y el stream se cerró, marcar que no debe avanzar
+        if (qq.isPausedByUser) {
+          qq.preventAutoAdvance = true;
+          logger.warn('[player] Marcando para prevenir avance automático', { guildId });
+        }
+      }
+      
       // Handler personalizado si está disponible
       if (eventHandlers.onStateChange) {
         eventHandlers.onStateChange(guildId, oldState, newState, queues);
@@ -185,6 +200,16 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
         return;
       }
       
+      // Si el usuario pausó manualmente, no saltar automáticamente por errores
+      // El stream se cerrará y el handler de Idle decidirá qué hacer
+      if (qq.isPausedByUser) {
+        logger.warn('[player] Error mientras pausado - esperando que el stream se cierre naturalmente', { 
+          guildId,
+          isPausedByUser: qq.isPausedByUser
+        });
+        return;
+      }
+      
       // Saltar la canción que falló
       const failedSong = qq.songs.shift();
       if (failedSong) {
@@ -242,6 +267,14 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
       const qq = queues.get(guildId);
       if (!qq) return;
       
+      logger.warn('[player] Evento Idle disparado', { 
+        guildId, 
+        status: qq.player?.state?.status,
+        isPausedByUser: qq.isPausedByUser,
+        preventAutoAdvance: qq.preventAutoAdvance,
+        songsLength: qq.songs?.length || 0
+      });
+      
       // Si está reemplazando recurso (seek, cambio de volumen, o nueva canción iniciando), ignorar
       if (qq.replacingResource) {
         qq.replacingResource = false;
@@ -276,8 +309,12 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
         // Verificar si el usuario pausó manualmente
         // Cuando está pausado, después de ~45 segundos el stream se cierra y el estado cambia a Idle
         // No queremos avanzar a la siguiente canción en este caso
-        if (currentQueue.isPausedByUser) {
-          logger.debug('[player] Cancelando avance - reproducción pausada por el usuario', { guildId });
+        logger.warn('[player] Verificando pausa antes del check - isPausedByUser:', currentQueue.isPausedByUser, 'preventAutoAdvance:', currentQueue.preventAutoAdvance, 'status:', currentStatus, { guildId });
+        if (currentQueue.isPausedByUser || currentQueue.preventAutoAdvance) {
+          logger.warn('[player] Cancelando avance - reproducción pausada por el usuario o marcado para prevenir avance', { guildId });
+          
+          // Limpiar el flag
+          currentQueue.preventAutoAdvance = false;
           return;
         }
         
@@ -473,6 +510,7 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
       currentTrackToken: null,
       replacingResource: false,
       isPausedByUser: false, // Flag para indicar si el usuario pausó manualmente
+      currentSongUrl: null, // URL de la canción actualmente reproduciéndose
       _directUrlCache: new Map(),
       _directUrlTimestamp: new Map(),
       _lastSeekTime: null,

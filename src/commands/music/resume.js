@@ -30,6 +30,12 @@ module.exports = {
       q.player.unpause();
       q.isPausedByUser = false; // Limpiar el flag al reanudar
       
+      logger.warn('[resume] Canción reanudada - isPausedByUser limpiado', {
+        guildId: guild.id,
+        status: q.player.state.status,
+        isPausedByUser: q.isPausedByUser
+      });
+      
       // Limpiar el tiempo pausado ya que se reanuda
       delete q.pausedAtTime;
       
