@@ -58,7 +58,39 @@ async function buildYtdlRequestOptions(videoIdOrUrl) {
   // 1. Variables de entorno directas (formato header)
   ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
   
-  // 2. Archivo cookies.json (formato preferido para ytdl-core)
+  // 2. Archivo cookies.txt (formato Netscape)
+  if (!ytCookie) {
+    try {
+      const cookieTxtPath = path.join(process.cwd(), 'cookies.txt');
+      if (fs.existsSync(cookieTxtPath)) {
+        const cookieContent = fs.readFileSync(cookieTxtPath, 'utf8');
+        const cookieLines = cookieContent.split('\n').filter(line => {
+          line = line.trim();
+          return line && !line.startsWith('#') && !line.startsWith('\n');
+        });
+        
+        // Parsear formato Netscape: domain flag path secure expiration name value
+        const cookies = [];
+        for (const line of cookieLines) {
+          const parts = line.split('\t');
+          if (parts.length >= 7) {
+            cookies.push(`${parts[5]}=${parts[6]}`);
+          }
+        }
+        
+        if (cookies.length > 0) {
+          ytCookie = cookies.join('; ');
+          const logger = require('./logger');
+          logger.debug('[ytdl] Cookies cargadas desde cookies.txt', { count: cookies.length });
+        }
+      }
+    } catch (error) {
+      const logger = require('./logger');
+      logger.warn('[ytdl] Error cargando cookies.txt', { error: error.message });
+    }
+  }
+  
+  // 3. Archivo cookies.json (formato preferido para ytdl-core)
   if (!ytCookie) {
     try {
       const cookieJsonPath = path.join(process.cwd(), 'cookies.json');

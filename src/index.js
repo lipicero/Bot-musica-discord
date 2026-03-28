@@ -60,15 +60,13 @@ process.on('unhandledRejection', (reason, promise) => {
 process.env.YTDL_NO_UPDATE = "1";
 require("dotenv").config({ quiet: true });
 
-// Configurar ffmpeg-static si está disponible
+// Configurar ffmpeg: usar del sistema si está disponible
 try {
-  const ffmpegPath = require("ffmpeg-static");
-  if (ffmpegPath) {
-    process.env.FFMPEG_PATH = ffmpegPath;
-    logger.info("[ffmpeg] ffmpeg-static configurado");
-  }
+  // Intentar usar ffmpeg del sistema primero (disponible en PATH después de instalar con winget)
+  process.env.FFMPEG_PATH = 'ffmpeg';
+  logger.info("[ffmpeg] Configurado para usar ffmpeg del sistema");
 } catch (_) {
-  logger.warn("[ffmpeg] ffmpeg-static no instalado; se intentará sin FFmpeg");
+  logger.warn("[ffmpeg] Error configurando ffmpeg");
 }
 
 // =================== IMPORTAR MÓDULOS ===================

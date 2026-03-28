@@ -10,13 +10,17 @@ const http = require('http');
 const https = require('https');
 const { Readable } = require('stream');
 const { StreamType, createAudioResource } = require('@discordjs/voice');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 const YTDlpWrap = require('yt-dlp-wrap').default;
 const logger = require('./logger');
 const { getYtDlpBinaryPath } = require('../services/playlist');
 
-const YT_DLP_TIMEOUT_MS = Number(process.env.YT_DLP_TIMEOUT_MS || 90000);
-const STREAM_TIMEOUT_MS = Number(process.env.YT_DLP_STREAM_TIMEOUT_MS || 30000);
+const execFileAsync = promisify(execFile);
+const YT_DLP_TIMEOUT_MS = Number(process.env.YT_DLP_TIMEOUT_MS || 120000); // Aumentado a 120 segundos
+const STREAM_TIMEOUT_MS = Number(process.env.YT_DLP_STREAM_TIMEOUT_MS || 45000); // Aumentado a 45 segundos
 let ytDlpInstance = null;
+let ytDlpBinaryPath = null;
 let cachedCookiePath = null;
 let cachedCookieMtime = 0;
 
@@ -25,6 +29,7 @@ function getYtDlpInstance() {
 
   try {
     const binaryPath = getYtDlpBinaryPath();
+    ytDlpBinaryPath = binaryPath;
     ytDlpInstance = binaryPath ? new YTDlpWrap(binaryPath) : new YTDlpWrap();
     return ytDlpInstance;
   } catch (error) {
@@ -35,6 +40,21 @@ function getYtDlpInstance() {
 
 function ensureNetscapeCookieFile() {
   try {
+    // Primero verificar si existe cookies.txt en formato Netscape
+    const cookieTxtPath = path.join(process.cwd(), 'cookies.txt');
+    if (fs.existsSync(cookieTxtPath)) {
+      const stat = fs.statSync(cookieTxtPath);
+      // Cachear la ruta para no verificar en cada llamada
+      if (cachedCookiePath === cookieTxtPath && cachedCookieMtime === stat.mtimeMs) {
+        return cachedCookiePath;
+      }
+      cachedCookiePath = cookieTxtPath;
+      cachedCookieMtime = stat.mtimeMs;
+      logger.debug('[yt-dlp] Usando cookies.txt existente');
+      return cachedCookiePath;
+    }
+    
+    // Fallback: buscar cookies.json y convertirlo
     const cookieJsonPath = path.join(process.cwd(), 'cookies.json');
     if (!fs.existsSync(cookieJsonPath)) {
       cachedCookiePath = null;
@@ -85,24 +105,93 @@ function ensureNetscapeCookieFile() {
   }
 }
 
+/**
+ * Obtiene solo la URL del stream (RÁPIDO)
+ */
+async function getStreamUrlFast(url) {
+  // Inicializar para obtener el binario path
+  getYtDlpInstance();
+  
+  if (!ytDlpBinaryPath) {
+    logger.debug('[yt-dlp] No hay ruta de binario configurada');
+    return null;
+  }
+
+  // Cliente Android no requiere cookies ni signature solving
+  const args = [
+    '--get-url',  // Solo devolver URL, no metadata
+    '--no-warnings',
+    '--no-check-certificate',
+    '--ignore-config',
+    '--no-playlist',
+    '--skip-download',
+    '--no-cache-dir',
+    '--extractor-retries', '3',
+    '-f', 'bestaudio',  // Usar formato simple que siempre funciona
+    '--socket-timeout', '30',  // Aumentar para conexiones lentas
+    '--extractor-args', 'youtube:player_client=android'  // Cliente Android sin signature solving
+  ];
+
+  // No usar cookies con cliente Android (no las soporta)
+  
+  args.push(url);
+
+  try {
+    // Usar execFile directamente con timeout
+    const { stdout, stderr } = await execFileAsync(ytDlpBinaryPath, args, {
+      timeout: 90000, // 90 segundos para dar suficiente tiempo
+      maxBuffer: 10 * 1024 * 1024, // 10MB buffer
+      windowsHide: true
+    });
+    
+    const output = stdout.trim();
+    
+    // Registrar stderr solo si hay algo importante (ignorar warnings menores)
+    if (stderr && stderr.length > 0) {
+      logger.debug('[yt-dlp] stderr output', { stderr: stderr.substring(0, 200) });
+    }
+    
+    // Validar que la salida parece una URL
+    if (output && (output.startsWith('http://') || output.startsWith('https://'))) {
+      logger.debug('[yt-dlp] URL obtenida exitosamente', { urlLength: output.length });
+      return output;
+    }
+    
+    logger.debug('[yt-dlp] Salida no es una URL válida', { output: output.substring(0, 100) });
+    return null;
+  } catch (error) {
+    // No registrar como warning, solo debug, porque el fallback se encargará
+    logger.debug('[yt-dlp] getStreamUrlFast falló, continuará con fallback', { 
+      error: error.message,
+      code: error.code,
+      signal: error.signal
+    });
+    return null;
+  }
+}
+
 async function execYtDlpJson(url) {
   const ytDlp = getYtDlpInstance();
   if (!ytDlp) return null;
 
-  const cookiePath = ensureNetscapeCookieFile();
+  // Cliente Android no requiere cookies
   const args = [
     '--dump-single-json',
     '--no-warnings',
     '--no-check-certificate',
     '--ignore-config',
     '--no-playlist',
-    '-f', 'bestaudio[ext=webm][acodec=opus]/bestaudio/best',
-    '--socket-timeout', String(Math.floor(STREAM_TIMEOUT_MS / 1000)),
+    '--skip-download', // No descargar, solo obtener metadata
+    '--no-cache-dir',
+    '--extractor-retries', '1',  // Reducido a 1 para velocidad máxima
+    '--fragment-retries', '1',
+    '--abort-on-error',  // Fallar rápido
+    '-f', 'bestaudio',  // Formato simple
+    '--socket-timeout', '10',
+    '--extractor-args', 'youtube:player_client=android'  // Cliente Android sin signature solving
   ];
 
-  if (cookiePath) {
-    args.push('--cookies', cookiePath);
-  }
+  // No usar cookies con cliente Android
 
   args.push(url);
 
@@ -241,62 +330,81 @@ function requestStream(streamUrl, headers) {
 }
 
 async function createAudioResourceWithYtDlp(url, volume = 1.0) {
-  logger.debug('[yt-dlp] Creando recurso de audio', { url });
+  logger.info('[yt-dlp] Obteniendo URL del stream...', { url });
   
-  const info = await execYtDlpJson(url);
-  const normalized = normalizeInfo(info);
-
-  if (!normalized || !normalized.url) {
-    throw new Error('yt-dlp no devolvió una URL válida');
+  // Inicializar para obtener el binario path
+  getYtDlpInstance();
+  
+  if (!ytDlpBinaryPath) {
+    throw new Error('yt-dlp binary no encontrado');
   }
 
-  logger.debug('[yt-dlp] Info normalizada', {
-    ext: normalized.ext,
-    acodec: normalized.acodec,
-    abr: normalized.abr,
-    urlLength: normalized.url.length
-  });
-
-  const stream = await requestStream(normalized.url, normalized.headers);
-  const inputType = inferStreamType(normalized);
-
-  logger.debug('[yt-dlp] Stream obtenido, creando recurso', {
-    inputType: StreamType[inputType] || inputType,
-    readable: stream.readable,
-    destroyed: stream.destroyed
-  });
-
-  const resource = createAudioResource(stream, {
-    inputType,
-    inlineVolume: true
-  });
-
-  if (resource.volume) {
-    resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, volume)));
-  }
-
-  resource.metadata = {
-    source: 'yt-dlp',
-    abr: normalized.abr || null
-  };
+  // Cliente Android no requiere cookies
   
-  // Agregar información del video para metadata
-  resource.videoInfo = info;
+  // Usar yt-dlp para descargar directamente y hacer stream
+  const args = [
+    '--no-warnings',
+    '--no-check-certificate',
+    '--ignore-config',
+    '--no-playlist',
+    '-f', 'bestaudio/best',  // Mejor audio disponible
+    '-o', '-',  // Output a stdout
+    '--extractor-args', 'youtube:player_client=android'  // Cliente Android sin signature solving
+  ];
 
-  // Agregar listener para errores en el playStream
-  if (resource.playStream) {
-    resource.playStream.on('error', (err) => {
-      logger.error('[yt-dlp] Error en playStream del recurso', { error: err.message });
+  // No usar cookies con cliente Android
+  
+  args.push(url);
+
+  try {
+    const { spawn } = require('child_process');
+    const process = spawn(ytDlpBinaryPath, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true
     });
+
+    let hasData = false;
+    const timeout = setTimeout(() => {
+      if (!hasData) {
+        process.kill();
+      }
+    }, 30000); // 30 segundos para empezar
+
+    process.stdout.once('data', () => {
+      hasData = true;
+      clearTimeout(timeout);
+    });
+
+    process.stderr.on('data', (data) => {
+      const msg = data.toString();
+      if (msg.includes('ERROR')) {
+        logger.warn('[yt-dlp] stderr:', { msg: msg.substring(0, 200) });
+      }
+    });
+
+    const resource = createAudioResource(process.stdout, {
+      inputType: StreamType.Arbitrary,
+      inlineVolume: true
+    });
+
+    if (resource.volume) {
+      resource.volume.setVolumeLogarithmic(Math.max(0, Math.min(2, volume)));
+    }
+
+    resource.metadata = { source: 'yt-dlp-stream' };
     
-    resource.playStream.on('close', () => {
-      logger.debug('[yt-dlp] playStream cerrado');
-    });
+    if (resource.playStream) {
+      resource.playStream.on('error', (err) => {
+        logger.error('[yt-dlp] Error en playStream', { error: err.message });
+      });
+    }
+
+    logger.info('[yt-dlp] ✓ Recurso creado con streaming directo');
+    return resource;
+  } catch (error) {
+    logger.error('[yt-dlp] Error creando recurso', { error: error.message });
+    throw error;
   }
-
-  logger.debug('[yt-dlp] Recurso de audio creado exitosamente');
-
-  return resource;
 }
 
 /**
