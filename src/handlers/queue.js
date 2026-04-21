@@ -515,6 +515,7 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
       _directUrlTimestamp: new Map(),
       _lastSeekTime: null,
       _lastSeekTimestamp: null,
+      playbackOffset: 0, // Offset de inicio en segundos (para seeks)
     };
     
     queues.set(guildId, q);

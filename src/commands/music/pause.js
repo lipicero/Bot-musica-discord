@@ -31,10 +31,11 @@ module.exports = {
       q.isPausedByUser = true; // Marcar que el usuario pausó manualmente
       
       // Guardar el tiempo actual de reproducción para mostrarlo correctamente en el panel
+      const offset = q.playbackOffset || 0;
       if (q.player.state.resource?.playbackDuration) {
-        q.pausedAtTime = Math.floor(q.player.state.resource.playbackDuration / 1000);
+        q.pausedAtTime = offset + Math.floor(q.player.state.resource.playbackDuration / 1000);
       } else if (q.lastPlaybackStart) {
-        q.pausedAtTime = Math.floor((Date.now() - q.lastPlaybackStart) / 1000);
+        q.pausedAtTime = offset + Math.floor((Date.now() - q.lastPlaybackStart) / 1000);
       }
       
       logger.warn('[pause] Canción pausada - isPausedByUser configurado', {

@@ -77,34 +77,23 @@ function buildProgressBar(totalSec, elapsedSec, size = 20, style = 'modern') {
     },
     spotify: {
       filled: '━',
-      empty: '━',
-      cursor: '⚪',
+      empty: '─',
+      cursor: '🔵',
       brackets: ['', '']
     }
   };
   
   const s = styles[style] || styles.modern;
-  let bar = '';
   
-  // Crear barra con colores usando formato especial
-  for (let i = 0; i < size; i++) {
-    if (i === pos) {
-      bar += s.cursor;
-    } else if (i < filled) {
-      bar += s.filled;
-    } else {
-      bar += s.empty;
-    }
-  }
+  // Calcular posiciones precisas
+  const filledChars = Math.max(0, Math.min(size, Math.floor(ratio * size)));
+  const emptyChars = Math.max(0, size - filledChars - 1);
   
-  // Para estilo modern/spotify, colorear la parte llena
-  if (style === 'modern' || style === 'spotify') {
-    const filledPart = s.filled.repeat(filled);
-    const emptyPart = s.empty.repeat(size - filled);
-    bar = `${filledPart}${s.cursor}${emptyPart}`;
-  }
+  const filledPart = s.filled.repeat(filledChars);
+  const emptyPart = s.empty.repeat(emptyChars);
   
-  return bar;
+  const bar = `${filledPart}${s.cursor}${emptyPart}`;
+  return `${s.brackets[0]}${bar}${s.brackets[1]}`;
 }
 
 /**

@@ -10,16 +10,8 @@ const { metadataCache } = require('./cache');
 const { formatDuration } = require('../utils/formatters');
 const logger = require('../utils/logger');
 
-// Importar yt-dlp si está disponible
-let ytdlp = null;
-try {
-  const playDl = require('play-dl');
-  if (playDl?.yt_validate === 'function') {
-    ytdlp = playDl;
-  }
-} catch (err) {
-  logger.warn('yt-dlp no disponible, usando solo ytdl-core');
-}
+// Importar utilidad de yt-dlp
+const { getVideoInfoWithYtDlp } = require('../utils/yt-dlp');
 
 // =================== MAPEO DE ITAGS ===================
 const ITAG_QUALITY_MAP = {
@@ -187,37 +179,29 @@ async function getEnhancedMetadata(url) {
     let views = null;
 
     // 3. Intentar con yt-dlp primero (más confiable)
-    if (ytdlp) {
-      try {
-        const info = await ytdlp(url, {
-          dumpSingleJson: true,
-          noPlaylist: true,
-          noCheckCertificates: true,
-          preferFreeFormats: true,
-          youtubeSkipDashManifest: true,
-        });
+    try {
+      const info = await getVideoInfoWithYtDlp(url);
+      
+      if (info) {
+        title = info.title || title;
+        duration = Math.floor(info.duration || 0);
+        thumbnail = info.thumbnail || thumbnail;
+        views = info.viewCount;
+        quality = info.abr ? `${info.abr}kbps` : (info.acodec || null);
         
-        if (info) {
-          title = info.title || title;
-          duration = Math.floor(info.duration || 0);
-          thumbnail = getHighQualityThumbnail(info) || info.thumbnail;
-          views = info.view_count;
-          quality = extractQualityFromYtDlp(info);
-          
-          if (DEBUG_AUDIO) {
-            logger.debug('[yt-dlp] Metadatos obtenidos', {
-              title,
-              duration,
-              quality,
-              views
-            });
-          }
+        if (DEBUG_AUDIO) {
+          logger.debug('[yt-dlp] Metadatos obtenidos', {
+            title,
+            duration,
+            quality,
+            views
+          });
         }
-      } catch (ytdlpErr) {
-        logger.warn('[yt-dlp] Error, usando fallback a ytdl-core', {
-          error: ytdlpErr.message
-        });
       }
+    } catch (ytdlpErr) {
+      logger.warn('[yt-dlp] Error, usando fallback a ytdl-core', {
+        error: ytdlpErr.message
+      });
     }
 
     // 4. Fallback a ytdl-core si yt-dlp falla o falta información
@@ -265,7 +249,9 @@ async function getEnhancedMetadata(url) {
     const metadata = {
       title,
       duration,
+      durationSec: duration, 
       thumbnail,
+      thumbnailUrl: thumbnail, // Agregado para compatibilidad
       quality,
       views,
       url,
@@ -384,6 +370,7 @@ function preloadMetadata(urls) {
 
 // =================== EXPORTS ===================
 module.exports = {
+  fetchMetadata: getEnhancedMetadata, // Alias para compatibilidad
   getEnhancedMetadata,
   updateMetadataQuality,
   getBatchMetadata,

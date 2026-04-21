@@ -5,16 +5,17 @@
 
 const play = require('play-dl');
 const { createAudioResource, StreamType } = require('@discordjs/voice');
-const { logger } = require('./logger');
+const logger = require('./logger');
 
 /**
  * Obtiene stream de audio usando play-dl
  * @param {string} url - URL del video de YouTube
+ * @param {number} seekAt - Tiempo en segundos para iniciar (opcional)
  * @returns {Promise<{resource: AudioResource, info: object}>}
  */
-async function getPlayDlStream(url) {
+async function getPlayDlStream(url, seekAt = 0) {
   try {
-    logger.audio('[play-dl] Obteniendo información del video', { url });
+    logger.audio('[play-dl] Obteniendo información del video', { url, seekAt });
     
     // Obtener información del video
     const info = await play.video_info(url);
@@ -26,8 +27,9 @@ async function getPlayDlStream(url) {
     });
     
     // Crear stream de audio
-    const stream = await play.stream(url, {
-      quality: 2 // 0 = lowest, 1 = low, 2 = medium, 3 = high, 4 = highest
+    const stream = await play.stream(url.trim(), {
+      quality: 2, // 0 = lowest, 1 = low, 2 = medium, 3 = high, 4 = highest
+      seek: seekAt > 0 ? Number(seekAt) : undefined
     });
     
     // Crear recurso de audio

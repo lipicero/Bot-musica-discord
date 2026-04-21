@@ -46,6 +46,7 @@ module.exports = {
           startAtSec: target,
         });
         
+        q.playbackOffset = target;
         q.player.play(res);
         
         await renderNowPlaying(guild.id).catch(() => {});

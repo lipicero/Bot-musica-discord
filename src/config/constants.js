@@ -9,15 +9,15 @@ process.env.YTDL_NO_UPDATE = "1";
 // =================== AUDIO QUALITY ===================
 const PREFER_WEBM_OPUS = process.env.PREFER_WEBM_OPUS === "1";
 const FORCE_BEST_AUDIO = process.env.FORCE_BEST_AUDIO === "1";
-const AUDIO_BUFFER_SIZE = Math.max(16, Math.min(64, Number(process.env.AUDIO_BUFFER_SIZE || 32)));
-const FFMPEG_OPTIMIZE_AUDIO = process.env.FFMPEG_OPTIMIZE_AUDIO === "1";
-const HIGH_WATER_MARK = 1 << (AUDIO_BUFFER_SIZE > 32 ? 26 : 25);
+const AUDIO_BUFFER_SIZE = Math.max(16, Math.min(128, Number(process.env.AUDIO_BUFFER_SIZE || 64)));
+const FFMPEG_OPTIMIZE_AUDIO = process.env.FFMPEG_OPTIMIZE_AUDIO !== "0";
+const HIGH_WATER_MARK = 1 << (AUDIO_BUFFER_SIZE > 64 ? 27 : 26);
 const OPUS_BITRATE = Number(process.env.OPUS_BITRATE || 160);
 
 // =================== PERFORMANCE ===================
 const ENABLE_PRELOAD = process.env.ENABLE_PRELOAD !== "0";
-const PRELOAD_AHEAD = Math.max(1, Math.min(5, Number(process.env.PRELOAD_AHEAD || 2)));
-const YT_PARALLEL_DOWNLOADS = Math.max(1, Math.min(5, Number(process.env.YT_PARALLEL_DOWNLOADS || 3)));
+const PRELOAD_AHEAD = Math.max(1, Math.min(5, Number(process.env.PRELOAD_AHEAD || 1)));
+const YT_PARALLEL_DOWNLOADS = Math.max(1, Math.min(5, Number(process.env.YT_PARALLEL_DOWNLOADS || 2)));
 const YT_DOWNLOAD_TIMEOUT = Math.max(30, Math.min(120, Number(process.env.YT_DOWNLOAD_TIMEOUT || 60))) * 1000;
 const YT_AGGRESSIVE_CACHE = process.env.YT_AGGRESSIVE_CACHE === "1";
 

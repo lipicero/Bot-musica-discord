@@ -124,7 +124,9 @@ module.exports = {
             requestedBy: member.user.tag,
             requestedByTag: member.user.tag,
             requestedByAvatar: member.user.displayAvatarURL(),
-            ytdlInfo: null // Se obtendrá cuando se reproduzca
+            ytdlInfo: null, // Se obtendrá cuando se reproduzca
+            quality: '128kbps',
+            format: { audioQuality: '128kbps', quality: '128kbps' }
           };
 
           // Si es el primer item y la cola está vacía, obtener metadata completa
@@ -142,6 +144,11 @@ module.exports = {
                   song.title = metadata.title || song.title;
                   song.durationSec = metadata.durationSec || song.durationSec;
                   song.thumbnailUrl = metadata.thumbnailUrl || song.thumbnailUrl;
+                  song.quality = metadata.quality || song.quality;
+                  song.format = { 
+                    audioQuality: metadata.quality || song.quality, 
+                    quality: metadata.quality || song.quality 
+                  };
                 }
               } catch {}
             }
@@ -204,7 +211,8 @@ module.exports = {
         metadata = {
           title: ytdlInfo.videoDetails.title,
           durationSec: parseInt(ytdlInfo.videoDetails.lengthSeconds) || 0,
-          thumbnailUrl: ytdlInfo.videoDetails.thumbnails?.[0]?.url || null
+          thumbnailUrl: ytdlInfo.videoDetails.thumbnails?.[0]?.url || null,
+          quality: null // Se obtendrá después o con fallback
         };
         if (DEBUG_AUDIO) logger.audio('[play] Metadata obtenida con ytdl-core');
       } catch (e) {
@@ -227,7 +235,8 @@ module.exports = {
         metadata = {
           title: `Video ${videoId || 'desconocido'}`,
           durationSec: 0,
-          thumbnailUrl: null
+          thumbnailUrl: null,
+          quality: null
         };
       }
 
@@ -245,7 +254,12 @@ module.exports = {
         requestedBy: member.user.tag,
         requestedByTag: member.user.tag,
         requestedByAvatar: member.user.displayAvatarURL(),
-        ytdlInfo: ytdlInfo
+        ytdlInfo: ytdlInfo,
+        quality: metadata.quality || '128kbps',
+        format: {
+          audioQuality: metadata.quality || '128kbps',
+          quality: metadata.quality || '128kbps'
+        }
       };
 
       // Agregar a la cola

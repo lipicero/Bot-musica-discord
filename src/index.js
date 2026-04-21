@@ -60,13 +60,36 @@ process.on('unhandledRejection', (reason, promise) => {
 process.env.YTDL_NO_UPDATE = "1";
 require("dotenv").config({ quiet: true });
 
-// Configurar ffmpeg: usar del sistema si está disponible
+// Configurar ffmpeg: usar ffmpeg-static si está disponible
 try {
-  // Intentar usar ffmpeg del sistema primero (disponible en PATH después de instalar con winget)
+  const fs = require('fs');
+  const path = require('path');
+  const ffmpeg = require('ffmpeg-static');
+  
+  // Ruta específica proporcionada por el usuario (WinGet)
+  const wingetFfmpegPath = 'C:\\Users\\matia\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Gyan.FFmpeg.Essentials_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-8.1-essentials_build\\bin\\ffmpeg.exe';
+  const wingetBinDir = 'C:\\Users\\matia\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Gyan.FFmpeg.Essentials_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-8.1-essentials_build\\bin';
+  
+  let finalFfmpegPath = 'ffmpeg';
+
+  if (fs.existsSync(wingetFfmpegPath)) {
+    finalFfmpegPath = wingetFfmpegPath;
+    // Agregar el directorio al PATH para que otras librerías lo encuentren
+    process.env.PATH = `${wingetBinDir}${path.delimiter}${process.env.PATH}`;
+    logger.info(`[ffmpeg] Configurado usando ruta WinGet y agregado al PATH: ${wingetFfmpegPath}`);
+  } else if (ffmpeg) {
+    finalFfmpegPath = ffmpeg;
+    const ffmpegDir = path.dirname(ffmpeg);
+    process.env.PATH = `${ffmpegDir}${path.delimiter}${process.env.PATH}`;
+    logger.info(`[ffmpeg] Configurado usando ffmpeg-static y agregado al PATH: ${ffmpeg}`);
+  } else {
+    logger.info("[ffmpeg] Configurado para usar ffmpeg del sistema (fallback)");
+  }
+  
+  process.env.FFMPEG_PATH = finalFfmpegPath;
+} catch (err) {
   process.env.FFMPEG_PATH = 'ffmpeg';
-  logger.info("[ffmpeg] Configurado para usar ffmpeg del sistema");
-} catch (_) {
-  logger.warn("[ffmpeg] Error configurando ffmpeg");
+  logger.warn("[ffmpeg] Error cargando ffmpeg, usando fallback del sistema", { error: err.message });
 }
 
 // =================== IMPORTAR MÓDULOS ===================
@@ -83,7 +106,7 @@ const webStats = require('./web/stats');
 
 // Importar handlers
 const { setPlayNextFunction, getQueuesMap } = require('./handlers/queue');
-const { playNext } = require('./handlers/player');
+const { playNext, createResourceFromUrl } = require('./handlers/player');
 const { spawnSync } = require('child_process');
 
 function getYtDlpBinaryPath() {
@@ -118,7 +141,10 @@ function resolveManualYtDlpPath() {
     process.env.YT_DLP_PATH,
     process.env.YTDLP_PATH,
     process.env.YTDLP_EXECUTABLE,
-    process.env.YTDLP_BINARY
+    process.env.YTDLP_BINARY,
+    // Agregar ruta de descargas como fallback común en Windows
+    process.platform === 'win32' ? `C:\\Users\\${process.env.USERNAME}\\Downloads\\yt-dlp.exe` : null,
+    'C:\\Users\\matia\\Downloads\\yt-dlp.exe'
   ].filter(Boolean);
 
   for (const candidate of candidates) {
@@ -128,8 +154,8 @@ function resolveManualYtDlpPath() {
     if (resolved) {
       return resolved;
     }
-    // Si no existe físicamente, devolver el valor para que el spawn intente resolverlo
-    if (trimmed) {
+    // Si no tiene separadores de ruta, asumimos que es un comando global y dejamos que spawn lo intente
+    if (!trimmed.includes('\\') && !trimmed.includes('/')) {
       return trimmed;
     }
   }
@@ -214,8 +240,9 @@ const globalContext = {
   PRELOAD_CACHE,
   USER_STATS,
   
-  // Función de reproducción
+  // Funciones de reproducción
   playNext: (guildId) => playNext(guildId, queues, globalContext),
+  createResourceFromUrl: createResourceFromUrl,
   
   // Servicios (se cargarán dinámicamente cuando se necesiten)
   // Los comandos pueden require() directamente los handlers y services que necesiten
@@ -652,10 +679,10 @@ process.on("SIGINT", () => {
   setTimeout(() => process.exit(0), 500);
 });
 
-// =================== VERIFICAR ACTUALIZACIÓN DE YT-DLP ===================
 logger.info("[yt-dlp] Verificando actualizaciones...");
 const ytdlpPath = getYtDlpBinaryPath();
 if (ytdlpPath) {
+  logger.info(`[yt-dlp] Usando binario para actualización: ${ytdlpPath}`);
   try {
     const result = spawnSync(ytdlpPath, ["--update"], { encoding: "utf8" });
     if (result.status === 0) {

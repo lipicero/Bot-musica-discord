@@ -18,7 +18,7 @@ function buildControlsComponents(q) {
   const volDownDisabled = volPercent <= 0;
   const volUpDisabled = volPercent >= 200;
   
-  // Fila 1: transporte básico y modos
+  // Fila 1: transporte básico
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(isPaused ? 'music_resume' : 'music_pause')
@@ -36,7 +36,11 @@ function buildControlsComponents(q) {
       .setCustomId('music_stop')
       .setEmoji('🛑')
       .setLabel('Detener')
-      .setStyle(ButtonStyle.Danger),
+      .setStyle(ButtonStyle.Danger)
+  );
+  
+  // Fila 2: modos
+  const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId('music_loop')
       .setEmoji('🔁')
@@ -49,9 +53,9 @@ function buildControlsComponents(q) {
       .setStyle(q.shuffleMode ? ButtonStyle.Success : ButtonStyle.Secondary)
       .setDisabled(!canShuffle)
   );
-  
-  // Fila 2: controles de navegación y volumen
-  const row2 = new ActionRowBuilder().addComponents(
+
+  // Fila 3: controles de navegación
+  const row3 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId('music_replay')
       .setEmoji('🔄')
@@ -69,7 +73,11 @@ function buildControlsComponents(q) {
       .setEmoji('⏩')
       .setLabel('+10s')
       .setStyle(ButtonStyle.Secondary)
-      .setDisabled(!canSeek),
+      .setDisabled(!canSeek)
+  );
+
+  // Fila 4: volumen
+  const row4 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId('music_vol_down')
       .setEmoji('🔉')
@@ -84,8 +92,8 @@ function buildControlsComponents(q) {
       .setDisabled(volUpDisabled)
   );
   
-  // Fila 3: utilidades y enlaces
-  const row3 = new ActionRowBuilder().addComponents(
+  // Fila 5: utilidades
+  const row5 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId('music_save')
       .setEmoji('⭐')
@@ -101,7 +109,7 @@ function buildControlsComponents(q) {
   );
   
   if (s?.url) {
-    row3.addComponents(
+    row5.addComponents(
       new ButtonBuilder()
         .setStyle(ButtonStyle.Link)
         .setURL(s.url)
@@ -110,7 +118,7 @@ function buildControlsComponents(q) {
     );
   }
   
-  return [row1, row2, row3];
+  return [row1, row2, row3, row4, row5];
 }
 
 function buildNowPlayingEmbed(q) {
@@ -143,24 +151,23 @@ function buildNowPlayingEmbed(q) {
   if (isPaused) {
     // Si está pausado, usar el tiempo guardado al pausar
     if (q.pausedAtTime !== undefined) {
-      currentSeconds = q.pausedAtTime;
+      currentSeconds = q.pausedAtTime; // pausedAtTime ya incluye el offset
       logger.debug(`[nowplaying] Usando pausedAtTime: ${currentSeconds}s`, { guildId: q.guildId });
     } else if (q.lastPlaybackStart) {
-      // Fallback: calcular tiempo hasta el momento de pausa (no debería pasar normalmente)
-      currentSeconds = Math.floor((Date.now() - q.lastPlaybackStart) / 1000);
+      currentSeconds = (q.playbackOffset || 0) + Math.floor((Date.now() - q.lastPlaybackStart) / 1000);
       logger.warn(`[nowplaying] pausedAtTime no definido durante pausa, calculando tiempo: ${currentSeconds}s`, { guildId: q.guildId });
     } else if (q.player.state.resource?.playbackDuration) {
-      currentSeconds = Math.floor(q.player.state.resource.playbackDuration / 1000);
+      currentSeconds = (q.playbackOffset || 0) + Math.floor(q.player.state.resource.playbackDuration / 1000);
       logger.debug(`[nowplaying] Usando playbackDuration en pausa: ${currentSeconds}s`, { guildId: q.guildId });
     }
   } else {
     // Si no está pausado, calcular tiempo transcurrido desde el inicio
     if (q.lastPlaybackStart) {
-      currentSeconds = Math.floor((Date.now() - q.lastPlaybackStart) / 1000);
+      currentSeconds = (q.playbackOffset || 0) + Math.floor((Date.now() - q.lastPlaybackStart) / 1000);
       logger.debug(`[nowplaying] Calculando tiempo transcurrido: ${currentSeconds}s desde ${new Date(q.lastPlaybackStart).toISOString()}`, { guildId: q.guildId });
     } else if (q.player.state.resource?.playbackDuration) {
       // Fallback al método anterior
-      currentSeconds = Math.floor(q.player.state.resource.playbackDuration / 1000);
+      currentSeconds = (q.playbackOffset || 0) + Math.floor(q.player.state.resource.playbackDuration / 1000);
       logger.debug(`[nowplaying] Usando playbackDuration: ${currentSeconds}s`, { guildId: q.guildId });
     }
   }
@@ -178,7 +185,7 @@ function buildNowPlayingEmbed(q) {
       {
         name: '🎵 Canción:',
         value: s ? `[${s.title}](${s.url})` : '—',
-        inline: false,
+        inline: false
       },
       {
         name: '👤 Agregado por:',
@@ -187,17 +194,30 @@ function buildNowPlayingEmbed(q) {
       },
       {
         name: '⏱️ Duración:',
-        value: totalSeconds ? formatDuration(totalSeconds) : '🔴 EN VIVO',
-        inline: true,
+        value: s.duration || formatDuration(totalSeconds),
+        inline: true
       },
       {
-        name: '🎧 Salida:',
-        value: s.format?.audioQuality || s.format?.quality || '192kbps Opus',
-        inline: true,
+        name: '🔊 Salida:',
+        value: (() => {
+          let qStr = s.quality || 'Opus 192kbps';
+          // Limpiar nombres técnicos feos
+          if (qStr.includes('mp4a.40.2')) qStr = 'AAC (Alta Calidad)';
+          if (qStr.includes('mp4a.40.5')) qStr = 'AAC (Calidad Media)';
+          if (qStr.toLowerCase().includes('opus')) qStr = 'Opus (Alta Calidad)';
+          
+          let source = s.obtainedFrom || 'Direct';
+          if (source === 'yt-dlp') source = 'YT-DLP';
+          if (source === 'play-dl') source = 'Play-DL';
+          if (source === 'ytdl-core') source = 'YTDL-Core';
+          
+          return `${qStr}\n${source}`;
+        })(),
+        inline: true
       }
     );
 
-  // Agregar próximas canciones en cola si hay más de una
+  // Próximas canciones en la cola (compacto)
   if (q.songs.length > 1) {
     const nextSongs = q.songs.slice(1, 4).map((song, i) => 
       `${i + 1}. ${song.title.length > 30 ? song.title.substring(0, 30) + '...' : song.title}`

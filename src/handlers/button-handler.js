@@ -7,8 +7,9 @@ const { AudioPlayerStatus } = require('@discordjs/voice');
 const { getVoiceConnection, joinVoiceChannel } = require('@discordjs/voice');
 const { EmbedBuilder } = require('discord.js');
 const logger = require('../utils/logger');
-const { REQUIRE_SAME_VC } = require('../config/constants');
+const { REQUIRE_SAME_VC, DEFAULT_BASS_FREQ, DEFAULT_BASS_WIDTH } = require('../config/constants');
 const { updateNowPlayingPanel } = require('./nowplaying-panel');
+const stateService = require('../services/state');
 
 /**
  * Maneja las interacciones de botones de música
@@ -17,7 +18,7 @@ const { updateNowPlayingPanel } = require('./nowplaying-panel');
  * @returns {Promise<void>}
  */
 async function handleMusicButton(interaction, context) {
-  const { queues, nowPlayingMessages, playNext } = context;
+  const { queues, nowPlayingMessages, playNext, createResourceFromUrl } = context;
   const guildId = interaction.guild.id;
   const q = queues.get(guildId);
   
@@ -92,11 +93,11 @@ async function handleMusicButton(interaction, context) {
         break;
         
       case 'music_rewind':
-        await handleRewind(interaction, q);
+        await handleRewind(interaction, q, context);
         break;
         
       case 'music_forward':
-        await handleForward(interaction, q);
+        await handleForward(interaction, q, context);
         break;
         
       default:
@@ -118,12 +119,19 @@ async function handleMusicButton(interaction, context) {
       stack: error.stack
     });
     
-    const errorMsg = { content: '❌ Error procesando la acción.', ephemeral: true };
+    // Si la interacción ya fue respondida o diferida, no intentar responder de nuevo con reply
+    if (interaction.replied || interaction.deferred) {
+      // Opcionalmente podrías enviar un mensaje efímero de seguimiento si es crítico
+      return;
+    }
     
-    if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply(errorMsg).catch(() => {});
-    } else {
-      await interaction.editReply(errorMsg).catch(() => {});
+    try {
+      await interaction.reply({ 
+        content: `❌ Error al ejecutar la acción: ${error.message}`, 
+        ephemeral: true 
+      });
+    } catch (replyError) {
+      logger.error('No se pudo enviar mensaje de error de interacción:', replyError.message);
     }
   }
 }
@@ -158,10 +166,19 @@ async function handlePause(interaction, q) {
   q.player.pause();
   q.isPausedByUser = true; // Marcar que el usuario pausó manualmente
   
+  // Guardar el tiempo actual de reproducción
+  const offset = q.playbackOffset || 0;
+  if (q.player.state.resource?.playbackDuration) {
+    q.pausedAtTime = offset + Math.floor(q.player.state.resource.playbackDuration / 1000);
+  } else if (q.lastPlaybackStart) {
+    q.pausedAtTime = offset + Math.floor((Date.now() - q.lastPlaybackStart) / 1000);
+  }
+
   logger.warn('[button-pause] Pausa desde botón - isPausedByUser configurado', {
     guildId: interaction.guildId,
     status: q.player.state.status,
-    isPausedByUser: q.isPausedByUser
+    isPausedByUser: q.isPausedByUser,
+    pausedAtTime: q.pausedAtTime
   });
   
   await interaction.deferUpdate();
@@ -336,15 +353,15 @@ async function handleLoop(interaction, q, context) {
   
   q.loop = !q.loop;
   
+  // Responder de inmediato para evitar que la interacción expire
+  await interaction.deferUpdate().catch(() => {});
+  
   // Guardar estado
-  const stateService = require('../services/state');
   stateService.saveGuildState(context.guildState, interaction.guild.id, {
     volume: q.volume,
     loop: q.loop,
     bass: q.bass || 'off'
   });
-  
-  await interaction.deferUpdate();
 }
 
 /**
@@ -359,19 +376,19 @@ async function handleVolumeDown(interaction, q, context) {
   const newVol = Math.max(0, current - 10);
   q.volume = newVol / 100;
   
+  // Responder de inmediato para evitar que la interacción expire
+  await interaction.deferUpdate().catch(() => {});
+  
   if (q.player.state.resource?.volume) {
     q.player.state.resource.volume.setVolumeLogarithmic(q.volume);
   }
   
   // Guardar estado
-  const stateService = require('../services/state');
   stateService.saveGuildState(context.guildState, interaction.guild.id, {
     volume: q.volume,
     loop: q.loop,
     bass: q.bass || 'off'
   });
-  
-  await interaction.deferUpdate();
 }
 
 /**
@@ -386,19 +403,19 @@ async function handleVolumeUp(interaction, q, context) {
   const newVol = Math.min(200, current + 10);
   q.volume = newVol / 100;
   
+  // Responder de inmediato para evitar que la interacción expire
+  await interaction.deferUpdate().catch(() => {});
+  
   if (q.player.state.resource?.volume) {
     q.player.state.resource.volume.setVolumeLogarithmic(q.volume);
   }
   
   // Guardar estado
-  const stateService = require('../services/state');
   stateService.saveGuildState(context.guildState, interaction.guild.id, {
     volume: q.volume,
     loop: q.loop,
     bass: q.bass || 'off'
   });
-  
-  await interaction.deferUpdate();
 }
 
 /**
@@ -501,65 +518,83 @@ async function handleShowQueue(interaction, q) {
 /**
  * Retroceder 10 segundos
  */
-async function handleRewind(interaction, q) {
+async function handleRewind(interaction, q, context) {
   if (!q || q.songs.length === 0) {
     return interaction.reply({ content: '❌ No hay nada reproduciendo.', ephemeral: true });
   }
   
-  const currentTime = Math.floor((q.player.state.resource?.playbackDuration || 0) / 1000);
+  const { createResourceFromUrl } = context;
+  const currentSong = q.songs[0];
+  const currentTime = (q.playbackOffset || 0) + Math.floor((q.player.state.resource?.playbackDuration || 0) / 1000);
   const newTime = Math.max(0, currentTime - 10);
   
   try {
-    // Buscar el recurso actual y hacer seek si es posible
-    const resource = q.player.state.resource;
-    if (resource && resource.playStream && resource.playStream.seek) {
-      resource.playStream.seek(newTime);
-      await interaction.deferUpdate();
-    } else {
-      await interaction.reply({ 
-        content: '❌ No se puede retroceder en esta canción.', 
-        ephemeral: true 
-      });
-    }
+    await interaction.deferUpdate();
+    q.replacingResource = true;
+
+    const bassActive = (Number(q.bassGainDb) || 0) > 0;
+    const { resource } = await createResourceFromUrl(currentSong.url, q.volume ?? 1.0, {
+      startAtSec: newTime,
+      forceFfmpeg: bassActive,
+      bassGainDb: q.bassGainDb,
+      bassFreq: DEFAULT_BASS_FREQ,
+      bassWidth: DEFAULT_BASS_WIDTH
+    });
+
+    q.playbackOffset = newTime;
+    q.player.play(resource);
+    
+    // Forzar actualización del panel
+    const { updateNowPlayingPanel } = require('./nowplaying-panel');
+    await updateNowPlayingPanel(interaction.guild.id, null, context).catch(() => {});
+    
   } catch (error) {
     logger.error('Error en rewind:', { error: error.message });
-    await interaction.reply({ 
-      content: '❌ Error al retroceder.', 
-      ephemeral: true 
-    });
+    q.replacingResource = false;
+    // Si ya hicimos deferUpdate, no podemos usar reply normal si falló antes del defer
+    // Pero aquí el defer ya se hizo
   }
 }
 
 /**
  * Avanzar 10 segundos
  */
-async function handleForward(interaction, q) {
+async function handleForward(interaction, q, context) {
   if (!q || q.songs.length === 0) {
     return interaction.reply({ content: '❌ No hay nada reproduciendo.', ephemeral: true });
   }
   
-  const currentTime = Math.floor((q.player.state.resource?.playbackDuration || 0) / 1000);
-  const totalTime = q.songs[0]?.durationSec || 0;
-  const newTime = Math.min(totalTime, currentTime + 10);
+  const { createResourceFromUrl } = context;
+  const currentSong = q.songs[0];
+  const currentTime = (q.playbackOffset || 0) + Math.floor((q.player.state.resource?.playbackDuration || 0) / 1000);
+  const totalTime = currentSong.durationSec || 0;
+  const newTime = Math.min(totalTime - 1, currentTime + 10);
   
+  if (newTime < 0) return; // Nada que hacer
+
   try {
-    // Buscar el recurso actual y hacer seek si es posible
-    const resource = q.player.state.resource;
-    if (resource && resource.playStream && resource.playStream.seek) {
-      resource.playStream.seek(newTime);
-      await interaction.deferUpdate();
-    } else {
-      await interaction.reply({ 
-        content: '❌ No se puede avanzar en esta canción.', 
-        ephemeral: true 
-      });
-    }
+    await interaction.deferUpdate();
+    q.replacingResource = true;
+
+    const bassActive = (Number(q.bassGainDb) || 0) > 0;
+    const { resource } = await createResourceFromUrl(currentSong.url, q.volume ?? 1.0, {
+      startAtSec: newTime,
+      forceFfmpeg: bassActive,
+      bassGainDb: q.bassGainDb,
+      bassFreq: DEFAULT_BASS_FREQ,
+      bassWidth: DEFAULT_BASS_WIDTH
+    });
+
+    q.playbackOffset = newTime;
+    q.player.play(resource);
+    
+    // Forzar actualización del panel
+    const { updateNowPlayingPanel } = require('./nowplaying-panel');
+    await updateNowPlayingPanel(interaction.guild.id, null, context).catch(() => {});
+    
   } catch (error) {
     logger.error('Error en forward:', { error: error.message });
-    await interaction.reply({ 
-      content: '❌ Error al avanzar.', 
-      ephemeral: true 
-    });
+    q.replacingResource = false;
   }
 }
 

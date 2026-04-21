@@ -14,10 +14,12 @@
   "type": "commonjs",
   "dependencies": {
     "@discordjs/opus": "^0.10.0",
+    "@discordjs/rest": "^2.6.1",
     "@discordjs/voice": "^0.19.0",
     "@distube/ytdl-core": "^4.16.12",
     "@snazzah/davey": "^0.1.6",
     "cors": "^2.8.5",
+    "discord-api-types": "^0.38.47",
     "discord.js": "^14.22.1",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
@@ -29,7 +31,7 @@
     "socket.io": "^4.8.1",
     "winston": "^3.18.3",
     "youtube-po-token-generator": "^0.6.0",
-    "yt-dlp-wrap": "^2.3.12",
-    "ytdl-core": "^4.11.5"
+
+    "ytdlp-nodejs": "^3.4.4"
   }
 }

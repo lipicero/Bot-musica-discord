@@ -57,6 +57,7 @@ module.exports = {
             startAtSec: elapsedSec,
           });
           
+          q.playbackOffset = elapsedSec;
           q.player.play(res);
         } catch (e) {
           if (DEBUG_AUDIO) console.warn("[bass] reapply failed:", e?.message || e);
