@@ -68,15 +68,9 @@ async function playNext(guildId, queues, context = {}) {
   const current = q.songs[0];
   current._ytDlpAttempts = 0;
   
-  // Limpiar el flag de pausa solo si estamos iniciando una canción diferente
-  // (no cuando se reinicia la misma canción desde resume)
-  const wasSameSong = q.currentSongUrl === current.url;
-  if (!wasSameSong) {
-    q.isPausedByUser = false;
-    logger.debug('[player] Nueva canción detectada, limpiando isPausedByUser', { guildId });
-  } else {
-    logger.debug('[player] Misma canción reiniciada, manteniendo isPausedByUser', { guildId, isPausedByUser: q.isPausedByUser });
-  }
+  // Limpiar el flag de pausa al iniciar o reiniciar cualquier canción
+  q.isPausedByUser = false;
+  logger.debug('[player] Iniciando reproducción, limpiando isPausedByUser', { guildId });
   
   // Actualizar la canción actual
   q.currentSongUrl = current.url;

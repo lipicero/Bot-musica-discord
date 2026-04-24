@@ -67,8 +67,15 @@ function getQueue(guildId, globalState = {}, eventHandlers = {}) {
       if (!qq) return;
       
       // Limpiar bandera de reemplazo al entrar en Playing
-      if (newState?.status === AudioPlayerStatus.Playing && qq.replacingResource) {
-        qq.replacingResource = false;
+      if (newState?.status === AudioPlayerStatus.Playing) {
+        if (qq.replacingResource) {
+          qq.replacingResource = false;
+        }
+        // Sincronizar isPausedByUser si el player está reproduciendo
+        if (qq.isPausedByUser) {
+          qq.isPausedByUser = false;
+          logger.debug('[player] Sincronizando isPausedByUser: Reproducción detectada', { guildId });
+        }
       }
       
       // Resetear contador de errores 403 cuando una canción se reproduce exitosamente

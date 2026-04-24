@@ -270,6 +270,12 @@ async function handleResume(interaction, q) {
     }
   }
   else {
+    if (q.isPausedByUser) {
+      q.isPausedByUser = false;
+      logger.debug('[button-resume] Player ya estaba reproduciendo pero isPausedByUser era true, sincronizando flag', { 
+        guildId: interaction.guildId 
+      });
+    }
     return interaction.reply({ content: '▶️ Ya está reproduciendo.', ephemeral: true });
   }
   
