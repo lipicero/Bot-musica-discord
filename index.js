@@ -2229,70 +2229,37 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   const ff = spawn(ffmpegPath, ffArgs, { stdio: [useDirect ? "ignore" : "pipe", "pipe", "pipe"] });
 
   if (!useDirect) {
-    // En modo yt-dlp, primero intentamos yt-dlp -> stdout -> ffmpeg (respeta cookies/IPv4)
+    // En modo yt-dlp, usar los mismos `args` ya armados (cookies, player_client, etc.)
+    // Antes se reconstruía un yArgs incompleto → YouTube 429/bloqueo y audio idle.
     let piped = false;
     try {
-      const cookieFile2 = ensureYtDlpCookiesFileFromEnv();
-      const yArgs = ["--no-playlist", "-f", "bestaudio/best", "-o", "-"];
-      if (headers?.userAgent) yArgs.push("--user-agent", headers.userAgent);
-      if (headers?.acceptLang) yArgs.push("--add-header", `Accept-Language: ${headers.acceptLang}`);
-      if (String(process.env.YT_FORCE_IPV4 || "0") === "1") yArgs.push("--force-ipv4");
-      
-      // 🚀 OPTIMIZACIONES DE VELOCIDAD PARA YT-DLP
-      const fastMode = String(process.env.YT_DLP_FAST_MODE || "0") === "1";
-      const noDlpSleep = String(process.env.YT_DLP_NO_SLEEP || "0") === "1";
-      
-      if (fastMode) {
-        // Optimizaciones para máxima velocidad
-        yArgs.push("--no-check-certificates"); // Evitar verificación SSL lenta
-        yArgs.push("--no-cache-dir"); // No guardar cache en disco (más rápido para uso inmediato)
-        yArgs.push("--geo-bypass"); // Intentar bypass geográfico
-        if (DEBUG_AUDIO) console.log(`[yt-dlp] 🚀 Modo velocidad activado`);
-      }
-      
-      if (noDlpSleep) {
-        yArgs.push("--sleep-interval", "0"); // Sin delays entre requests
-        yArgs.push("--max-sleep-interval", "0"); // Sin delays máximos
-        if (DEBUG_AUDIO) console.log(`[yt-dlp] ⚡ Delays deshabilitados`);
-      }
-      
-      // Agregar --no-sleep-requests solo si la versión de yt-dlp lo soporta
-      if (String(process.env.YT_NO_SLEEP_REQUESTS || "0") === "1") {
-        try {
-          const supports = await ytDlpSupportsNoSleep();
-          if (supports) yArgs.push("--no-sleep-requests");
-        } catch {}
-      }
-      if (cookieFile2) yArgs.push("--cookies", cookieFile2);
-      yArgs.push(url);
       const yProc = binPath
-        ? spawn(binPath, yArgs, { stdio: ["ignore", "pipe", "pipe"] })
+        ? spawn(binPath, args, { stdio: ["ignore", "pipe", "pipe"] })
         : ytdlp.raw(url, {
             noPlaylist: true,
             f: "bestaudio/best",
             o: "-",
             ...(headers?.userAgent ? { userAgent: headers.userAgent } : {}),
             ...(headers?.acceptLang ? { addHeader: [`Accept-Language: ${headers.acceptLang}`] } : {}),
-            ...(cookieFile2 ? { cookies: cookieFile2 } : {}),
-            ...(String(process.env.YT_FORCE_IPV4 || "0") === "1" ? { forceIpv4: true } : {}),
-            // 🚀 OPTIMIZACIONES DE VELOCIDAD
-            ...(fastMode ? { 
-              noCheckCertificates: true,
-              noCacheDir: true,
-              geoBypass: true 
-            } : {}),
-            ...(noDlpSleep ? { 
-              sleepInterval: 0,
-              maxSleepInterval: 0 
-            } : {}),
-            // Opción no-sleep solo si está soportada
-            ...(await (async () => {
-              if (String(process.env.YT_NO_SLEEP_REQUESTS || "0") !== "1") return {};
-              try { if (await ytDlpSupportsNoSleep()) return { noSleepRequests: true }; } catch {}
-              return {};
-            })()),
+            ...(cookieFile ? { cookies: cookieFile } : {}),
+            ...(forceIpv4 ? { forceIpv4: true } : {}),
           });
-      if (DEBUG_AUDIO) yProc.stderr?.on("data", (d) => console.warn(`[yt-dlp] ${String(d).trim()}`));
+
+      // Loguear errores de yt-dlp siempre (sin DEBUG_AUDIO) para diagnosticar en Render
+      let yErr = "";
+      yProc.stderr?.on("data", (d) => {
+        const s = String(d);
+        yErr += s;
+        if (/ERROR|WARNING|429|Sign in|bot/i.test(s)) {
+          console.warn(`[yt-dlp] ${s.trim()}`);
+        }
+      });
+      yProc.on?.("close", (code) => {
+        if (code && code !== 0) {
+          console.warn(`[yt-dlp] proceso salió con código ${code}${yErr ? `: ${yErr.trim().slice(0, 500)}` : ""}`);
+        }
+      });
+
       // Pipe a ffmpeg
       yProc.stdout.pipe(ff.stdin);
       piped = true;
@@ -2309,7 +2276,7 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
       yProc.stdout?.on("error", ignoreErr("yt-dlp:stdout"));
       yProc.stdin?.on?.("error", ignoreErr("yt-dlp:stdin"));
     } catch (e) {
-      if (DEBUG_AUDIO) console.warn("[yt-dlp] pipe->ffmpeg falló, fallback ytdl-core:", e?.message || e);
+      console.warn("[yt-dlp] pipe->ffmpeg falló, fallback ytdl-core:", e?.message || e);
     }
     if (!piped) {
       // Fallback: ytdl-core -> ffmpeg
@@ -2342,11 +2309,21 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
     }
   }
 
-  if (DEBUG_AUDIO) {
-    ff.stderr?.on("data", (d) => console.warn(`[ffmpeg] ${String(d).trim()}`));
-  }
+  // Manejo de errores para ffmpeg (siempre loguear warnings útiles)
+  let ffErr = "";
+  ff.stderr?.on("data", (d) => {
+    const s = String(d);
+    ffErr += s;
+    if (DEBUG_AUDIO || /error|invalid|fail|429/i.test(s)) {
+      console.warn(`[ffmpeg] ${s.trim()}`);
+    }
+  });
+  ff.on("close", (code) => {
+    if (code && code !== 0) {
+      console.warn(`[ffmpeg] salió con código ${code}${ffErr ? `: ${ffErr.trim().slice(0, 400)}` : ""}`);
+    }
+  });
 
-  // Manejo de errores para ffmpeg
   const ignoreErr = (label) => (err) => {
     if (!err) return;
     const code = err?.code || "";
@@ -2679,7 +2656,16 @@ async function fetchMetadata(url) {
         durationSec: dur > 0 ? Math.floor(dur) : 0,
         thumbnailUrl: thumb,
       };
-    } catch {}
+    } catch (e) {
+      console.warn("[metadata:ytdl-core]", e?.message || e);
+    }
+    // Fallback metadata con yt-dlp (evita 429 de ytdl-core en Render)
+    try {
+      const fromYt = await fetchMetadataWithYtDlp(normalized);
+      if (fromYt) return fromYt;
+    } catch (e) {
+      console.warn("[metadata:yt-dlp]", e?.message || e);
+    }
   }
   if (!skipPlayDl) {
     try {
@@ -2706,6 +2692,52 @@ async function fetchMetadata(url) {
     durationSec: 0,
     thumbnailUrl: deriveYouTubeThumb(normalized),
   };
+}
+
+async function fetchMetadataWithYtDlp(url) {
+  const binPath = getYtDlpBinaryPath();
+  if (!binPath) return null;
+  const cookieFile = ensureYtDlpCookiesFileFromEnv();
+  const args = [
+    "--no-playlist",
+    "--no-warnings",
+    "--print",
+    "%(title)s\t%(duration)s\t%(thumbnail)s",
+  ];
+  if (cookieFile) args.push("--cookies", cookieFile);
+  args.push("--extractor-args", "youtube:player_client=android");
+  args.push(url);
+
+  return new Promise((resolve) => {
+    const proc = spawn(binPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    let err = "";
+    const t = setTimeout(() => {
+      try { proc.kill("SIGKILL"); } catch {}
+      resolve(null);
+    }, 25000);
+    proc.stdout.on("data", (d) => (out += d.toString()));
+    proc.stderr.on("data", (d) => (err += d.toString()));
+    proc.on("close", (code) => {
+      clearTimeout(t);
+      if (code !== 0) {
+        if (err) console.warn(`[metadata:yt-dlp] ${err.trim().slice(0, 300)}`);
+        return resolve(null);
+      }
+      const line = out.trim().split(/\r?\n/).find(Boolean) || "";
+      const [title, duration, thumbnail] = line.split("\t");
+      const dur = Number(duration) || 0;
+      resolve({
+        title: title || url,
+        durationSec: dur > 0 ? Math.floor(dur) : 0,
+        thumbnailUrl: thumbnail || deriveYouTubeThumb(url),
+      });
+    });
+    proc.on("error", () => {
+      clearTimeout(t);
+      resolve(null);
+    });
+  });
 }
 
 function formatDuration(totalSeconds) {
