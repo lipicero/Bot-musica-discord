@@ -256,5 +256,6 @@ function getStreamType(format) {
 module.exports = {
   buildYtdlRequestOptions,
   selectWebmOpusFormat,
-  getStreamType
+  getStreamType,
+  generatePoToken
 };

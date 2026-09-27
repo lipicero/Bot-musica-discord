@@ -118,6 +118,7 @@ try {
   ytdlp = require("yt-dlp-exec");
 } catch {}
 const { spawn, spawnSync } = require("child_process");
+const { generatePoToken } = require("./src/utils/ytdl-helpers");
 
 function getYtDlpBinaryPath() {
   try {
@@ -2108,23 +2109,23 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   if (cookieFile) {
     args.push("--cookies", cookieFile);
   }
-  // Elegir extractor-args (player_client). En Render/android suele fallar con
-  // "Failed to extract any player response"; ios/web/mweb rinden mejor.
-  // No usar player_skip=webpage (rompe la extracción del player response).
+  // Elegir extractor-args (player_client + PO token). En Render, cookies solas no alcanzan.
+  const poAuth = await getYtPoAuth();
   let effectiveClient = ytClient;
   if (!extractorArgsEnv) {
     if (!effectiveClient) {
-      effectiveClient = cookieFile
-        ? "ios,web,mweb,tv"
-        : "ios,web,mweb,tv,android";
+      // Con PO token preferir web; sin PO, intentar varios clientes
+      effectiveClient = poAuth.poToken
+        ? "web"
+        : "ios,web,mweb,tv";
     }
-    args.push("--extractor-args", `youtube:player_client=${effectiveClient}`);
+    args.push("--extractor-args", buildYoutubeExtractorArgs(effectiveClient, poAuth));
     console.log(
-      `[yt-dlp] player_client=${effectiveClient} cookies=${cookieFile ? "si" : "no"}`
+      `[yt-dlp] player_client=${effectiveClient} cookies=${cookieFile ? "si" : "no"} po=${poAuth.source}`
     );
   } else {
     args.push("--extractor-args", extractorArgsEnv);
-    console.log(`[yt-dlp] extractor-args (env): ${extractorArgsEnv} cookies=${cookieFile ? "si" : "no"}`);
+    console.log(`[yt-dlp] extractor-args (env): ${extractorArgsEnv} cookies=${cookieFile ? "si" : "no"} po=${poAuth.source}`);
   }
   args.push(url);
 
@@ -2459,6 +2460,55 @@ function parseCookieHeaderToArray(header) {
   }
 }
 
+// PO Token + visitorData para yt-dlp (requerido en muchas IPs de datacenter)
+async function getYtPoAuth() {
+  const envPo = (process.env.YT_PO_TOKEN || process.env.YOUTUBE_PO_TOKEN || "").trim();
+  const envVd = (process.env.YT_VISITOR_DATA || process.env.YOUTUBE_VISITOR_DATA || "").trim();
+  if (envPo && envVd) {
+    return { poToken: envPo, visitorData: envVd, source: "env" };
+  }
+  try {
+    const { poToken, visitorData } = await generatePoToken();
+    if (poToken && visitorData) {
+      return { poToken, visitorData, source: "generated" };
+    }
+  } catch (e) {
+    console.warn("[yt-dlp] No se pudo generar PO token:", e?.message || e);
+  }
+  return { poToken: null, visitorData: null, source: "none" };
+}
+
+function buildYoutubeExtractorArgs(playerClient, poAuth) {
+  const parts = [`player_client=${playerClient || "web"}`];
+  if (poAuth?.visitorData) {
+    parts.push(`visitor_data=${poAuth.visitorData}`);
+  }
+  if (poAuth?.poToken) {
+    // Formato actual de yt-dlp: CLIENT+TOKEN o CLIENT.CONTEXT+TOKEN
+    const token = String(poAuth.poToken);
+    const formatted = token.includes("+") ? token : `web+${token}`;
+    parts.push(`po_token=${formatted}`);
+  }
+  return `youtube:${parts.join(";")}`;
+}
+
+async function fetchOEmbedTitle(url) {
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 4000);
+    const res = await fetch(
+      `https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`,
+      { signal: ctrl.signal }
+    );
+    clearTimeout(t);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data?.title ? String(data.title) : null;
+  } catch {
+    return null;
+  }
+}
+
 // Lee cookie de YouTube desde variables de entorno en formato de header "a=b; c=d"
 function getYouTubeCookieHeaderFromEnv() {
   try {
@@ -2633,23 +2683,51 @@ async function fetchMetadata(url) {
   const normalized = canonicalizeYouTubeUrl(url);
   const skipPlayDl = String(process.env.YT_FORCE_YTDLP || "1") === "1";
   if (isYouTubeUrl(normalized)) {
+    // oEmbed es liviano y suele funcionar aunque el player esté bloqueado
     try {
-      const id = extractYouTubeId(normalized) || normalized;
-      const info = await ytdl.getBasicInfo(id);
-      const title = info?.videoDetails?.title || normalized;
-      const dur = Number(info?.videoDetails?.lengthSeconds || 0) || 0;
-      const thumb =
-        (info?.videoDetails?.thumbnails || [])[0]?.url ||
-        deriveYouTubeThumb(normalized);
-      return {
-        title,
-        durationSec: dur > 0 ? Math.floor(dur) : 0,
-        thumbnailUrl: thumb,
-      };
-    } catch (e) {
-      console.warn("[metadata:ytdl-core]", e?.message || e);
+      const oembedTitle = await fetchOEmbedTitle(normalized);
+      if (oembedTitle) {
+        // Completar duración con yt-dlp en paralelo no bloqueante si hace falta
+        let durationSec = 0;
+        let thumbnailUrl = deriveYouTubeThumb(normalized);
+        try {
+          const fromYt = await Promise.race([
+            fetchMetadataWithYtDlp(normalized),
+            new Promise((r) => setTimeout(() => r(null), 8000)),
+          ]);
+          if (fromYt?.durationSec) durationSec = fromYt.durationSec;
+          if (fromYt?.thumbnailUrl) thumbnailUrl = fromYt.thumbnailUrl;
+          if (fromYt?.title) {
+            return {
+              title: fromYt.title,
+              durationSec: fromYt.durationSec || 0,
+              thumbnailUrl: fromYt.thumbnailUrl || thumbnailUrl,
+            };
+          }
+        } catch {}
+        return { title: oembedTitle, durationSec, thumbnailUrl };
+      }
+    } catch {}
+
+    // Skip ytdl-core si forzamos yt-dlp (en Render casi siempre da 429)
+    if (!skipPlayDl) {
+      try {
+        const id = extractYouTubeId(normalized) || normalized;
+        const info = await ytdl.getBasicInfo(id);
+        const title = info?.videoDetails?.title || normalized;
+        const dur = Number(info?.videoDetails?.lengthSeconds || 0) || 0;
+        const thumb =
+          (info?.videoDetails?.thumbnails || [])[0]?.url ||
+          deriveYouTubeThumb(normalized);
+        return {
+          title,
+          durationSec: dur > 0 ? Math.floor(dur) : 0,
+          thumbnailUrl: thumb,
+        };
+      } catch (e) {
+        console.warn("[metadata:ytdl-core]", e?.message || e);
+      }
     }
-    // Fallback metadata con yt-dlp (evita 429 de ytdl-core en Render)
     try {
       const fromYt = await fetchMetadataWithYtDlp(normalized);
       if (fromYt) return fromYt;
@@ -2688,7 +2766,10 @@ async function fetchMetadataWithYtDlp(url) {
   const binPath = getYtDlpBinaryPath();
   if (!binPath) return null;
   const cookieFile = ensureYtDlpCookiesFileFromEnv();
-  const clients = String(process.env.YT_YTDLP_CLIENT || "ios,web,mweb,tv")
+  const poAuth = await getYtPoAuth();
+  const clients = String(
+    process.env.YT_YTDLP_CLIENT || (poAuth.poToken ? "web" : "web,ios,mweb")
+  )
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
@@ -2700,7 +2781,7 @@ async function fetchMetadataWithYtDlp(url) {
       "--print",
       "%(title)s\t%(duration)s\t%(thumbnail)s",
       "--extractor-args",
-      `youtube:player_client=${client}`,
+      buildYoutubeExtractorArgs(client, poAuth),
     ];
     if (cookieFile) args.push("--cookies", cookieFile);
     args.push(url);
@@ -2712,7 +2793,7 @@ async function fetchMetadataWithYtDlp(url) {
       const t = setTimeout(() => {
         try { proc.kill("SIGKILL"); } catch {}
         resolve(null);
-      }, 20000);
+      }, 12000);
       proc.stdout.on("data", (d) => (out += d.toString()));
       proc.stderr.on("data", (d) => (err += d.toString()));
       proc.on("close", (code) => {
@@ -2725,7 +2806,7 @@ async function fetchMetadataWithYtDlp(url) {
         const [title, duration, thumbnail] = line.split("\t");
         if (!title) return resolve(null);
         const dur = Number(duration) || 0;
-        console.log(`[metadata:yt-dlp] ok client=${client} cookies=${cookieFile ? "si" : "no"}`);
+        console.log(`[metadata:yt-dlp] ok client=${client} cookies=${cookieFile ? "si" : "no"} po=${poAuth.source}`);
         resolve({
           title: title || url,
           durationSec: dur > 0 ? Math.floor(dur) : 0,
@@ -3211,6 +3292,21 @@ async function registerSlashCommands() {
 // clientReady: evento recomendado ("ready" quedará deprecado en v15)
 client.once("clientReady", async (c) => {
   console.log(`[bot] Conectado como ${c.user?.tag || c.user?.id}`);
+  try {
+    const cookieFile = ensureYtDlpCookiesFileFromEnv();
+    const poAuth = await getYtPoAuth();
+    console.log(
+      `[yt] cookies=${cookieFile ? "si" : "no"} po=${poAuth.source}`
+    );
+    if (!cookieFile) {
+      console.warn("[yt] Sin cookies: en Render YouTube suele bloquear. Configurá YT_COOKIE_B64.");
+    }
+    if (poAuth.source === "none") {
+      console.warn("[yt] Sin PO token: puede fallar la extracción. Probá YT_PO_TOKEN + YT_VISITOR_DATA.");
+    }
+  } catch (e) {
+    console.warn("[yt] No se pudo verificar cookies/PO:", e?.message || e);
+  }
   try { await registerSlashCommands(); } catch {}
   
 });
@@ -4533,50 +4629,34 @@ client.on("interactionCreate", async (interaction) => {
         );
       }
 
-  const q = getQueue(guild.id);
-  if (!q.textChannelId) q.textChannelId = interaction.channelId;
-      // Paralelizar conexión con fetch de info/metadata
+      const q = getQueue(guild.id);
+      if (!q.textChannelId) q.textChannelId = interaction.channelId;
+      // Paralelizar conexión; no bloquear /play esperando metadata de YouTube
       const connectP = ensureConnection(guild, voiceChannel).catch((e) => e);
-      const ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
       let songData = null;
       if (isYouTubeUrl(finalUrl)) {
-        if (String(process.env.YT_FORCE_YTDLP || "1") === "1") {
-          const meta = await fetchMetadata(finalUrl);
-          songData = {
-            url: finalUrl,
-            title: meta.title,
-            durationSec: meta.durationSec || 0,
-            thumbnailUrl: meta.thumbnailUrl,
-            requestedById: member?.user?.id,
-          };
-        } else {
-          try {
-            const id = extractYouTubeId(finalUrl) || finalUrl;
-            const info = await ytdl.getInfo(id);
-            const title = info?.videoDetails?.title || finalUrl;
-            const dur = Number(info?.videoDetails?.lengthSeconds || 0) || 0;
-            const thumb =
-              (info?.videoDetails?.thumbnails || [])[0]?.url ||
-              deriveYouTubeThumb(finalUrl);
-            songData = {
-              url: finalUrl,
-              title,
-              durationSec: dur ? Math.floor(dur) : 0,
-              thumbnailUrl: thumb,
-              requestedById: member?.user?.id,
-              ytdlInfo: info,
-            };
-          } catch {
-            const meta = await fetchMetadata(finalUrl);
-            songData = {
-              url: finalUrl,
-              title: meta.title,
-              durationSec: meta.durationSec || 0,
-              thumbnailUrl: meta.thumbnailUrl,
-              requestedById: member?.user?.id,
-            };
-          }
-        }
+        // Título rápido vía oEmbed (no requiere player response)
+        const quickTitle = (await fetchOEmbedTitle(finalUrl).catch(() => null)) || finalUrl;
+        songData = {
+          url: finalUrl,
+          title: quickTitle,
+          durationSec: 0,
+          thumbnailUrl: deriveYouTubeThumb(finalUrl),
+          requestedById: member?.user?.id,
+        };
+        // Completar metadata en background (no bloquear la reproducción)
+        fetchMetadata(finalUrl)
+          .then((meta) => {
+            const qq = queues.get(guild.id);
+            if (!qq?.songs?.length) return;
+            const song = qq.songs.find((s) => s.url === finalUrl);
+            if (!song) return;
+            if (meta?.title) song.title = meta.title;
+            if (meta?.durationSec) song.durationSec = meta.durationSec;
+            if (meta?.thumbnailUrl) song.thumbnailUrl = meta.thumbnailUrl;
+            renderNowPlaying(guild.id).catch(() => {});
+          })
+          .catch(() => {});
       } else {
         const meta = await fetchMetadata(finalUrl);
         songData = {
