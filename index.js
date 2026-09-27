@@ -2467,10 +2467,16 @@ async function getYtPoAuth() {
   if (envPo && envVd) {
     return { poToken: envPo, visitorData: envVd, source: "env" };
   }
+  // En Render el generate() con jsdom suele colgarse/429: timeout estricto
   try {
-    const { poToken, visitorData } = await generatePoToken();
-    if (poToken && visitorData) {
-      return { poToken, visitorData, source: "generated" };
+    const result = await Promise.race([
+      generatePoToken(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("PO_TOKEN_TIMEOUT")), 8000)
+      ),
+    ]);
+    if (result?.poToken && result?.visitorData) {
+      return { poToken: result.poToken, visitorData: result.visitorData, source: "generated" };
     }
   } catch (e) {
     console.warn("[yt-dlp] No se pudo generar PO token:", e?.message || e);
@@ -3292,23 +3298,28 @@ async function registerSlashCommands() {
 // clientReady: evento recomendado ("ready" quedará deprecado en v15)
 client.once("clientReady", async (c) => {
   console.log(`[bot] Conectado como ${c.user?.tag || c.user?.id}`);
-  try {
-    const cookieFile = ensureYtDlpCookiesFileFromEnv();
-    const poAuth = await getYtPoAuth();
-    console.log(
-      `[yt] cookies=${cookieFile ? "si" : "no"} po=${poAuth.source}`
-    );
-    if (!cookieFile) {
-      console.warn("[yt] Sin cookies: en Render YouTube suele bloquear. Configurá YT_COOKIE_B64.");
-    }
-    if (poAuth.source === "none") {
-      console.warn("[yt] Sin PO token: puede fallar la extracción. Probá YT_PO_TOKEN + YT_VISITOR_DATA.");
-    }
-  } catch (e) {
-    console.warn("[yt] No se pudo verificar cookies/PO:", e?.message || e);
-  }
+  // Registrar slash YA (no esperar PO token / jsdom)
   try { await registerSlashCommands(); } catch {}
-  
+
+  // Diagnóstico YouTube en background (no bloquear ready)
+  setImmediate(async () => {
+    try {
+      const cookieFile = ensureYtDlpCookiesFileFromEnv();
+      console.log(`[yt] cookies=${cookieFile ? "si" : "no"}`);
+      if (!cookieFile) {
+        console.warn("[yt] Sin cookies: en Render YouTube suele bloquear. Configurá YT_COOKIE_B64.");
+      }
+      const poAuth = await getYtPoAuth();
+      console.log(`[yt] po=${poAuth.source}`);
+      if (poAuth.source === "none") {
+        console.warn(
+          "[yt] Sin PO token. Generá en tu PC: npx youtube-po-token-generator y seteá YT_PO_TOKEN + YT_VISITOR_DATA en Render."
+        );
+      }
+    } catch (e) {
+      console.warn("[yt] No se pudo verificar cookies/PO:", e?.message || e);
+    }
+  });
 });
 
 function canonicalizeYouTubeUrl(input) {
