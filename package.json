@@ -13,7 +13,6 @@
   "packageManager": "pnpm@10.32.1",
   "type": "commonjs",
   "dependencies": {
-    "@discordjs/opus": "^0.10.0",
     "@discordjs/rest": "^2.6.1",
     "@discordjs/voice": "^0.19.0",
     "@distube/ytdl-core": "^4.16.12",
@@ -31,7 +30,9 @@
     "socket.io": "^4.8.1",
     "winston": "^3.18.3",
     "youtube-po-token-generator": "^0.6.0",
-
     "ytdlp-nodejs": "^3.4.4"
+  },
+  "optionalDependencies": {
+    "@discordjs/opus": "^0.10.0"
   }
 }
