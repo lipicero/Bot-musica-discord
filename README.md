@@ -38,3 +38,16 @@ Si el panel no aparece, asegúrate de:
 Tips:
 - Puedes alternar aleatorio con `/shuffle` o con el botón “Aleatorio”.
 - Usa `/seek` para saltar dentro del tema actual; con bass activo usa FFmpeg para precisión.
+
+## Deploy en Render (Web Service)
+
+Render exige un único HTTP en `0.0.0.0:$PORT`. El bot abre dashboard + health en ese puerto al arrancar:
+
+1. Crear un **Web Service** con runtime **Docker** (usa el `Dockerfile` del repo).
+2. Health Check Path: `/health`
+3. Variables: `DISCORD_TOKEN` (obligatoria), opcional `YT_COOKIE`, `WEB_PASSWORD`.
+4. **No** definas `PORT` ni `WEB_PORT` en el Dashboard: Render inyecta `PORT`.
+
+Verificación rápida tras el deploy: `https://<tu-servicio>.onrender.com/health` debe devolver `ok`.
+
+Nota (plan free): el Web Service se duerme tras ~15 min sin HTTP. El bot de Discord se cae con el sleep; para 24/7 hace falta un plan de pago o un ping externo a `/health`.

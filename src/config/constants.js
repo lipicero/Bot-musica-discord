@@ -52,8 +52,9 @@ const DEBUG_AUDIO = process.env.DEBUG_AUDIO === "1";
 const DEBUG_DISCORD = process.env.DEBUG_DISCORD === "1";
 
 // =================== WEB SERVER ===================
-const WEB_PORT = Number(process.env.WEB_PORT || 3000);
-const HEALTH_PORT = Number(process.env.HEALTH_PORT || 8080);
+// En Render, PORT manda. WEB_PORT/HEALTH_PORT solo aplican en local si PORT no está.
+const WEB_PORT = Number(process.env.PORT || process.env.WEB_PORT || 3001);
+const HEALTH_PORT = Number(process.env.PORT || process.env.HEALTH_PORT || WEB_PORT);
 
 // =================== DISCORD ===================
 const COMMANDS_SCOPE = String(process.env.COMMANDS_SCOPE || "global").toLowerCase();
