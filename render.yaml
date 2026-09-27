@@ -1,15 +1,17 @@
 services:
+  # Web Service: Render requiere un proceso escuchando en 0.0.0.0:$PORT
+  # El bot abre un único HTTP (dashboard + /health) en ese puerto al arrancar.
   - type: web
     name: music-bot
-    env: docker
+    runtime: docker
     plan: free
     autoDeploy: true
-    healthCheckPath: /
-    # Si querés persistir volumes.json entre deploys, descomentá el disco persistente
-    # disks:
-    #   - name: data
-    #     mountPath: /app
-    #     sizeGB: 1
+    healthCheckPath: /health
+    # Opcional: persistir state.json / cookies entre deploys
+    # disk:
+    #   name: data
+    #   mountPath: /app/data
+    #   sizeGB: 1
     envVars:
       - key: NODE_ENV
         value: production
@@ -18,6 +20,8 @@ services:
       # Opcional: cookies de YouTube para acceso a contenidos restringidos/edad
       - key: YT_COOKIE
         sync: false
+      - key: WEB_PASSWORD
+        sync: false
       # Debug opcional
       - key: DEBUG_AUDIO
         value: "0"
@@ -25,9 +29,8 @@ services:
         value: "1"
       - key: FAST_START_MS
         value: "2000"
-      # Forzar backend yt-dlp en producción si querés
       - key: YT_FORCE_YTDLP
         value: "1"
-      # Ruta no necesaria en Linux si está en PATH; se deja por si se quisiera fijar explícita
       - key: YT_DLP_PATH
         value: "/usr/local/bin/yt-dlp"
+      # Nota: NO definir PORT ni WEB_PORT aquí — Render inyecta PORT automáticamente.

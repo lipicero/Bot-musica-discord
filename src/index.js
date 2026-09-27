@@ -280,7 +280,7 @@ setPlayNextFunction((guildId) => playNext(guildId, queues, globalContext), globa
 logger.bot('[OK] Handler de reproducción configurado');
 
 // =================== SERVIDOR WEB ===================
-const { app, server, io, startWebServer, startHealthServer } = createWebServer({
+const { app, server, io, startWebServer } = createWebServer({
   client,
   queues,
   METADATA_CACHE,
@@ -289,6 +289,15 @@ const { app, server, io, startWebServer, startHealthServer } = createWebServer({
 });
 
 logger.bot('[OK] Servidor web configurado');
+
+// HTTP YA: Render exige 0.0.0.0:$PORT abierto antes del health check del deploy.
+// No esperar a clientReady (Discord puede tardar y el deploy falla por "puertos").
+try {
+  startWebServer();
+} catch (error) {
+  logger.error('Error iniciando servidor web:', { error: error.message });
+  process.exit(1);
+}
 
 // =================== EVENT HANDLERS DEL BOT ===================
 
@@ -302,20 +311,6 @@ client.once("clientReady", async (c) => {
     logger.bot('[OK] Comandos slash registrados');
   } catch (error) {
     logger.error('Error registrando comandos slash:', { error: error.message });
-  }
-  
-  // Iniciar servidor web
-  try {
-    startWebServer();
-  } catch (error) {
-    logger.error('Error iniciando servidor web:', { error: error.message });
-  }
-  
-  // Iniciar health server para Render
-  try {
-    startHealthServer();
-  } catch (error) {
-    logger.error('Error iniciando health server:', { error: error.message });
   }
   
   // Iniciar sistema de health check interno

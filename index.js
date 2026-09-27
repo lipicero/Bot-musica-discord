@@ -870,8 +870,12 @@ const io = socketIo(server, {
   }
 });
 
-const WEB_PORT = Number(process.env.WEB_PORT || 3001);
+// En Render Web Service, PORT es obligatorio y debe ser el único puerto público.
+// Localmente usamos WEB_PORT (default 3001).
+const HTTP_PORT = Number(process.env.PORT || process.env.WEB_PORT || 3001);
+const HTTP_HOST = "0.0.0.0";
 const WEB_PASSWORD = process.env.WEB_PASSWORD || "admin123";
+let httpServerStarted = false;
 
 // Middleware de seguridad
 app.use(helmet({
@@ -3116,8 +3120,6 @@ client.once("clientReady", async (c) => {
   console.log(`[bot] Conectado como ${c.user?.tag || c.user?.id}`);
   try { await registerSlashCommands(); } catch {}
   
-  // Iniciar servidor web del dashboard
-  startWebServer();
 });
 
 function canonicalizeYouTubeUrl(input) {
@@ -5109,20 +5111,6 @@ setInterval(cleanupOldLogs, 24 * 60 * 60 * 1000);
 // Iniciar el bot
 client.login(process.env.DISCORD_TOKEN);
 
-// Si corremos en Render Web Service, expongamos un health-check HTTP en PORT
-function startHealthServer() {
-  const port = Number(process.env.PORT || 0);
-  if (!port) return; // no estamos en un Web Service
-  const http = require("http");
-  const server = http.createServer((req, res) => {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("ok");
-  });
-  server.listen(port, () =>
-    console.log(`[http] health server escuchando en :${port}`)
-  );
-}
-
 // =================== RUTAS API Y SERVIDOR WEB ===================
 // Middleware de autenticación simple
 function requireAuth(req, res, next) {
@@ -5132,6 +5120,11 @@ function requireAuth(req, res, next) {
   }
   next();
 }
+
+// Health check para Render: debe responder YA, antes de que Discord esté listo
+app.get('/health', (req, res) => {
+  res.status(200).type('text/plain').send('ok');
+});
 
 // Rutas API
 app.post('/api/login', (req, res) => {
@@ -5204,18 +5197,27 @@ io.on('connection', (socket) => {
   });
 });
 
-// Iniciar servidor web
+// Un solo HTTP en 0.0.0.0:$PORT (Render) o WEB_PORT (local).
+// Antes había dos servidores (dashboard :3001 + health en PORT) y el health
+// a veces arrancaba tarde o sin bind público → deploy fallaba por puertos.
 function startWebServer() {
+  if (httpServerStarted) return;
+  httpServerStarted = true;
   try {
-    server.listen(WEB_PORT, () => {
-      console.log(`[web] 🌐 Dashboard disponible en: http://localhost:${WEB_PORT}`);
+    server.listen(HTTP_PORT, HTTP_HOST, () => {
+      console.log(`[web] Escuchando en http://${HTTP_HOST}:${HTTP_PORT} (health: /health)`);
+    });
+    server.on('error', (error) => {
+      console.error(`[web] Error al escuchar en ${HTTP_HOST}:${HTTP_PORT}:`, error.message);
+      process.exit(1);
     });
   } catch (error) {
     console.error('[web] Error al iniciar servidor:', error.message);
+    process.exit(1);
   }
 }
 
-startHealthServer();
+startWebServer();
 
 // Apagado limpio en plataformas que envían señales (Render)
 function gracefulShutdown(signal) {
