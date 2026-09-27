@@ -1896,6 +1896,8 @@ async function getDirectUrlFromYtDlp(targetUrl, headers = {}, opts = {}) {
         "251",
         "bestaudio/best",
       ];
+  const playerClient =
+    (opts.playerClient || process.env.YT_YTDLP_CLIENT || "ios,web,mweb,tv").trim();
   let lastErr = null;
   for (const fmt of formats) {
     try {
@@ -1905,6 +1907,9 @@ async function getDirectUrlFromYtDlp(targetUrl, headers = {}, opts = {}) {
           const args = ["-g", "-f", fmt, "--no-playlist"];
           if (cookieFile) {
             args.push("--cookies", cookieFile);
+          }
+          if (playerClient) {
+            args.push("--extractor-args", `youtube:player_client=${playerClient}`);
           }
           for (const h of addHeader) args.push("--add-header", h);
           args.push(targetUrl);
@@ -2087,7 +2092,6 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   // Opcionales para mitigar captcha en YouTube
   const extractorArgsEnv = (process.env.YT_YTDLP_EXTRACTOR_ARGS || "").trim();
   const ytClient = (process.env.YT_YTDLP_CLIENT || "").trim().toLowerCase(); // p.ej.: android | tvhtml5 | web | ios | mweb
-  const strictClient = String(process.env.YT_YTDLP_STRICT_CLIENT || "0") === "1";
   const forceIpv4 = String(process.env.YT_FORCE_IPV4 || "0") === "1";
 
   if (headers?.userAgent) {
@@ -2104,37 +2108,23 @@ async function createResourceFromYtDlp(url, volume = 1.0, headers = {}) {
   if (cookieFile) {
     args.push("--cookies", cookieFile);
   }
-  // Elegir extractor-args (player_client) según cookies y configuración
+  // Elegir extractor-args (player_client). En Render/android suele fallar con
+  // "Failed to extract any player response"; ios/web/mweb rinden mejor.
+  // No usar player_skip=webpage (rompe la extracción del player response).
   let effectiveClient = ytClient;
   if (!extractorArgsEnv) {
     if (!effectiveClient) {
-      // Sin cookies: usar android (más estable) 
-      // Con cookies: usar android_embedded (menos bloqueado)
-      effectiveClient = cookieFile ? "android_embedded" : "android";
+      effectiveClient = cookieFile
+        ? "ios,web,mweb,tv"
+        : "ios,web,mweb,tv,android";
     }
-    if (cookieFile && effectiveClient === "android" && !strictClient) {
-      // Sin cookies: mantener android para evitar warnings de "yt initial data"
-      // Con cookies: usar android_embedded que es más estable
-      effectiveClient = "android_embedded";
-      if (DEBUG_AUDIO)
-        console.log(
-          `[yt-dlp] cambiando player_client=android -> android_embedded (cookies presentes)`
-        );
-    }
-    
-    // 🛡️ CONFIGURACIÓN ANTI-WARNING: Evitar "unable to extract yt initial data"
-    if (effectiveClient) {
-      args.push("--extractor-args", `youtube:player_client=${effectiveClient}`);
-      // Agregar configuración para evitar API fallbacks que causan warnings
-      if (effectiveClient.includes('android')) {
-        args.push("--extractor-args", "youtube:player_skip=webpage,configs");
-      }
-      if (DEBUG_AUDIO)
-        console.log(`[yt-dlp] usando player_client=${effectiveClient}`);
-    }
+    args.push("--extractor-args", `youtube:player_client=${effectiveClient}`);
+    console.log(
+      `[yt-dlp] player_client=${effectiveClient} cookies=${cookieFile ? "si" : "no"}`
+    );
   } else {
     args.push("--extractor-args", extractorArgsEnv);
-    if (DEBUG_AUDIO) console.log(`[yt-dlp] extractor-args (env): ${extractorArgsEnv}`);
+    console.log(`[yt-dlp] extractor-args (env): ${extractorArgsEnv} cookies=${cookieFile ? "si" : "no"}`);
   }
   args.push(url);
 
@@ -2698,46 +2688,59 @@ async function fetchMetadataWithYtDlp(url) {
   const binPath = getYtDlpBinaryPath();
   if (!binPath) return null;
   const cookieFile = ensureYtDlpCookiesFileFromEnv();
-  const args = [
-    "--no-playlist",
-    "--no-warnings",
-    "--print",
-    "%(title)s\t%(duration)s\t%(thumbnail)s",
-  ];
-  if (cookieFile) args.push("--cookies", cookieFile);
-  args.push("--extractor-args", "youtube:player_client=android");
-  args.push(url);
+  const clients = String(process.env.YT_YTDLP_CLIENT || "ios,web,mweb,tv")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 
-  return new Promise((resolve) => {
-    const proc = spawn(binPath, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let out = "";
-    let err = "";
-    const t = setTimeout(() => {
-      try { proc.kill("SIGKILL"); } catch {}
-      resolve(null);
-    }, 25000);
-    proc.stdout.on("data", (d) => (out += d.toString()));
-    proc.stderr.on("data", (d) => (err += d.toString()));
-    proc.on("close", (code) => {
-      clearTimeout(t);
-      if (code !== 0) {
-        if (err) console.warn(`[metadata:yt-dlp] ${err.trim().slice(0, 300)}`);
-        return resolve(null);
-      }
-      const line = out.trim().split(/\r?\n/).find(Boolean) || "";
-      const [title, duration, thumbnail] = line.split("\t");
-      const dur = Number(duration) || 0;
-      resolve({
-        title: title || url,
-        durationSec: dur > 0 ? Math.floor(dur) : 0,
-        thumbnailUrl: thumbnail || deriveYouTubeThumb(url),
+  for (const client of clients) {
+    const args = [
+      "--no-playlist",
+      "--no-warnings",
+      "--print",
+      "%(title)s\t%(duration)s\t%(thumbnail)s",
+      "--extractor-args",
+      `youtube:player_client=${client}`,
+    ];
+    if (cookieFile) args.push("--cookies", cookieFile);
+    args.push(url);
+
+    const result = await new Promise((resolve) => {
+      const proc = spawn(binPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+      let out = "";
+      let err = "";
+      const t = setTimeout(() => {
+        try { proc.kill("SIGKILL"); } catch {}
+        resolve(null);
+      }, 20000);
+      proc.stdout.on("data", (d) => (out += d.toString()));
+      proc.stderr.on("data", (d) => (err += d.toString()));
+      proc.on("close", (code) => {
+        clearTimeout(t);
+        if (code !== 0) {
+          if (err) console.warn(`[metadata:yt-dlp:${client}] ${err.trim().slice(0, 220)}`);
+          return resolve(null);
+        }
+        const line = out.trim().split(/\r?\n/).find(Boolean) || "";
+        const [title, duration, thumbnail] = line.split("\t");
+        if (!title) return resolve(null);
+        const dur = Number(duration) || 0;
+        console.log(`[metadata:yt-dlp] ok client=${client} cookies=${cookieFile ? "si" : "no"}`);
+        resolve({
+          title: title || url,
+          durationSec: dur > 0 ? Math.floor(dur) : 0,
+          thumbnailUrl: thumbnail || deriveYouTubeThumb(url),
+        });
+      });
+      proc.on("error", () => {
+        clearTimeout(t);
+        resolve(null);
       });
     });
-    proc.on("error", () => {
-      clearTimeout(t);
-      resolve(null);
-    });
-  });
+
+    if (result) return result;
+  }
+  return null;
 }
 
 function formatDuration(totalSeconds) {
