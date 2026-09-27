@@ -1525,7 +1525,9 @@ async function createResourceFromUrl(url, volume = 1.0, options = {}) {
     // Resolver ID una sola vez para reutilizar en fallbacks
     const id = extractYouTubeId(url) || url;
     const forcePlayDl = String(process.env.YT_FORCE_PLAYDL || "0") === "1";
-    const forceYtDlp = String(process.env.YT_FORCE_YTDLP || "0") === "1";
+    // Por defecto usar yt-dlp (play-dl suele recibir 429 en IPs de datacenter como Render)
+    const forceYtDlp =
+      !forcePlayDl && String(process.env.YT_FORCE_YTDLP || "1") === "1";
     
     // 🚀 MODO VELOCIDAD: Usar el extractor más rápido (generalmente ytdl-core)
     if ((speedPriority || ultraFastStart) && !forceYtDlp && !needFfmpeg) {
@@ -2647,8 +2649,14 @@ function ensureYtDlpCookiesFileFromEnv() {
 
 async function fetchTitle(url) {
   try {
-    const info = await playdl.video_info(canonicalizeYouTubeUrl(url));
-    return info?.video_details?.title || url;
+    if (String(process.env.YT_FORCE_YTDLP || "1") !== "1") {
+      const info = await playdl.video_info(canonicalizeYouTubeUrl(url));
+      return info?.video_details?.title || url;
+    }
+  } catch {}
+  try {
+    const meta = await fetchMetadata(url);
+    return meta?.title || url;
   } catch {
     return url;
   }
@@ -2656,6 +2664,7 @@ async function fetchTitle(url) {
 
 async function fetchMetadata(url) {
   const normalized = canonicalizeYouTubeUrl(url);
+  const skipPlayDl = String(process.env.YT_FORCE_YTDLP || "1") === "1";
   if (isYouTubeUrl(normalized)) {
     try {
       const id = extractYouTubeId(normalized) || normalized;
@@ -2672,24 +2681,26 @@ async function fetchMetadata(url) {
       };
     } catch {}
   }
-  try {
-    const info = await playdl.video_info(normalized);
-    const title = info?.video_details?.title || normalized;
-    const dur =
-      Number(
-        info?.video_details?.durationInSec ||
-          info?.video_details?.durationInMs / 1000 ||
-          0
-      ) || 0;
-    const thumb =
-      info?.video_details?.thumbnails?.[0]?.url ||
-      deriveYouTubeThumb(normalized);
-    return {
-      title,
-      durationSec: dur > 0 ? Math.floor(dur) : 0,
-      thumbnailUrl: thumb,
-    };
-  } catch {}
+  if (!skipPlayDl) {
+    try {
+      const info = await playdl.video_info(normalized);
+      const title = info?.video_details?.title || normalized;
+      const dur =
+        Number(
+          info?.video_details?.durationInSec ||
+            info?.video_details?.durationInMs / 1000 ||
+            0
+        ) || 0;
+      const thumb =
+        info?.video_details?.thumbnails?.[0]?.url ||
+        deriveYouTubeThumb(normalized);
+      return {
+        title,
+        durationSec: dur > 0 ? Math.floor(dur) : 0,
+        thumbnailUrl: thumb,
+      };
+    } catch {}
+  }
   return {
     title: normalized,
     durationSec: 0,
@@ -2760,120 +2771,167 @@ function buildProgressBar(totalSec, elapsedSec, size = 20) {
   return `\`${elapsedStr}\` ${bar} \`${totalStr}\` **${percentage}%**`;
 }
 
+function isYouTubePlaylistUrl(url) {
+  try {
+    const u = new URL(String(url || ""));
+    const host = u.hostname.replace(/^www\./, "");
+    if (!/(^|\.)youtube\.com$|(^|\.)youtu\.be$|(^|\.)music\.youtube\.com$/i.test(host)) {
+      return false;
+    }
+    const list = u.searchParams.get("list");
+    if (!list) return false;
+    // /playlist?list=... o watch?v=...&list=... (cola/playlist)
+    if (u.pathname === "/playlist") return true;
+    // Evitar listas de "Mix" / RD que a veces no son playlists reales; igual las tratamos como playlist
+    return !u.searchParams.get("v") || list.startsWith("PL") || list.startsWith("OL") || list.startsWith("LL") || list.startsWith("UU") || list.startsWith("RD");
+  } catch {
+    return false;
+  }
+}
+
 // Función para obtener playlist manteniendo el orden original
 async function getPlaylistItemsOrdered(playlistUrl) {
   const results = [];
   let playlistInfo = null;
-  
-  try {
-    // Método 1: Usar play-dl con carga completa
+  const preferYtDlp = String(process.env.YT_FORCE_YTDLP || "1") === "1";
+
+  const tryYtDlpPlaylist = async () => {
+    if (DEBUG_AUDIO) console.log(`[playlist] Intentando yt-dlp...`);
+    const ytdlpPath = getYtDlpBinaryPath();
+    if (!ytdlpPath) return null;
+
+    const args = [
+      "--flat-playlist",
+      "--print-json",
+      "--no-warnings",
+      `--playlist-end=${MAX_PLAYLIST_ITEMS}`,
+      playlistUrl,
+    ];
+
+    // Pasar cookies a yt-dlp si están disponibles
+    try {
+      const cookieFile = ensureYtDlpCookiesFileFromEnv();
+      if (cookieFile) args.splice(args.length - 1, 0, "--cookies", cookieFile);
+    } catch {}
+
+    return new Promise((resolve, reject) => {
+      const proc = spawn(ytdlpPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "";
+      let stderr = "";
+
+      proc.stdout.on("data", (data) => (stdout += data.toString()));
+      proc.stderr.on("data", (data) => (stderr += data.toString()));
+
+      proc.on("close", (code) => {
+        if (code !== 0) {
+          return reject(new Error(`yt-dlp failed: ${stderr}`));
+        }
+
+        try {
+          const lines = stdout.trim().split("\n").filter((line) => line.trim());
+          const items = [];
+          let playlistTitle = "Playlist";
+
+          for (let i = 0; i < lines.length && i < MAX_PLAYLIST_ITEMS; i++) {
+            const json = JSON.parse(lines[i]);
+
+            if (json._type === "playlist") {
+              playlistTitle = json.title || playlistTitle;
+              continue;
+            }
+
+            const url = json.url || (json.id ? `https://www.youtube.com/watch?v=${json.id}` : null);
+            if (url && (json.title || json.id)) {
+              items.push({
+                url: canonicalizeYouTubeUrl(url),
+                title: json.title || `Video ${i + 1}`,
+                durationSec: json.duration ? Math.floor(json.duration) : 0,
+                thumbnailUrl: deriveYouTubeThumb(url),
+                originalIndex: items.length,
+              });
+            }
+          }
+
+          if (DEBUG_AUDIO) console.log(`[playlist] ✅ yt-dlp obtuvo ${items.length} videos`);
+          resolve({ items, title: playlistTitle });
+        } catch (parseError) {
+          reject(parseError);
+        }
+      });
+
+      setTimeout(() => {
+        try { proc.kill("SIGKILL"); } catch {}
+        reject(new Error("yt-dlp timeout"));
+      }, 30000);
+    });
+  };
+
+  const tryPlayDlPlaylist = async () => {
     if (DEBUG_AUDIO) console.log(`[playlist] Obteniendo playlist con play-dl...`);
     playlistInfo = await playdl.playlist_info(playlistUrl, { incomplete: false });
     await playlistInfo.fetch();
-    
-    // Obtener videos en orden con índice preservado
+
     const videos = playlistInfo.videos || [];
     if (DEBUG_AUDIO) console.log(`[playlist] Encontrados ${videos.length} videos en play-dl`);
-    
+
     for (let i = 0; i < Math.min(videos.length, MAX_PLAYLIST_ITEMS); i++) {
       const vid = videos[i];
       if (!vid) continue;
-      
+
       const url = vid.url || vid.video_url || (vid.id ? `https://www.youtube.com/watch?v=${vid.id}` : null);
       if (!url) continue;
-      
+
       const title = vid.title || vid.name || `Video ${i + 1}`;
       const duration = Number(vid.durationInSec || vid.durationInMs / 1000 || 0) || 0;
-      
+
       results.push({
         url: canonicalizeYouTubeUrl(url),
         title,
         durationSec: duration ? Math.floor(duration) : 0,
         thumbnailUrl: deriveYouTubeThumb(url),
-        originalIndex: i // Preservar índice original
+        originalIndex: i,
       });
     }
-    
+
     if (results.length > 0) {
       if (DEBUG_AUDIO) console.log(`[playlist] ✅ Obtenidos ${results.length} videos con play-dl`);
       return { items: results, title: playlistInfo.title || "Playlist" };
     }
-  } catch (e) {
-    if (DEBUG_AUDIO) console.warn(`[playlist] Error con play-dl:`, e?.message);
-  }
-  
-  // Método 2: Fallback con yt-dlp si play-dl falla
-  try {
-    if (DEBUG_AUDIO) console.log(`[playlist] Intentando fallback con yt-dlp...`);
-    const ytdlpPath = getYtDlpBinaryPath();
-    if (ytdlpPath) {
-      const args = [
-        '--flat-playlist',
-        '--print-json',
-        '--no-warnings',
-        `--playlist-end=${MAX_PLAYLIST_ITEMS}`,
-        playlistUrl
-      ];
-      
-      return new Promise((resolve, reject) => {
-        const proc = spawn(ytdlpPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-        let stdout = '';
-        let stderr = '';
-        
-        proc.stdout.on('data', (data) => stdout += data.toString());
-        proc.stderr.on('data', (data) => stderr += data.toString());
-        
-        proc.on('close', (code) => {
-          if (code !== 0) {
-            return reject(new Error(`yt-dlp failed: ${stderr}`));
-          }
-          
-          try {
-            const lines = stdout.trim().split('\n').filter(line => line.trim());
-            const items = [];
-            let playlistTitle = "Playlist";
-            
-            for (let i = 0; i < lines.length && i < MAX_PLAYLIST_ITEMS; i++) {
-              const line = lines[i];
-              const json = JSON.parse(line);
-              
-              if (json._type === 'playlist') {
-                playlistTitle = json.title || playlistTitle;
-                continue;
-              }
-              
-              if (json.url && json.title) {
-                items.push({
-                  url: canonicalizeYouTubeUrl(json.url),
-                  title: json.title,
-                  durationSec: json.duration ? Math.floor(json.duration) : 0,
-                  thumbnailUrl: deriveYouTubeThumb(json.url),
-                  originalIndex: i
-                });
-              }
-            }
-            
-            if (DEBUG_AUDIO) console.log(`[playlist] ✅ Fallback yt-dlp obtuvo ${items.length} videos`);
-            resolve({ items, title: playlistTitle });
-          } catch (parseError) {
-            reject(parseError);
-          }
-        });
-        
-        setTimeout(() => {
-          proc.kill('SIGKILL');
-          reject(new Error('yt-dlp timeout'));
-        }, 30000);
-      });
+    return null;
+  };
+
+  // Preferir yt-dlp (evita 429 de play-dl en Render)
+  if (preferYtDlp) {
+    try {
+      const fromYt = await tryYtDlpPlaylist();
+      if (fromYt?.items?.length) return fromYt;
+    } catch (e) {
+      if (DEBUG_AUDIO) console.warn(`[playlist] Error con yt-dlp:`, e?.message);
     }
-  } catch (e) {
-    if (DEBUG_AUDIO) console.warn(`[playlist] Error con yt-dlp:`, e?.message);
+    try {
+      const fromPlay = await tryPlayDlPlaylist();
+      if (fromPlay) return fromPlay;
+    } catch (e) {
+      if (DEBUG_AUDIO) console.warn(`[playlist] Error con play-dl:`, e?.message);
+    }
+  } else {
+    try {
+      const fromPlay = await tryPlayDlPlaylist();
+      if (fromPlay) return fromPlay;
+    } catch (e) {
+      if (DEBUG_AUDIO) console.warn(`[playlist] Error con play-dl:`, e?.message);
+    }
+    try {
+      const fromYt = await tryYtDlpPlaylist();
+      if (fromYt?.items?.length) return fromYt;
+    } catch (e) {
+      if (DEBUG_AUDIO) console.warn(`[playlist] Error con yt-dlp:`, e?.message);
+    }
   }
-  
-  // Si ambos métodos fallan, devolver lo que tengamos de play-dl
-  return { 
-    items: results, 
-    title: playlistInfo?.title || "Playlist" 
+
+  return {
+    items: results,
+    title: playlistInfo?.title || "Playlist",
   };
 }
 
@@ -3457,7 +3515,7 @@ async function playNext(guildId) {
     );
     
     const longEnough = (current.durationSec || 0) >= 60;
-    const forceYtDlp = String(process.env.YT_FORCE_YTDLP || "0") === "1";
+    const forceYtDlp = String(process.env.YT_FORCE_YTDLP || "1") === "1";
     const speedPriority = String(process.env.FIRST_SONG_SPEED_PRIORITY || "0") === "1";
 
     const bassActive = (Number(q.bassGainDb) || 0) > 0;
@@ -3559,12 +3617,12 @@ async function playNext(guildId) {
     }
   } catch (e) {
     console.error("[playNext:error]", e?.message || e, "url:", current?.url);
-    // Fallback: forzar play-dl para esta URL
+    // Fallback: reintentar vía createResource (yt-dlp por defecto; evita play-dl/429)
     try {
       const fallbackRes = await createResourceFromUrl(
         current.url,
         q.volume ?? 1.0,
-        { preferPlayDl: true }
+        {}
       );
       q.player.play(fallbackRes);
       if (q.nowPlayingMessageId) {
@@ -4316,10 +4374,9 @@ client.on("interactionCreate", async (interaction) => {
       const normalizedQuery = canonicalizeYouTubeUrl(query);
       const ok = await safeDefer(interaction);
       if (!ok) return;
-      // Playlist en /play
+      // Playlist en /play (detectar por URL; evita playdl.validate → 429)
       try {
-  const vType = await playdl.validate(normalizedQuery);
-        if (vType === "yt_playlist") {
+        if (isYouTubePlaylistUrl(normalizedQuery)) {
           const voiceChannel = member.voice?.channel;
           if (!voiceChannel)
             return safeRespond(
@@ -4448,7 +4505,7 @@ client.on("interactionCreate", async (interaction) => {
       const ytCookie = process.env.YT_COOKIE || process.env.YOUTUBE_COOKIE;
       let songData = null;
       if (isYouTubeUrl(finalUrl)) {
-        if (String(process.env.YT_FORCE_YTDLP || "0") === "1") {
+        if (String(process.env.YT_FORCE_YTDLP || "1") === "1") {
           const meta = await fetchMetadata(finalUrl);
           songData = {
             url: finalUrl,

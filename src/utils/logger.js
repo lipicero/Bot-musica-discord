@@ -32,6 +32,7 @@ const fileFormat = winston.format.combine(
 // Crear logger
 const logger = winston.createLogger({
   level: process.env.LOG_LEVEL || 'info',
+  exitOnError: false,
   transports: [
     // Console para desarrollo
     new winston.transports.Console({
