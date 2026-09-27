@@ -3961,8 +3961,6 @@ async function renderNowPlaying(guildId) {
   return sent;
 }
 
-globalContext.renderNowPlaying = renderNowPlaying;
-
 // Garantiza que exista un único panel por servidor; si no existe, lo crea en el canal dado
 async function ensurePanel(guildId, channelId) {
   const q = getQueue(guildId);
