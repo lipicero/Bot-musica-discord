@@ -2,9 +2,16 @@ node_modules
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+pnpm-debug.log*
 logs
 .env
+.env.*
 volumes.json
 .git
 .gitignore
 .DS_Store
+# No usar npm en la imagen; el lock canónico es pnpm-lock.yaml
+package-lock.json
+cookies.txt
+*.log
+bot.pid

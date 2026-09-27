@@ -1,2 +1,7 @@
-allowBuilds:
-  '@discordjs/opus': true
+# Ajustes de pnpm para este repo (no es un monorepo de paquetes).
+# Los scripts de build nativos permitidos también están en package.json → pnpm.onlyBuiltDependencies.
+onlyBuiltDependencies:
+  - '@discordjs/opus'
+  - ffmpeg-static
+  - '@snazzah/davey'
+  - ytdlp-nodejs
